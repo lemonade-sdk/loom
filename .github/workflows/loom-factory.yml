@@ -35,7 +35,7 @@ env:
   ANTHROPIC_ORGANIZATION_ID: 9bdff596-1595-4140-8301-817e43ef8412
   ANTHROPIC_SERVICE_ACCOUNT_ID: svac_01RaWseoyo5MeWhBYqZYEkfr
   ANTHROPIC_WORKSPACE_ID: wrkspc_01DcG9t7asPHNeFbcKtktSu3
-  ANTHROPIC_MODEL: claude-sonnet-4-5
+  ANTHROPIC_MODEL: claude-opus-5-5
 
 jobs:
   select:
@@ -107,9 +107,7 @@ jobs:
         run: |
           set -euo pipefail
           WORK=$HOME/loom-factory/$SLUG
-          mkdir -p "$WORK"
-          # Keep a previous attempt's GGUF download; everything else starts fresh.
-          find "$WORK" -mindepth 1 -maxdepth 1 ! -name gguf -exec rm -rf {} +
+          rm -rf "$WORK"
           mkdir -p "$WORK/serve"
           printf '{"source":"%s","quant":"%s","run":"%s/%s/actions/runs/%s"}\n' \
             "$SOURCE" "$QUANT" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" > "$WORK/attempt.json"
@@ -117,15 +115,40 @@ jobs:
           echo "LOOM_SERVE_STATE=$WORK/serve" >> "$GITHUB_ENV"
           echo "Converting [$SOURCE](https://huggingface.co/$SOURCE) ($QUANT, $GIB GiB) → [$TARGET](https://huggingface.co/$TARGET)" >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Download the GGUF
+      - name: Get the GGUF (reuse a local copy if present)
         env:
           HF_TOKEN: ${{ secrets.HF_LOOM_FACTORY }}
         run: |
           set -euo pipefail
           python3 -m venv "$RUNNER_TEMP/hf"
           "$RUNNER_TEMP/hf/bin/pip" install -q -U huggingface_hub
-          mapfile -t files < <(python3 -c 'import json, os; print("\n".join(json.loads(os.environ["FILES"])))')
-          "$RUNNER_TEMP/hf/bin/hf" download "$SOURCE" "${files[@]}" --local-dir "$WORK/gguf"
+          "$RUNNER_TEMP/hf/bin/python" - <<'EOF'
+          import json, os
+          from huggingface_hub import constants, hf_hub_download, try_to_load_from_cache
+
+          src, work = os.environ["SOURCE"], os.environ["WORK"]
+          dest = os.path.join(work, "gguf")
+          # Repos already in the shared cache belong to someone else; cleanup must leave them alone.
+          cache = constants.HF_HUB_CACHE
+          before = sorted(d for d in os.listdir(cache) if d.startswith("models--")) if os.path.isdir(cache) else []
+          json.dump({"cache": cache, "repos": before}, open(os.path.join(work, "hf-cache-before.json"), "w"))
+          lines = []
+          for f in json.loads(os.environ["FILES"]):
+              path = os.path.join(dest, f)
+              os.makedirs(os.path.dirname(path), exist_ok=True)
+              cached = try_to_load_from_cache(src, f)
+              if isinstance(cached, str) and os.path.exists(cached):
+                  os.symlink(os.path.realpath(cached), path)
+                  lines.append(f"- `{f}`: already available locally ({cached}), not downloaded")
+              else:
+                  hf_hub_download(src, f, local_dir=dest)
+                  lines.append(f"- `{f}`: not available locally, downloaded "
+                               f"({os.path.getsize(path) / 2**30:.1f} GiB; deleted when the run ends)")
+          report = "\n".join(lines)
+          print(report)
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as s:
+              s.write("\n" + report + "\n")
+          EOF
 
       - name: Install Claude Code
         run: |
@@ -167,7 +190,9 @@ jobs:
 
           This is an unattended CI run on the Strix Halo; nobody can answer questions, so never stop to ask.
           - Working directory: $WORK. The GGUF is already downloaded: $files.
-            If it is split into shards, merge them into one GGUF in $WORK/gguf first.
+            If it is split into shards, merge them into one GGUF in $WORK/gguf first. Never modify or
+            delete files outside $WORK; the GGUF may be a symlink into the shared Hugging Face cache.
+            Any other model you download is deleted when the run ends.
           - Write the finished package to $WORK/pkg (model.json, program/*.loom, weights.loom, tokenizer.json,
             llm_config.json), the benchmark/roofline outputs to $WORK/bench, and the final report to $WORK/REPORT.md.
           - Reuse the Loom install at ~/loom if present (install it with loom-setup otherwise) and the llama.cpp
@@ -216,8 +241,6 @@ jobs:
           "$RUNNER_TEMP/hf/bin/python" .github/scripts/loom_factory.py publish --work "$WORK" \
             --source "$SOURCE" --target "$TARGET" --quant "$QUANT" --files "$FILES"
           echo "Published https://huggingface.co/$TARGET" >> "$GITHUB_STEP_SUMMARY"
-          # The weights are on the hub already; free the disk.
-          rm -rf "$WORK/gguf"
 
       - name: Stop leftover servers
         if: always()
@@ -230,6 +253,28 @@ jobs:
             tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | grep -q llama-server && kill "$pid" || true
             rm -f "$f"
           done
+
+      - name: Delete downloaded models
+        if: always()
+        run: |
+          set -uo pipefail
+          [ -n "${WORK:-}" ] || exit 0
+          # Removes this run's downloads and merged GGUFs; symlinks to pre-existing cache files are
+          # removed without touching their targets.
+          freed=$(du -sh "$WORK/gguf" 2>/dev/null | cut -f1)
+          rm -rf "$WORK/gguf"
+          find "$WORK" \( -name '*.gguf' -o -name '*.safetensors' \) \( -type f -o -type l \) -print -delete
+          # Hugging Face cache repos that appeared during this run (e.g. fetched by the agent).
+          [ -f "$WORK/hf-cache-before.json" ] && "$RUNNER_TEMP/hf/bin/python" - <<'EOF'
+          import json, os, shutil
+          s = json.load(open(os.path.join(os.environ["WORK"], "hf-cache-before.json")))
+          if os.path.isdir(s["cache"]):
+              for d in sorted(set(os.listdir(s["cache"])) - set(s["repos"])):
+                  if d.startswith("models--"):
+                      print("deleting", os.path.join(s["cache"], d))
+                      shutil.rmtree(os.path.join(s["cache"], d), ignore_errors=True)
+          EOF
+          echo "Deleted the run's model files (${freed:-0} in $WORK/gguf)." >> "$GITHUB_STEP_SUMMARY"
 
       # Scheduled runs count these to stop retrying a model that keeps failing.
       - name: Upload the attempt logs
