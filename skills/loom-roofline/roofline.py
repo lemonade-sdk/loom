@@ -22,7 +22,8 @@ EFF = {
     "decode": 0.90,      # dense. Bolt-E4B 61.1 / 68.1 (reference/calibration.md)
     "decode_moe": 0.78,  # expert gather. Flint 101 / 130
     "prefill": 0.33,     # end to end. Bolt-E4B with d256/d512 flash prefill: 2339 / 7094 (Flint 0.22-0.28)
-    "c4": 0.70,          # Bolt 0.65, Flint 0.74
+    "c4": 0.70,          # dense. Bolt 0.65-0.66
+    "c4_moe": 0.85,      # Flint 0.74, LFM2.5-24B-A2B 0.91
 }
 # Stretch: plausible with known-but-unbuilt levers (not yet demonstrated end to end).
 STRETCH = {
@@ -30,6 +31,7 @@ STRETCH = {
     "decode_moe": 0.88,  # batched expert gather
     "prefill": 0.45,     # GEMM efficiency already seen in isolation, plus flash attention
     "c4": 0.85,
+    "c4_moe": 0.95,
 }
 GATHERED = re.compile(r"(^|\.)(token_embd|per_layer_token_embd)\.weight$")
 EXPERT = re.compile(r"_exps\.weight$")
@@ -105,10 +107,17 @@ def weight_bytes(tensors, geo):
     return read, params, head_bytes, detail
 
 
+def attn_layers(tensors, L):
+    """Layers that attend: those with a q projection. Hybrids (LFM2 short-conv, Mamba,
+    delta-net) have attention in only some blocks; KV-shared layers still have q."""
+    found = {i for i in range(L) if any(f"blk.{i}.attn_q{s}.weight" in tensors for s in ("", "kv"))}
+    return found or set(range(L))
+
+
 def kv_read_bytes(geo, ctx):
     """F16 K+V bytes read per decode token with `ctx` tokens cached (every attending layer)."""
     tot = 0
-    for i in range(geo["L"]):
+    for i in sorted(geo["attn"]):
         sl = i in geo["sliding"]
         hd = geo["hd_swa"] if sl else geo["hd"]
         n = min(ctx, geo["window"]) if (sl and geo["window"]) else ctx
@@ -119,7 +128,7 @@ def kv_read_bytes(geo, ctx):
 def attn_flops_per_token(geo, P):
     """Prefill attention flops per prompt token, causal, prompt length P."""
     tot = 0
-    for i in range(geo["L"]):
+    for i in sorted(geo["attn"]):
         sl = i in geo["sliding"]
         hd = geo["hd_swa"] if sl else geo["hd"]
         avg = min(P / 2, geo["window"]) if (sl and geo["window"]) else P / 2
@@ -162,6 +171,7 @@ def main():
     cfg = json.load(open(a.cfg)) if a.cfg else {}
     meta, tensors = load(a.gguf)
     geo = geometry(meta, cfg)
+    geo["attn"] = attn_layers(tensors, geo["L"])
     wb, params, head, detail = weight_bytes(tensors, geo)
     base = json.load(open(a.baseline)) if a.baseline else {}
     ctxs = [int(x) for x in a.ctx.split(",")]
@@ -184,9 +194,11 @@ def main():
     # 4 streams: one weight pass serves 4 tokens; KV at ~short context
     exp = detail.get("experts (active)", 0)
     if exp:   # 4 tokens route independently: ~min(n_exp, 4*k) distinct experts per layer
-        exp4 = exp * min(geo["n_exp"], 4 * geo["n_used"]) / geo["n_used"]
+        n, k = geo["n_exp"], geo["n_used"]
+        exp4 = exp * n * (1 - (1 - k / n) ** 4) / k            # expected distinct experts
     c4 = 4 * a.bw / (wb - exp + (exp4 if exp else 0) + 4 * kv_read_bytes(geo, 600))
-    rows.append(pick_target("c4_steady", base.get("c4_steady"), c4, EFF["c4"], STRETCH["c4"]))
+    ck = "c4_moe" if geo["n_exp"] else "c4"
+    rows.append(pick_target("c4_steady", base.get("c4_steady"), c4, EFF[ck], STRETCH[ck]))
 
     out = dict(gguf=a.gguf, geometry={k: (sorted(v) if isinstance(v, set) else v)
                                       for k, v in geo.items()},

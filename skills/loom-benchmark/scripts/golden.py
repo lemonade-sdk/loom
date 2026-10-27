@@ -29,10 +29,13 @@ for n in [int(x) for x in a.long.split(",") if x]:
     for q in ("Summarize this documentation in one sentence.", "What is the main command shown in this documentation?"):
         items.append((q + "\n\n" + doc(n), 64))
 out = []
+# Samplers are forced off: some GGUFs set penalty_repeat (LFM2.5: 1.05), which llama.cpp
+# applies even at temperature 0, and Loom decodes greedily.
 for prompt, n_predict in items:
     ids = pkg.ids(pkg.render(prompt))
     r = requests.post(a.llama + "/completion", json={"prompt": ids, "n_predict": n_predict, "temperature": 0, "n_probs": 5,
-                                                     "cache_prompt": False, "return_tokens": True}).json()
+                                                     "cache_prompt": False, "return_tokens": True,
+                                                     "repeat_penalty": 1.0, "presence_penalty": 0.0, "frequency_penalty": 0.0}).json()
     if "tokens" not in r:  # e.g. the prompt exceeds the server's context: skip, don't crash
         print(f"SKIP {len(ids)} prompt tokens: {str(r)[:200]}", flush=True)
         continue

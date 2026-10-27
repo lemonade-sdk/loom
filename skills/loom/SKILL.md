@@ -55,7 +55,9 @@ without stopping:
 2. port;
 3. pass the gates;
 4. measure the llama.cpp baseline;
-5. run `loom-roofline` to set targets and a budget;
+5. run `loom-roofline` to set targets and a budget. This is **not optional**: the
+   report must contain the roofline table (`bench/roofline.json`) and the approach
+   curve (`bench/targets.jsonl`), and a report without them is incomplete;
 6. optimize, under the rate controller;
 7. pass the gates again;
 8. serve;
@@ -64,12 +66,11 @@ without stopping:
 Stop to ask only for what the hard rules require: a gated-license click, or
 approval of a binary you downloaded. Avoid both where possible:
 - **Reuse what is installed.** Check `~/loom/.venv/bin/loom-serve` and the HF cache.
-- **Find a llama.cpp ROCm build already on the machine first**, with
-  `find ~ -maxdepth 7 -name llama-server 2>/dev/null`. If several builds exist, use
-  the **newest lemonade-sdk ROCm tag** (`bNNNN`, check with `llama-server --version`),
-  and report the tag. Older builds differ a lot: on Bolt-E4B, b1274 did 125 tok/s at
-  c4 where b1355 did 157, which inflates Loom's margin. A build the user already
-  installed doesn't need approval; one you download in this session does.
+- **Baseline = the fastest llama.cpp ROCm build already on the machine.** Run
+  `loom-benchmark/scripts/pick_llamacpp.sh MODEL.gguf`. It finds and benchmarks
+  every HIP build. Version strings can't be trusted, and an old build inflated a
+  margin from +25 % to 2.5× in one run. A build the user already installed doesn't
+  need approval; one you download in this session does.
 
 The `loom-roofline` skill is at `${CLAUDE_SKILL_DIR}/../loom-roofline/SKILL.md`.
 Read it from there if it isn't in your skill list.

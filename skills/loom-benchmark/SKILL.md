@@ -13,7 +13,21 @@ id from a package built by `loom-port-llm/starter/build.py`.
 
 ## 0. Reference: llama.cpp ROCm (not Vulkan, not CPU)
 
-Use the lemonade-sdk ROCm build as the baseline (not Vulkan or CPU builds):
+**First, use what is already on the machine, and pick the fastest.**
+```bash
+S=${CLAUDE_SKILL_DIR}/scripts
+$S/pick_llamacpp.sh MODEL.gguf     # finds every llama-server with libggml-hip.so, benchmarks each, ranks them
+```
+The baseline is the top-ranked build. Don't choose by version string: the lemonade
+nightly prints `version: 1`, and the tag is usually only in the directory name.
+Builds differ a lot on the same GGUF:
+- LFM2.5-24B prefill: b1274 1,062 tok/s vs b1355 2,140 tok/s;
+- Bolt-E4B with 4 streams: b1274 125 tok/s vs b1355 157 tok/s.
+
+A weaker baseline inflates every margin you report. Report the chosen build's path
+and tag.
+
+If none is installed, download the lemonade-sdk ROCm build:
 ```bash
 mkdir -p ~/llamacpp-rocm && cd ~/llamacpp-rocm
 gh release download -R lemonade-sdk/llamacpp-rocm -p 'llama-*-ubuntu-rocm-gfx1151-x64.zip'   # latest; or pin a tag, e.g. b1355
@@ -22,9 +36,8 @@ unzip -q llama-*-gfx1151-x64.zip && chmod +x llama-server
 **Ask the user before running a freshly downloaded binary.** Pick the zip that matches the GPU (`gfx1151` = Strix
 Halo). Then:
 ```bash
-S=${CLAUDE_SKILL_DIR}/scripts
-LLAMACPP_DIR=~/llamacpp-rocm $S/llamacpp_server.sh MODEL.gguf 8130 1 34000   # goldens / long context (1 slot, 34k)
-LLAMACPP_DIR=~/llamacpp-rocm $S/llamacpp_server.sh MODEL.gguf 8130 4 8192    # perf incl. 4 streams
+LLAMACPP_DIR=<dir> $S/llamacpp_server.sh MODEL.gguf 8130 1 34000   # goldens / long context (1 slot, 34k)
+LLAMACPP_DIR=<dir> $S/llamacpp_server.sh MODEL.gguf 8130 4 8192    # perf incl. 4 streams
 kill $(cat /tmp/llamacpp-8130.pid)
 ```
 Always use the **same GGUF file** as the Loom package. Never run llama.cpp and a
@@ -70,7 +83,14 @@ $T $S/consistency.py http://127.0.0.1:8160 --model <model id>         # concurre
 - Long goldens (16k/32k) are what catch KV paging, prefill chunking and attention
   masking bugs.
 - `consistency.py` catches mixed-sequence epoch bugs (padding, tile uniformity,
-  fallback lists).
+  fallback lists). If it fails, find the first divergent token and its golden
+  log-prob gap. A divergence is acceptable only when **both** hold:
+  - it is a near-tie (gap < 0.05);
+  - the cause is identified and stated in the report. For example, decode tokens
+    that share an epoch with a prefill go through the f16 GEMM path instead of the
+    f32 matvec path.
+
+  Anything else is a bug.
 - 503 errors on long prompts mean `--memory_bytes` is too small for the KV pool,
   not a model bug.
 

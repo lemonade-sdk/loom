@@ -31,6 +31,23 @@ rows = []
 alt = {g["prompt"]: g for g in json.load(open(a.alt))} if a.alt else {}
 
 
+THINK_END = pkg.tok.token_to_id(pkg.chat.get("think_end", "</think>"))
+
+
+def strip_ws_after_think(g):
+    """Loom's control program drops whitespace after </think> (it is not part of either
+    channel), so raw_from_chat cannot reproduce it: drop a whitespace-only golden token
+    right after </think> (and its top-5 entry) before matching."""
+    ids, top = list(g["ids"]), list(g["top"])
+    for i in range(len(ids) - 1):
+        if ids[i] == THINK_END and pkg.tok.decode([ids[i + 1]]).strip() == "":
+            del ids[i + 1]
+            if i + 1 < len(top):
+                del top[i + 1]
+            break
+    return dict(g, ids=ids, top=top)
+
+
 def match(got, g):
     gold = g["ids"]
     n = 0
@@ -46,7 +63,9 @@ def match(got, g):
     return n, gap
 
 
+alt = {k: strip_ws_after_think(v) for k, v in alt.items()}
 for g in json.load(open(a.golden)):
+    g = strip_ws_after_think(g)
     t0 = time.perf_counter()
     r = requests.post(a.url + "/v1/chat/completions", headers={"Content-Type": "application/json"},
                       json={"model": pkg.model_id, "messages": [{"role": "user", "content": g["prompt"]}],
