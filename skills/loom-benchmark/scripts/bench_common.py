@@ -56,7 +56,7 @@ class Package:
         """Exactly what control.loom renders for one user message + generation prompt."""
         c = self.chat
         bos = self.tok.id_to_token(self.cfg["bos_id"]) if self.cfg.get("bos_id") is not None else ""
-        return bos + c["user_prefix"] + user + c["suffix"] + c["generation_prompt"]
+        return bos + c.get("default_system", "") + c["user_prefix"] + user + c["suffix"] + c["generation_prompt"]
 
     def ids(self, text):
         return self.tok.encode(text, add_special_tokens=False).ids

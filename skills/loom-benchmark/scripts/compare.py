@@ -95,5 +95,6 @@ summary = {"prompts": len(rows), "full_match": sum(r["full_match"] for r in rows
            "max_gap": round(max(gaps), 3) if gaps else 0.0, "bad": sum(r["bad"] for r in rows)}
 summary["verdict"] = "PASS" if summary["bad"] == 0 else "FAIL"
 print(json.dumps(summary))
-from campaign import log_gate
+from campaign import log_gate, run_audit
 log_gate("compare", summary["verdict"], golden=a.golden, **{k: summary[k] for k in ("prompts", "full_match", "max_gap", "bad")})
+run_audit()

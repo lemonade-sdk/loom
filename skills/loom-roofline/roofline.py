@@ -10,7 +10,8 @@ sharing). Prints, per metric, the hardware ceiling, the *practical* ceiling (cei
 the efficiency Loom has demonstrated on this hardware, see EFF), and - if --baseline
 gives llama.cpp numbers - the target, stretch and margin over llama.cpp.
 
---baseline is a JSON object of llama.cpp ROCm numbers, keys as in perf.py output:
+--baseline is perf_log.jsonl (its latest llama.cpp rows are used), or a JSON object of
+llama.cpp ROCm numbers, keys as in perf.py output:
   {"decode_tps": 52.7, "decode_tps_2k": 48.7, "prefill_1000": 1593, "prefill_2000": 1678,
    "c4_steady": 157}
 """
@@ -33,6 +34,10 @@ STRETCH = {
     "c4": 0.85,
     "c4_moe": 0.95,
 }
+# Fixed per-layer cost per decode step (launches, norms, small kernels, sync) that does
+# not shrink with model size. Best seen: Bolt-E4B 1.69 ms over 42 layers = 40 us.
+# It dominates small models (Qwen2.5-0.5B: 1.8 ms of weights, 24 layers).
+LAYER_US = 35
 GATHERED = re.compile(r"(^|\.)(token_embd|per_layer_token_embd)\.weight$")
 EXPERT = re.compile(r"_exps\.weight$")
 
@@ -177,18 +182,35 @@ def main():
     geo = geometry(meta, cfg)
     geo["attn"] = attn_layers(tensors, geo["L"])
     wb, params, head, detail = weight_bytes(tensors, geo)
-    base = json.load(open(a.baseline)) if a.baseline else {}
+    base = {}
+    if a.baseline and a.baseline.endswith(".jsonl"):   # perf_log.jsonl: latest llama.cpp rows
+        for l in open(a.baseline):
+            r = json.loads(l)
+            if r.get("kind") != "llama":
+                continue
+            for k in ("decode_tps", "decode_tps_1k", "decode_tps_2k", "decode_tps_32k"):
+                if k in r:
+                    base[k] = r[k]
+            for p in r.get("prefill", []) + r.get("prefill_long", []):
+                n = min((1000, 2000, 8000, 16000, 32000), key=lambda x: abs(x - p["prompt_tokens"]))
+                base[f"prefill_{n}"] = p["prefill_tps"]
+    elif a.baseline:
+        base = json.load(open(a.baseline))
     ctxs = [int(x) for x in a.ctx.split(",")]
 
     rows = []
     dec = a.bw / wb
     key = "decode_moe" if geo["n_exp"] else "decode"
     ed, sd = EFF[key], STRETCH[key]
-    rows.append(pick_target("decode_tps", base.get("decode_tps"), dec, ed, sd))
+    floor_ms = geo["L"] * LAYER_US / 1000
+
+    def dec_eff(ceil, e):  # efficiency vs the bandwidth ceiling, capped by the per-layer floor
+        return min(e, (1000 / (1000 / ceil + floor_ms)) / ceil)
+    rows.append(pick_target("decode_tps", base.get("decode_tps"), dec, dec_eff(dec, ed), dec_eff(dec, sd)))
     for c in ctxs:
         k = f"decode_tps_{c // 1000}k"
         r = a.bw / (wb + kv_read_bytes(geo, c))
-        rows.append(pick_target(k, base.get(k), r, ed, sd))
+        rows.append(pick_target(k, base.get(k), r, dec_eff(r, ed), dec_eff(r, sd)))
     for P in ctxs:
         k = f"prefill_{P}"
         hb = tensors.get("output.weight", tensors.get("token_embd.weight"))[1]

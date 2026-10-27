@@ -101,6 +101,11 @@ recent llama.cpp; older trees have it in `src/llama-model.cpp`). Check these fie
   - `think_close` (what follows reasoning in history);
   - `terminal`.
 
+  Some templates insert a **default system prompt** when the conversation has none.
+  Qwen2.5, for example, inserts "You are Qwen, created by Alibaba Cloud…". Put the
+  rendered block in `chat.default_system`: the control program must emit it, and
+  `bench_common.py` renders prompts with it.
+
   `inspect_gguf.py` decides thinking mode from the template's
   `add_generation_prompt` block and prints it. Check it against the model card:
   - Hybrid Qwen3 (e.g. Qwen3-0.6B) thinks. Use `generation_prompt`

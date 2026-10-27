@@ -34,5 +34,6 @@ with cf.ThreadPoolExecutor(a.n) as ex:
 same = [x[0] == y[0] for x, y in zip(alone, together)]
 print("prompt tokens", [x[1] for x in alone], "identical when concurrent:", same)
 print("PASS" if all(same) else "FAIL")
-from campaign import log_gate
+from campaign import log_gate, run_audit
 log_gate("consistency", "PASS" if all(same) else "FAIL", identical=same)
+run_audit()

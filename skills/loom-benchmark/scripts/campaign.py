@@ -14,6 +14,32 @@ import time
 PROGRESS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "loom-roofline", "progress.py")
 
 
+SCRIPTS = os.path.dirname(os.path.abspath(__file__))
+ROOFLINE = os.path.join(SCRIPTS, "..", "..", "loom-roofline", "roofline.py")
+
+
+def require(kind, log_path="perf_log.jsonl"):
+    """Exit with the exact next command when a required campaign step was skipped."""
+    d = os.path.dirname(os.path.abspath(log_path))
+    if kind == "llama" and not os.path.exists(os.path.join(d, "llamacpp_pick.json")):
+        sys.exit(f"ERROR: no llamacpp_pick.json in {d}. The baseline must be the fastest llama.cpp ROCm build "
+                 f"on this machine. Run, from {d}:\n  {SCRIPTS}/pick_llamacpp.sh MODEL.gguf\n"
+                 "then start the top-ranked build with llamacpp_server.sh and re-run this. "
+                 "(--no-campaign for an ad-hoc measurement.)")
+    if kind == "loom" and not find_roofline(log_path):
+        sys.exit(f"ERROR: no roofline.json in {d}. Measure the llama.cpp baseline first (perf.py --kind llama "
+                 f"into this same log), then run:\n  {sys.executable} {ROOFLINE} MODEL.gguf --cfg ../cfg.json "
+                 f"--baseline {os.path.basename(log_path)} --out {d}/roofline.json --budget-h 1\n"
+                 "(--no-campaign for an ad-hoc or ablation measurement.)")
+
+
+def run_audit():
+    """Run the definition-of-done audit after a gate, so the agent sees what is missing."""
+    r = subprocess.run([sys.executable, os.path.join(SCRIPTS, "audit.py"), "."], capture_output=True, text=True)
+    lines = [l for l in r.stdout.splitlines() if l.startswith(("[FAIL]", "[WARN]", "AUDIT"))]
+    print("\n[audit] " + "\n[audit] ".join(lines or ["(audit produced no output)"]), flush=True)
+
+
 def find_roofline(log_path="perf_log.jsonl"):
     for d in (os.path.dirname(os.path.abspath(log_path)), os.getcwd()):
         p = os.path.join(d, "roofline.json")

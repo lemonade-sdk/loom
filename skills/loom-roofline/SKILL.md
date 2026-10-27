@@ -45,17 +45,17 @@ In every case:
 
 - The GGUF and the port's `cfg.json`. The cfg supplies sliding layers, KV sharing
   (`kv_layers`) and `head_dim_swa`, which the GGUF may not spell out.
-- llama.cpp ROCm numbers on the same GGUF, from `perf.py` / `c4_steady.py`
-  (`loom-benchmark`). Write them as `baseline.json`:
-  `{"decode_tps":…, "decode_tps_1k":…, "decode_tps_2k":…, "prefill_1000":…, "prefill_2000":…, "c4_steady":…}`.
-  For long context add `decode_tps_16k`, `prefill_16000`, and so on.
+- llama.cpp ROCm numbers on the same GGUF, from the fastest build
+  (`pick_llamacpp.sh`), measured with `perf.py --kind llama` into
+  `bench/perf_log.jsonl`. `roofline.py --baseline bench/perf_log.jsonl` reads the
+  latest llama.cpp rows from it.
 - The current Loom numbers, if the port already exists.
 
 ## 2. Run
 
 ```bash
 T=~/loom/.tools/bin/python; R=${CLAUDE_SKILL_DIR}
-$T $R/roofline.py MODEL.gguf --cfg cfg.json --baseline baseline.json --ctx 1000,2000,16000 --out bench/roofline.json \
+$T $R/roofline.py MODEL.gguf --cfg cfg.json --baseline bench/perf_log.jsonl --ctx 1000,2000,16000 --out bench/roofline.json \
    --budget-h 1            # the user's budget (section 0); add --goal decode_tps=70 for a user target
 ```
 The script prints the bytes read per decode token, broken down by kind, so you can
@@ -133,6 +133,14 @@ the new target and the reason in the log.
 Optimization returns diminish, so the question is never "is there more to gain?"
 (there always is, up to the ceiling). The question is **how fast this path is
 closing the gap**, compared with the other paths available.
+
+**Order is enforced.** `perf.py` exits with an error, naming the command to run, if
+it can't find:
+- `llamacpp_pick.json`, for a llama.cpp run (so run `pick_llamacpp.sh` first);
+- `roofline.json`, for a Loom run.
+
+Use `--no-campaign` only for ablation or ad-hoc builds. The final `compare.py` /
+`consistency.py` print the audit's FAIL and WARN lines.
 
 **Tracking is automatic.** Once `bench/roofline.json` exists, every Loom run of
 `perf.py` (run from `bench/`) and `c4_steady.py --label NAME` does three things:
