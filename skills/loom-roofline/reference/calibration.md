@@ -19,6 +19,8 @@ campaign, including ones that missed their target.
 | LFM2.5-24B-A2B (lfm2moe hybrid: 30 short-conv + 10 attention layers, MoE 64×4, Q4_K_M; fresh agent, 1 turn, 74 min) | decode | 140 | 100.4 | 0.72 | 97.3 (b1355) | MoE decode below 0.78; the roofline step was skipped, so no targets steered the run |
 | 〃 | prefill 1k / 2k | 13208 / 12970 | 2677 / 2744 | 0.20 / 0.21 | 2140 / 2213 | prefill chunk 4096: every chunk reads all 64 experts |
 | 〃 | c4 steady | 204 | 185.7 | 0.91 | 158.9 | |
+| Qwen2.5-0.5B-Instruct (qwen2 dense, Q4_K_M/Q5_0; fresh agent, 1 turn, 35 min, campaign tools used) | decode | 551 (target 377 with per-layer floor) | 289 | 0.52 | 288 (b1355) | small model: per-layer launch cost dominates |
+| 〃 | prefill 1k / 2k / 16k | 77769 / 73596 / – | 17571 / 18571 / 11920 | 0.23 / 0.25 / 0.28 | 13851 / 13890 / 8202 | |
 | Flint (MoE 256×6, int4 q4_1) | decode | 130 | 99–104 | 0.78 | 62 | expert gather bound |
 | 〃 | decode @32k | 82.7 | 63 | 0.76 | 48 | |
 | 〃 | prefill 2k | 11946 | ~2650 | 0.22 | 1509 | |

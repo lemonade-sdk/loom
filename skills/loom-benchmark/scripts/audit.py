@@ -54,11 +54,15 @@ if pick and pick.get("ranked") and roof:
 check("roofline: ran with a baseline", roof is not None and metrics.get("decode_tps", {}).get("baseline"),
       "roofline.json missing or without --baseline: run loom-roofline")
 
-# plausibility, both directions
-best = {}
+# plausibility, both directions (best kept value); the headline uses the final build
+best, final = {}, {}
 for r in targets:
     if r.get("kept", True):
         best[r["metric"]] = max(best.get(r["metric"], 0), r["value"])
+        final.setdefault(r["metric"], []).append(r)
+for m, rs in final.items():   # final build = last kept label; median of its runs (noise is ±5-10 %)
+    vals = sorted(x["value"] for x in rs if x.get("label") == rs[-1].get("label")) or [rs[-1]["value"]]
+    final[m] = vals[len(vals) // 2]
 for m, R in metrics.items():
     if m in best:
         e = best[m] / R["ceiling"]
@@ -103,14 +107,18 @@ for m, R in metrics.items():
     if m not in best:
         continue
     goal = roof.get("campaign", {}).get("goals", {}).get(m) or R["target"]
-    rows.append({"metric": m, "llama_cpp": R.get("baseline"), "loom": best[m],
-                 "margin": round(best[m] / R["baseline"] - 1, 3) if R.get("baseline") else None,
-                 "pct_of_ceiling": round(best[m] / R["ceiling"], 3), "target": goal,
-                 "met": best[m] >= goal * 0.99})
-print(f"{'metric':16} {'llama.cpp':>9} {'Loom':>9} {'margin':>7} {'%ceil':>6} {'target':>8}  met")
+    v = final[m]
+    rows.append({"metric": m, "llama_cpp": R.get("baseline"), "loom": v, "loom_best_seen": best[m],
+                 "margin": round(v / R["baseline"] - 1, 3) if R.get("baseline") else None,
+                 "pct_of_ceiling": round(v / R["ceiling"], 3), "target": goal,
+                 "met": v >= goal * 0.99})
+print("Loom = final build (median of its runs); best = best single kept run")
+print(f"{'metric':16} {'llama.cpp':>9} {'Loom':>9} {'best':>7} {'margin':>7} {'%ceil':>6} {'target':>8}  met")
 for r in rows:
-    print(f"{r['metric']:16} {r['llama_cpp'] or 0:9.1f} {r['loom']:9.1f} "
-          f"{(r['margin'] or 0):+7.0%} {r['pct_of_ceiling']:6.0%} {r['target']:8.1f}  {'yes' if r['met'] else 'no'}")
+    lc = f"{r['llama_cpp']:9.1f}" if r["llama_cpp"] else f"{'-':>9}"
+    mg = f"{r['margin']:+7.0%}" if r["margin"] is not None else f"{'-':>7}"
+    print(f"{r['metric']:16} {lc} {r['loom']:9.1f} {r['loom_best_seen']:7.1f} "
+          f"{mg} {r['pct_of_ceiling']:6.0%} {r['target']:8.1f}  {'yes' if r['met'] else 'no'}")
 if pick and pick.get("ranked"):
     print(f"baseline build: {pick['ranked'][0]['dir']}")
 print()
