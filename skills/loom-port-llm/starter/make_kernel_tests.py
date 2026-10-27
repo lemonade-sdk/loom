@@ -104,5 +104,5 @@ cases.append(f"""check.case public @qk_rope {{
   check.return
 }}
 """)
-open(os.path.join(out, "cases.loom-test"), "w").write("\n".join(cases))
+open(os.path.join(out, "cases.loom-test"), "w", newline="\n").write("\n".join(cases))
 print("wrote", len(cases), "cases")

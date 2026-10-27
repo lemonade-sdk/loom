@@ -24,6 +24,9 @@ The script:
   and httpx for the port, benchmark and UI scripts.
 
 Facts:
+- **Windows:** run the script from Git Bash. It installs the `loom-sdk-wheel-windows`
+  artifact; there is no pinned Windows wheel, so `pinned` falls back to `latest`.
+  Venvs use `Scripts/`. See the `loom` skill's Windows section.
 - There is no PyPI release. CI artifacts expire after about 90 days. If the pinned one is
   gone, use `latest` and note which commit you got (`gh api repos/ROCm/hrx-system/actions/artifacts/<id>`).
 - You need `gh auth status` to be logged in. `python3 -m venv` needs Python ≥ 3.12.

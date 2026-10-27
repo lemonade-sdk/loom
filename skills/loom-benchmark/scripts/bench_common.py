@@ -40,7 +40,7 @@ PROMPTS = [
 
 def doc(n):
     """Real-text document of ~n tokens (Loom docs markdown): 1000 2000 8000 16000 32000."""
-    return open(os.path.join(DATA, f"doc_{n}.txt")).read()
+    return open(os.path.join(DATA, f"doc_{n}.txt"), encoding="utf-8").read()
 
 
 class Package:

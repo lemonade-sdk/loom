@@ -2040,5 +2040,5 @@ if __name__ == "__main__":
     parts.append(open(flash2).read())
     parts.append(program)
     out = os.path.join(out_dir, "model.loom")
-    open(out, "w").write("\n".join(parts))
+    open(out, "w", newline="\n").write("\n".join(parts))
     print("wrote", out)

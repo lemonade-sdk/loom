@@ -28,6 +28,32 @@ tools venv `~/loom/.tools`). Substitute your own root consistently. The scripts 
 `VENV=` (serve.sh, run_kernel_tests.sh), `UI_VENV=` or the 2nd argument (start_ui.sh),
 and `LOOM_SERVE_STATE=` (the serve.sh PID/log dir).
 
+## Windows
+
+The whole pipeline (install, port, kernel tests, golden gate, perf, serve) works on
+Windows 11 on Strix Halo. Run the scripts from **Git Bash**. Differences:
+- Venv executables are in `Scripts/`, not `bin/`. Read every `~/loom/.venv/bin/X`
+  and `~/loom/.tools/bin/python` in these skills as `~/loom/.venv/Scripts/X` and
+  `~/loom/.tools/Scripts/python`. The scripts detect this themselves.
+- The SDK is the `loom-sdk-wheel-windows` artifact, which only `Loom / SDK`
+  (`build_loom_sdk.yml`) runs and release tags produce. The library pins a Linux
+  wheel only, so `install_loom.sh` takes the latest Windows wheel. `--device=amdgpu`
+  reports `driver: amd, backend: libamdf` in `/v1/status`.
+- Python: `install_loom.sh` uses `py -3` (override with `PYTHON=`). On Python < 3.15,
+  text files default to cp1252, so open text files with `encoding="utf-8"`.
+- `ss`, `pgrep` and `/sys` don't exist. Use these instead:
+  - ports: `netstat -ano -p tcp | grep LISTENING`;
+  - processes: `ps -W | grep -E 'loom-serve|llama-server'`;
+  - GPU memory: `llama-server --list-devices` shows the HIP-visible VRAM (91.6 GiB
+    on a 128 GB box with a 32 GiB BIOS carve-out).
+- `build.py` symlinks the GGUF. Without Developer Mode it hard-links it instead,
+  which needs the package and the GGUF on the same drive.
+- **llama.cpp:** lemonade installs builds in `~/.cache/lemonade/bin/llamacpp/{rocm,rocm-stable,rocm-preview}`.
+  A build missing its HIP/BLAS DLLs **silently runs on CPU**: on the original
+  machine only one of the three saw the GPU. Check with `llama-server --list-devices`.
+  `llamacpp_server.sh` refuses a build that lists no `ROCm` device, so
+  `pick_llamacpp.sh` skips it.
+
 Typical cold-start order: `loom-setup` → (`loom-demo-ui`) → `loom-port-llm` →
 `loom-benchmark` (baseline + golden) → `loom-roofline` (targets) → `loom-optimize` ↔ `loom-benchmark`.
 
@@ -66,7 +92,7 @@ without stopping:
 
 Stop to ask only for what the hard rules require: a gated-license click, or
 approval of a binary you downloaded. Avoid both where possible:
-- **Reuse what is installed.** Check `~/loom/.venv/bin/loom-serve` and the HF cache.
+- **Reuse what is installed.** Check `~/loom/.venv/bin/loom-serve` (Windows: `.venv/Scripts/loom-serve.exe`) and the HF cache.
 - **Baseline = the fastest llama.cpp ROCm build already on the machine.** Run
   `loom-benchmark/scripts/pick_llamacpp.sh MODEL.gguf`. It finds and benchmarks
   every HIP build. Version strings can't be trusted, and an old build inflated a
@@ -101,7 +127,7 @@ Read it from there if it isn't in your skill list.
   READY after about 1 s is normal, since compiled kernels are cached and weights
   load on the first request. A stale server shows up as a READY from a PID that
   isn't yours, or as old behavior.
-- Before starting llama-server or loom-serve, check the port is free (`ss -ltnp`).
+- Before starting llama-server or loom-serve, check the port is free (`ss -ltnp`; Windows: `netstat -ano`).
 - Golden references must be external (llama.cpp ROCm or the model's own reference
   implementation), never a numpy model you wrote yourself.
 

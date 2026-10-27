@@ -293,4 +293,4 @@ for key, value in {"{KT_LESS}": KT - 1, "{KT}": KT, "{KBYTES}": KT * 136 * 2, "{
     text = text.replace(key, str(value))
 assert "{" not in "".join(l for l in text.split("\n") if "{P}" in l or "{KVH" in l)
 out_path = os.environ.get("FLASH2_OUT", os.path.join(os.path.dirname(os.path.abspath(__file__)), "flash2.loom"))
-open(out_path, "w").write(text)
+open(out_path, "w", newline="\n").write(text)

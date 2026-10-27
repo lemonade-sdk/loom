@@ -33,6 +33,9 @@ mkdir -p ~/llamacpp-rocm && cd ~/llamacpp-rocm
 gh release download -R lemonade-sdk/llamacpp-rocm -p 'llama-*-ubuntu-rocm-gfx1151-x64.zip'   # latest; or pin a tag, e.g. b1355
 unzip -q llama-*-gfx1151-x64.zip && chmod +x llama-server
 ```
+On Windows, download the `llama-*-windows-rocm-gfx1151-x64.zip` asset instead, or reuse a
+lemonade build from `~/.cache/lemonade/bin/llamacpp/`. Either way, check that
+`llama-server --list-devices` shows `ROCm0`, because a build missing its DLLs falls back to CPU silently.
 **Ask the user before running a freshly downloaded binary.** Pick the zip that matches the GPU (`gfx1151` = Strix
 Halo). Then:
 ```bash
@@ -125,7 +128,7 @@ Rules:
 - llama.cpp numbers use its server-side `timings`, which exclude HTTP and
   tokenization. That slightly favors llama.cpp; say so.
 - Measure on an idle machine: stop the demo servers and other models first
-  (`pgrep -af "loom-serve|llama-server"`).
+  (`pgrep -af "loom-serve|llama-server"`; Windows: `ps -W | grep -E 'loom-serve|llama-server'`).
 - Noise levels:
   - decode and c4 vary by about ±2–3 %;
   - short prefill varies a lot, so use the median;

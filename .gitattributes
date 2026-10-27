@@ -1,0 +1,4 @@
+# LF everywhere: CRLF .sh files break non-Git-Bash shells on Windows, and the starter copies
+# templates into generated packages.
+* text=auto eol=lf
+*.wav binary

@@ -57,29 +57,35 @@ subs = {
     "@@CHAT_COMMENT@@": json.dumps({k: v for k, v in chat.items()})[:400],
 }
 for name in ("prepare", "control", "storage", "service"):
-    text = open(os.path.join(HERE, "templates", name + ".loom")).read()
+    text = open(os.path.join(HERE, "templates", name + ".loom"), encoding="utf-8").read()
     for k, v in subs.items():
         text = text.replace(k, v)
     assert "@@" not in text, (name, [l for l in text.splitlines() if "@@" in l])
-    open(os.path.join(pkg, "program", name + ".loom"), "w").write(text)
-open(os.path.join(pkg, "weights.loom"), "w").write(open(os.path.join(HERE, "templates", "weights.loom")).read())
+    open(os.path.join(pkg, "program", name + ".loom"), "w", encoding="utf-8", newline="\n").write(text)
+open(os.path.join(pkg, "weights.loom"), "w", encoding="utf-8", newline="\n").write(open(os.path.join(HERE, "templates", "weights.loom"), encoding="utf-8").read())
 
 # 3. Tokenizer. loom-serve strips *special* added tokens from decoded text; any
 # structural token the control program must see in the output (channel tags,
 # e.g. Glimmer's <|start|>/<|message|>) is listed in chat.nonspecial_tokens.
-tok = json.load(open(a.tokenizer))
+tok = json.load(open(a.tokenizer, encoding="utf-8"))
 keep = set(chat.get("nonspecial_tokens", []))
 for t in tok.get("added_tokens", []):
     if t["content"] in keep:
         t["special"] = False
-json.dump(tok, open(os.path.join(pkg, "tokenizer.json"), "w"), ensure_ascii=False)
+json.dump(tok, open(os.path.join(pkg, "tokenizer.json"), "w", encoding="utf-8"), ensure_ascii=False)
 
-# 4. Weights (symlink) and the package card.
+# 4. Weights (symlink; hard link on Windows without Developer Mode) and the package card.
 gguf_name = os.path.basename(cfg["gguf"])
 link = os.path.join(pkg, "parameter", gguf_name)
 if os.path.lexists(link):
     os.remove(link)
-os.symlink(os.path.abspath(cfg["gguf"]), link)
+try:
+    os.symlink(os.path.abspath(cfg["gguf"]), link)
+except OSError:  # Windows needs Developer Mode (or admin) for symlinks
+    try:
+        os.link(os.path.realpath(cfg["gguf"]), link)
+    except OSError as e:
+        sys.exit(f"cannot link {cfg['gguf']} into {link} ({e}): enable Windows Developer Mode, or put the package on the GGUF's drive")
 card = {
     "schema_version": 1,
     "model": {"id": a.model_id or cfg.get("name", "llm"), "name": f"{cfg.get('name', 'llm')} (Loom port, GGUF)"},

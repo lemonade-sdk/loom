@@ -116,7 +116,9 @@ order:
 
 ## Requirements
 
-- Linux, and an AMD GPU (ROCm-class; developed on gfx1151). The NPU path needs an
+- Linux or Windows 11 (Git Bash), and an AMD GPU (ROCm-class; developed on gfx1151).
+  Windows was verified end to end on Strix Halo with Qwen3-0.6B; see the `loom` skill's
+  Windows section. The NPU path needs an
   XDNA device.
 - `gh`, authenticated: the Loom SDK wheel is a GitHub Actions artifact of
   ROCm/hrx-system, not a PyPI package.

@@ -8,20 +8,21 @@
 set -u
 gguf=$1; port=${2:-8139}; root=${3:-$HOME}
 here=$(cd "$(dirname "$0")" && pwd)
-py=${PY:-$HOME/loom/.tools/bin/python}
+py=${PY:-$HOME/loom/.tools/bin/python}; [ -x "$py" ] || py=$HOME/loom/.tools/Scripts/python   # Windows venvs use Scripts/
 doc=$here/../data/doc_1000.txt
-mapfile -t dirs < <(find "$root" -maxdepth 7 -name llama-server -type f 2>/dev/null \
-  | xargs -r -n1 dirname | while read -r d; do [ -e "$d/libggml-hip.so" ] && echo "$d"; done \
-  | while read -r d; do echo "$(readlink -f "$d/llama-server" | xargs sha256sum | cut -c1-16) $d"; done \
+# HIP builds: libggml-hip.so (Linux) or ggml-hip.dll (Windows) next to llama-server[.exe].
+mapfile -t dirs < <(find "$root" -maxdepth 7 \( -name llama-server -o -name llama-server.exe \) -type f 2>/dev/null \
+  | xargs -r -n1 dirname | while read -r d; do { [ -e "$d/libggml-hip.so" ] || [ -e "$d/ggml-hip.dll" ]; } && echo "$d"; done \
+  | while read -r d; do echo "$(readlink -f "$d"/llama-server* | head -1 | xargs sha256sum | cut -c1-16) $d"; done \
   | sort -u -k1,1 | cut -d' ' -f2-)
-[ ${#dirs[@]} -gt 0 ] || { echo "no llama.cpp ROCm build found (no libggml-hip.so next to llama-server)"; exit 1; }
+[ ${#dirs[@]} -gt 0 ] || { echo "no llama.cpp ROCm build found (no libggml-hip.so / ggml-hip.dll next to llama-server)"; exit 1; }
 echo "candidates (deduplicated by binary hash): ${#dirs[@]}"
 res=()
 for d in "${dirs[@]}"; do
   LLAMACPP_DIR=$d bash "$here/llamacpp_server.sh" "$gguf" "$port" 1 8192 >/dev/null 2>&1 || { echo "  $d: failed to start"; continue; }
   line=$("$py" - "$port" "$doc" <<'E'
 import json, sys, requests
-port, doc = sys.argv[1], open(sys.argv[2]).read()
+port, doc = sys.argv[1], open(sys.argv[2], encoding="utf-8").read()
 u = f"http://127.0.0.1:{port}/completion"
 requests.post(u, json={"prompt": "hi", "n_predict": 8})                  # warm-up
 d = requests.post(u, json={"prompt": "Write an essay about rivers.", "n_predict": 200,

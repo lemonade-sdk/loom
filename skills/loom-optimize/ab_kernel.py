@@ -53,5 +53,5 @@ old = extract(open(old_path).read(), name)
 old = old.replace(f'export("{name}") @{name}(', f'export("{name}_old") @{name}_old(', 1)
 new_text = open(new_path).read()
 extract(new_text, name)  # must exist in the new build too
-open(out, "w").write(new_text + f"\n// ---- A/B: {name} from {old_path}\n" + old + "\n")
+open(out, "w", newline="\n").write(new_text + f"\n// ---- A/B: {name} from {old_path}\n" + old + "\n")
 print(f"wrote {out}: new library + @{name}_old; append check.case records and run loom-test")

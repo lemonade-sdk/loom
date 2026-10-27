@@ -1,10 +1,11 @@
 #!/bin/bash
 # usage: VENV=~/loom/.venv run_kernel_tests.sh PACKAGE TESTDIR   (TESTDIR from make_kernel_tests.py)
 pkg=$(cd "$1" && pwd); dir=$2; venv=${VENV:-$HOME/loom/.venv}
+bin=$venv/bin; [ -d "$bin" ] || bin=$venv/Scripts   # Windows venvs use Scripts/
 cd "$dir" && cat "$pkg/program/llm.loom" cases.loom-test > combined.loom-test
-"$venv/bin/loom-test" combined.loom-test --device=${DEVICE:-amdgpu} > out.json 2> err.txt
+"$bin/loom-test" combined.loom-test --device=${DEVICE:-amdgpu} > out.json 2> err.txt
 grep -v '^{"format' err.txt | head -20
-python3 - <<'PY'
+"$bin/python" - <<'PY'
 import json
 d = json.load(open("out.json")); bad = 0
 for s in d["samples"]:
