@@ -163,6 +163,59 @@ jobs:
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           claude --version
 
+      # Older local builds may not know a new model's architecture. Each release is kept in its own
+      # directory, where pick_llamacpp.sh finds it next to the other builds.
+      - name: Get the latest llama.cpp ROCm build
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LLAMACPP_REPO: lemonade-sdk/llamacpp-rocm
+          LLAMACPP_ASSET: ubuntu-rocm-gfx1151-x64.zip
+        run: |
+          set -euo pipefail
+          python3 - <<'EOF'
+          import json, os, shutil, tempfile, urllib.request, zipfile
+
+          repo, suffix = os.environ["LLAMACPP_REPO"], os.environ["LLAMACPP_ASSET"]
+          auth = {"Authorization": f"Bearer {os.environ['GH_TOKEN']}"}
+          req = urllib.request.Request(f"https://api.github.com/repos/{repo}/releases/latest", headers=auth)
+          rel = json.load(urllib.request.urlopen(req))
+          tag = rel["tag_name"]
+          asset = next(a for a in rel["assets"] if a["name"].endswith(suffix))
+          root = os.path.expanduser("~/llamacpp-rocm")
+          dest = os.path.join(root, tag)
+          if os.path.isdir(dest):
+              msg = f"llama.cpp ROCm {tag}: already available locally ({dest}), not downloaded"
+          else:
+              os.makedirs(root, exist_ok=True)
+              tmp = tempfile.mkdtemp(dir=root, prefix=f".{tag}-")
+              try:
+                  zpath = os.path.join(tmp, asset["name"])
+                  urllib.request.urlretrieve(asset["browser_download_url"], zpath)
+                  out = os.path.join(tmp, "build")
+                  with zipfile.ZipFile(zpath) as z:
+                      z.extractall(out)
+                  # zipfile drops the executable bit.
+                  for d, _, files in os.walk(out):
+                      for f in files:
+                          if f.startswith("llama-") and "." not in f:
+                              os.chmod(os.path.join(d, f), 0o755)
+                  os.rename(out, dest)
+              finally:
+                  shutil.rmtree(tmp, ignore_errors=True)
+              msg = f"llama.cpp ROCm {tag}: downloaded {asset['name']} to {dest}"
+          server = next((os.path.join(d, "llama-server") for d, _, files in os.walk(dest) if "llama-server" in files), None)
+          if not server:
+              raise SystemExit(f"::error::{asset['name']} has no llama-server")
+          print(msg)
+          with open(os.environ["GITHUB_ENV"], "a") as f:
+              f.write(f"LLAMACPP_LATEST={os.path.dirname(server)}\nLLAMACPP_LATEST_TAG={tag}\n")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as s:
+              s.write(f"\n- {msg}\n")
+          EOF
+          cd "$LLAMACPP_LATEST"
+          LD_LIBRARY_PATH=$PWD ./llama-server --list-devices 2>&1 | grep ROCm \
+            || echo "::warning::llama.cpp ROCm $LLAMACPP_LATEST_TAG at $LLAMACPP_LATEST lists no ROCm device"
+
       - name: Port the model with the Loom skills
         timeout-minutes: 540
         run: |
@@ -201,8 +254,10 @@ jobs:
           - Write the finished package to $WORK/pkg (model.json, program/*.loom, weights.loom, tokenizer.json,
             llm_config.json), the benchmark/roofline outputs to $WORK/bench, and the final report to $WORK/REPORT.md.
           - Reuse the Loom install at ~/loom if present (install it with loom-setup otherwise) and the llama.cpp
-            ROCm builds already on this machine. Do not download and run new binaries. If no usable llama.cpp
-            ROCm build exists, fail.
+            ROCm builds already on this machine. The latest lemonade-sdk/llamacpp-rocm release
+            ($LLAMACPP_LATEST_TAG) was just installed in $LLAMACPP_LATEST for this run; pick_llamacpp.sh ranks it
+            with the others. Do not download and run any other binaries. If no usable llama.cpp ROCm build
+            exists, fail.
           - Start loom-serve only through the loom-setup serve.sh script (LOOM_SERVE_STATE is set), and stop
             every server you started before you finish.
           - Finish by writing $WORK/result.json:
