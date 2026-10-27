@@ -4,7 +4,7 @@ name: loom-factory
 # huggingface.co/loom-fun. Without a checkpoint input it takes the highest-trending GGUF chat LLM
 # (of the top 20 that fit) that loom-fun doesn't have yet, and skips if another run is active.
 # Scheduled runs only consider repositories published by the approved organizations listed in
-# .github/loom-factory/approved-publishers.txt.
+# PUBLISHERS in .github/scripts/loom_factory.py.
 
 on:
   schedule:

@@ -19,6 +19,14 @@ HF = "https://huggingface.co"
 QUANTS = ["Q4_K_M", "Q4_K_S", "Q5_K_M", "Q5_K_S", "Q6_K", "Q8_0"]
 SHARD = re.compile(r"-\d{5}-of-\d{5}(?=\.gguf$)", re.I)
 GIB = 2**30
+# Hugging Face organizations whose GGUF repositories scheduled runs may convert: original model
+# developers and established quantization providers (organization accounts, not individuals).
+PUBLISHERS = [
+    "unsloth", "ggml-org", "lmstudio-community",
+    "Qwen", "google", "microsoft", "amd", "nvidia", "meta-llama", "mistralai", "deepseek-ai", "openai",
+    "ibm-granite", "Intel", "tencent", "LiquidAI", "allenai", "HuggingFaceTB", "tiiuae", "CohereLabs",
+    "LGAI-EXAONE", "zai-org", "openbmb", "internlm", "JetBrains",
+]
 
 
 def get(url, token=None):
@@ -26,11 +34,6 @@ def get(url, token=None):
     with urllib.request.urlopen(req, timeout=60) as r:
         nxt = re.search(r'<([^>]+)>;\s*rel="next"', r.headers.get("Link", ""))
         return json.load(r), nxt.group(1) if nxt else None
-
-
-def load_publishers(path):
-    names = [line.split("#")[0].strip() for line in open(path, encoding="utf-8")]
-    return [n for n in names if n]
 
 
 def ranked_gguf_repos(publishers, token, per_publisher):
@@ -120,7 +123,7 @@ def explicit(a, token):
         sys.exit(f"{rid} {w[0]} is {w[2] / GIB:.1f} GiB, over the {a.max_gib} GiB Strix Halo budget")
     if m.get("gated"):
         print(f"warning: {rid} is gated; the HF_LOOM_FACTORY account must have accepted its license")
-    approved = rid.split("/")[0].lower() in {p.lower() for p in load_publishers(a.publishers)}
+    approved = rid.split("/")[0].lower() in {p.lower() for p in PUBLISHERS}
     names, sources = published(a.org, token)
     target = target_name(rid, a.org)
     note = "" if approved else ", publisher not on the approved list"
@@ -149,8 +152,7 @@ def cmd_select(a):
     names, sources = published(a.org, token)
 
     top, skipped = [], []
-    publishers = load_publishers(a.publishers)
-    for m in ranked_gguf_repos(publishers, token, a.per_publisher):
+    for m in ranked_gguf_repos(PUBLISHERS, token, a.per_publisher):
         if len(top) >= a.top:
             break
         rid, g = m["id"], m.get("gguf") or {}
@@ -183,7 +185,7 @@ def cmd_select(a):
     result = {"org": a.org, "max_gib": a.max_gib, "top": top, "skipped": skipped, "pick": pick}
     json.dump(result, open(a.out, "w", encoding="utf-8"), indent=1)
     report(a, top, skipped, pick,
-           f"### Top {len(top)} GGUF chat LLMs from the {len(publishers)} approved publishers "
+           f"### Top {len(top)} GGUF chat LLMs from the {len(PUBLISHERS)} approved publishers "
            f"(by Hugging Face trending score) that fit in {a.max_gib} GiB")
 
 
@@ -274,9 +276,6 @@ s = sub.add_parser("select")
 s.add_argument("--org", default="loom-fun")
 s.add_argument("--top", type=int, default=20)
 s.add_argument("--max-gib", type=float, default=48)
-s.add_argument("--publishers", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "..",
-                                                    "loom-factory", "approved-publishers.txt"),
-               help="approved Hugging Face organizations, one per line")
 s.add_argument("--per-publisher", type=int, default=50, help="most-downloaded GGUF repos to consider per publisher")
 s.add_argument("--max-attempts", type=int, default=2)
 s.add_argument("--attempts-file", help="artifact names of previous attempts, one per line")
