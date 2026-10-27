@@ -31,12 +31,21 @@ and `LOOM_SERVE_STATE=` (the serve.sh PID/log dir).
 Typical cold-start order: `loom-setup` → (`loom-demo-ui`) → `loom-port-llm` →
 `loom-benchmark` (baseline + golden) → `loom-roofline` (targets) → `loom-optimize` ↔ `loom-benchmark`.
 
-**"Optimize this model" with no target** means: run `loom-roofline`, announce
-per-metric targets (llama.cpp, target, margin, stretch, lever) without asking the user
-to choose, then iterate in `loom-optimize` until every headline target is met or
-its stop rule fires. Report met/short per metric with the reason. A user-supplied
-target still gets a roofline check: if it is above the practical ceiling, say so
-once, with the numbers.
+**"Optimize this model".** Run `loom-roofline`. It turns the request into a goal
+and a time budget:
+- with no target and no time given, the goal is the roofline targets and the
+  budget is **1 h** of the user's time;
+- a stated target and/or a time budget replaces the defaults.
+
+Announce the targets and the budget without asking, then iterate in
+`loom-optimize`. After each measurement, `progress.py` checks how fast the gap to
+the roofline is closing, per hour, and gives one of four verdicts:
+- continue;
+- review (pivot to another path, or fork from an earlier decision);
+- budget used up;
+- done.
+
+Report met or short for each metric, with the approach curve.
 
 ## Hard rules (learned the expensive way)
 

@@ -9,6 +9,34 @@ The point is to decide **once, up front, with numbers**, what the port should re
 so the optimization loop (`loom-optimize`) has a finish line, and so a stopping
 decision is a measurement rather than a debate.
 
+## 0. Effort: what the user asked for
+
+Read the request for two optional inputs: a **performance target** and a **time
+budget**. The time budget is the user's wall-clock time for the optimization
+campaign, from the roofline run to the final report, including builds, gates and
+reverted attempts. Porting and baseline measurement are prerequisites and are not
+counted, but report how long they took.
+
+| User said | Goal | Budget (`--budget-h`) |
+|---|---|---|
+| Nothing ("optimize this model") | The roofline TARGET per headline metric, then stretch | **1 h**: return a reasonable degree of optimization in an hour |
+| A time only ("spend 3 hours", "quick pass", "overnight") | TARGET, then stretch | As stated. "Quick" ≈ 0.5 h, "thorough" ≈ 4 h, "overnight" ≈ 8 h, "don't work all night" caps it |
+| A target only ("+50 % decode", "70 tok/s") | The user's target (`--goal-tps`) | No fixed cap. The rate controller still stops when no path can reach the target. If the projected time is more than ~2 h, say so with the numbers as soon as it is known |
+| Both | The user's target | As stated. If the projected time exceeds the budget, say so early: give what the budget buys, and what the target would take |
+
+In every case:
+- Check a user target against the roofline once. If it is above the stretch, say
+  so, with the ceiling.
+- If a user target is below TARGET, say how much more is available, then honor
+  their target as the finish line.
+- Within a budget, spend time where the **expected gain per hour** is highest
+  across the headline metrics. With 1 h this usually means the tuning levers on
+  1–2 metrics. A new kernel usually needs a multi-hour budget: in a 1 h run,
+  report it as the next step, with its expected gain, instead of starting it.
+- Keep a reserve (default 10 min) at the end for the final `compare.py` +
+  `consistency.py`, the server restart and the report. Never overrun the budget by
+  starting an attempt that cannot finish its gates in time.
+
 ## 1. Inputs (all from the same session, on an idle machine)
 
 - The GGUF and the port's `cfg.json`. The cfg supplies sliding layers, KV sharing
@@ -95,29 +123,91 @@ ablated kernels with the levers you have, is smaller than `gap_ms`, the target i
 not achievable this session. Lower it to what the identified levers give. Record
 the new target and the reason in the log.
 
-## 5. Stop rules (no "working all night")
+## 5. Steer by rate of approach (diminishing returns)
 
-Track each attempt in `bench/targets.jsonl` as one JSON line:
-`{metric, target, before, after, change, kept}`.
-- **Met.** Stop work on a metric as soon as two consecutive runs meet its target,
-  and the correctness gates pass.
-- **Stalled.** After 3 attempts in a row that each improve the target metric by
-  less than 1 %, re-ablate. After 2 re-ablations with no new lever, stop that metric
-  and keep the best build.
-- **Budget per lever, not per margin.** As a rule of thumb, a tuning lever gets
-  about 4 attempts. A new kernel gets one build, its A/B test, and about 4 tuning
-  attempts. A metric with a 3× margin and one missing kernel is a normal plan, not
-  an overrun. To go past a lever's budget, you need a measured reason, such as an
-  ablation showing that the lever still covers ≥ the remaining gap.
-- **Stretch.** Pursue stretch only on metrics that met TARGET, and only while each
-  attempt still gains ≥ 1 %.
+Optimization returns diminish, so the question is never "is there more to gain?"
+(there always is, up to the ceiling). The question is **how fast this path is
+closing the gap**, compared with the other paths available.
+
+**Log every measured build**, kept or reverted, to `bench/targets.jsonl`:
+`{"ts", "metric", "value", "commit", "change", "kept"}`. The first line has
+`"change": "start"`. Then, after each measurement, run:
+```bash
+$T $R/progress.py bench/roofline.json bench/targets.jsonl --budget-h 1   # [--goal-tps N] if the user gave a target
+```
+It works in **ms per token** (gains add; percentages don't), as follows:
+1. It takes the gap from the best kept build to the ceiling, the target and the
+   stretch.
+2. It measures the wall-clock rate at which the gap has closed over the trailing
+   window. Time spent on reverted attempts counts.
+3. It projects the time to the current goal: the target, or the stretch once the
+   target is met within noise.
+
+Act on the verdict:
+The horizon is what is left of the budget, minus the reserve.
+- **CONTINUE**: at the current rate the goal is reached within the horizon. Keep
+  going on this path.
+- **REVIEW**: the ETA exceeds the horizon, or there has been no gain above noise
+  for `--stall-min`. Do the plateau review below before any further attempt.
+- **BUDGET**: the time is used up. Run the final gates on the best build, serve it
+  and report.
+- **DONE**: the goal is met (the user's target, or else the stretch), or the gap to the ceiling is within noise. Move on
+  to the next headline metric.
+
+On this session's Bolt decode run (ceiling 14.68 ms/token), with the default 1 h
+budget, the replay goes:
+- at 16 minutes, the first lever had closed 1.74 ms, 46 % of the gap (6.6 ms/h):
+  CONTINUE;
+- at 36 minutes the target was met, but the stretch was 21 minutes away at the
+  current rate with only 14 left: REVIEW. Pivot to a cheap lever, or wrap up;
+- past the budget: BUDGET.
+
+With a 4 h budget the same log says CONTINUE. This replaces the session's
+back-and-forth about feasibility with a measurement.
+
+### Plateau review (REVIEW verdict): pivot or stop
+
+1. **Re-ablate the current best build.** Diminishing returns usually mean the cost
+   has moved. The kernel you were optimizing may no longer be the biggest one.
+2. **List candidate paths, each with an expected rate:**
+   `expected ms/h = (ms the lever can remove, from the ablation × the fraction
+   plausibly removable) ÷ (estimated hours, including build, A/B and gates)`.
+   Draw the candidates from:
+   - the rest of the ablation table;
+   - the `loom-optimize` catalog;
+   - a **new kernel** (section 3);
+   - **forks from prior decisions**: reopen an option from `bench/decisions.jsonl`
+     whose rejection reason no longer holds. For example, fusing the norm into the
+     matvec lost when the matvec was under-filled, and may win now that it isn't.
+     To fork, branch from that decision's commit (`git worktree add ../fork-X <commit>`),
+     then build and serve on a separate port with `tools/variant.sh`. Choose an
+     earlier commit when a later choice blocks the lever, for example a layout that
+     prevents a fusion.
+3. **Pick the best candidate** if its expected rate gives an ETA to the goal within
+   the horizon. Log the choice. A switch of path resets the stall timer, but not
+   the measured rate.
+4. **Stop the metric** if no candidate meets the horizon. Keep the best build and
+   record in the report why the remaining gap isn't worth it, with the numbers:
+   the ablation table and the best candidate's expected rate.
+
+**Record decision points** in `bench/decisions.jsonl`, whenever you choose one
+design over another:
+`{"ts", "commit", "decision", "chosen", "rejected": [{"option", "measured", "why"}]}`.
+The rejected options, with their measured numbers and the reason, are what makes a
+fork cheap to evaluate later instead of re-deriving it.
+
+Rules that override the rate:
 - **Never** stop with a correctness gate failing. The last kept build must pass
-  `compare.py` + `consistency.py`.
+  `compare.py` + `consistency.py`. The time spent on gates counts toward the rate.
+- Re-measure a value near the target before calling it met or missed (noise ±2 %).
+- The stall timer defaults to half the budget, clamped to 20–90 min. A long budget
+  tolerates a longer exploration, such as building a new kernel, before a review.
 
 ## 6. Report and recalibrate
 
 - Report each headline metric as: target, stretch, achieved, % of ceiling, margin
-  vs llama.cpp, and met / short (with the reason).
+  vs llama.cpp, and met / short (with the reason). Include the approach curve (gap
+  vs elapsed time, from `targets.jsonl`) and the stop or pivot decisions.
 - If a port reached a higher efficiency than `EFF`, update `EFF` in `roofline.py`
   and add the row to `reference/calibration.md`. Do the same for `STRETCH` if a
   port beat it. This is how the targets get more ambitious over time.

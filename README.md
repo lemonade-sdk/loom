@@ -60,7 +60,7 @@ name:
 | `/loom:loom-setup` | `/loom-setup` | Install the SDK wheel and the model library, `loom-fetch`, start/stop/inspect `loom-serve` (GPU and NPU) |
 | `/loom:loom-demo-ui` | `/loom-demo-ui` | Web playground: chat, transcribe, speak, image, embed. It finds models from the servers' `/v1/status` |
 | `/loom:loom-port-llm` | `/loom-port-llm` | Config-driven starter kit that turns a dense GGUF LLM into a Loom package: inspect → generate kernels → build → kernel unit tests → golden check |
-| `/loom:loom-roofline` | `/loom-roofline` | Roofline for decode/prefill/c4 from the GGUF, calibrated against achieved Loom efficiency; picks per-metric targets vs llama.cpp and the stop rules for the optimize loop |
+| `/loom:loom-roofline` | `/loom-roofline` | Roofline for decode/prefill/c4 from the GGUF, calibrated against achieved Loom efficiency; picks per-metric targets vs llama.cpp and a time budget (default 1 h); a rate-of-approach controller decides continue / pivot / stop |
 | `/loom:loom-optimize` | `/loom-optimize` | The measure / ablate / change / verify loop, a kernel A/B helper, a catalog of optimizations that worked (and that didn't), and the sources of a hand-tuned MoE port |
 | `/loom:loom-benchmark` | `/loom-benchmark` | Token-by-token golden comparison against llama.cpp ROCm, a batching-consistency check, throughput workloads, reporting rules |
 
