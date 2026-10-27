@@ -38,11 +38,11 @@ Per metric it then prints a row:
 | Column | Meaning |
 |---|---|
 | ceiling | Hardware roofline. Decode: 216 GB/s ÷ (weights + KV read per token). Prefill: 59 TFLOP/s ÷ (2·params + causal attention flops) per token. c4: 4 tokens per weight pass. For MoE, the 4 tokens route to their own experts, so those weights are read for each token. |
-| practical | ceiling × the **best efficiency a Loom port has actually reached** on this hardware (`EFF` in the script; sources in `reference/calibration.md`). |
-| eff | llama.cpp's fraction of the ceiling. |
-| headroom | practical ÷ llama.cpp − 1. |
-| class | large ≥ 25 %, moderate 10–25 %, tight 3–10 %, at-ceiling < 3 %. |
-| TARGET | The practical ceiling, or parity when the class is at-ceiling. |
+| eff | llama.cpp's fraction of the ceiling. **This, not Loom, decides how big the win can be.** At eff 0.75, the most Loom can gain is about 1.3×. At eff 0.15, 3–6× is on the table, and such results are routinely reported for new architectures, MoE and prefill. |
+| TARGET | ceiling × the **best efficiency a Loom port has actually reached** on this hardware (`EFF` in the script; sources in `reference/calibration.md`). Realistic by construction. |
+| margin | TARGET ÷ llama.cpp − 1. Reported as is, with no cap and no label. |
+| stretch | ceiling × `STRETCH`: what the known but not yet built levers should give (GEMM efficiency already seen in isolation, small-op fusion, batched expert gather). |
+| at-ceiling | Under 3 % headroom: llama.cpp is near the roofline. Target parity and spend the effort elsewhere. |
 
 **Sanity-check the model before trusting it.** If llama.cpp's `eff` is above about
 0.95 on any metric, the roofline undercounts. Check for a missed sliding window, KV
@@ -51,26 +51,32 @@ setting targets.
 
 ## 3. Pick the targets: realistic, achievable, impressive
 
-- **Realistic.** A target never exceeds the practical ceiling. Some port has
-  already reached that efficiency here, so it is not a guess.
-- **Impressive.** State each target as a margin over llama.cpp ROCm. Choose a
+- **Realistic.** TARGET comes from an efficiency some port has already reached
+  here, so it is not a guess. Don't shade it down because the margin "looks too
+  big". A large margin means llama.cpp is leaving the hardware idle.
+- **Impressive.** Report each metric as a margin over llama.cpp ROCm. Choose a
   **headline set** of 2–4 metrics that matter for the use case:
   - decode tok/s always;
   - prefill at 1k–2k;
   - c4 if serving many users;
   - long-context decode/prefill if the model is advertised for long context.
 
-  Drop at-ceiling metrics from the headline and set them to "≥ parity".
-- **Achievable.** For each headline metric, write down the lever, using the gap
-  budget below. A large-class target that needs a kernel the kit doesn't have
-  (flash attention for head_dim ≠ 128, a new quant format, MoE gather) is achievable
-  only with that kernel. Say so, and size the work.
+  Lead with the metrics that have the most headroom. Drop at-ceiling metrics from
+  the headline and set them to "≥ parity".
+- **Achievable.** Use the gap budget below to name the lever for each headline
+  metric, and mark it **tuning** (existing kernels, retuned or fused) or **new
+  kernel** (something the kit lacks: flash attention for head_dim ≠ 128, a new
+  quant format, an MoE gather, GEMM pipelining). A new-kernel target is achievable
+  when that kernel is built. Size it, schedule it, and don't lower the target to
+  avoid it.
+- **Stretch.** Once a metric meets TARGET, keep going toward stretch while the stop
+  rules allow. Any result above TARGET raises `EFF` for every later port.
 - Don't ask the user to choose. Announce the targets in one short table (metric,
-  llama.cpp, target, margin, class, lever), then start working. The user can
-  override them.
+  llama.cpp, target, margin, stretch, lever, tuning/new kernel), then start working.
+  The user can override them.
 - If the user *did* give a target, still run this. If their target is above the
-  practical ceiling, say so once with the numbers, and work toward the practical
-  ceiling.
+  stretch ceiling, say so once with the numbers. If it is below TARGET, say how much
+  more is available and aim for TARGET.
 
 ## 4. Gap budget: convert the target into milliseconds
 
@@ -98,22 +104,22 @@ Track each attempt in `bench/targets.jsonl` as one JSON line:
 - **Stalled.** After 3 attempts in a row that each improve the target metric by
   less than 1 %, re-ablate. After 2 re-ablations with no new lever, stop that metric
   and keep the best build.
-- **Budget.** As a rule of thumb:
-  - moderate: about 6 attempts;
-  - large: about 10 attempts, or one new kernel;
-  - tight: about 4 attempts.
-
-  Going past the budget needs a measured reason, such as a lever whose ablation
-  shows ≥ the remaining gap.
+- **Budget per lever, not per margin.** As a rule of thumb, a tuning lever gets
+  about 4 attempts. A new kernel gets one build, its A/B test, and about 4 tuning
+  attempts. A metric with a 3× margin and one missing kernel is a normal plan, not
+  an overrun. To go past a lever's budget, you need a measured reason, such as an
+  ablation showing that the lever still covers ≥ the remaining gap.
+- **Stretch.** Pursue stretch only on metrics that met TARGET, and only while each
+  attempt still gains ≥ 1 %.
 - **Never** stop with a correctness gate failing. The last kept build must pass
   `compare.py` + `consistency.py`.
 
 ## 6. Report and recalibrate
 
-- Report each headline metric as: target, achieved, % of ceiling, margin vs
-  llama.cpp, and met / short (with the reason).
+- Report each headline metric as: target, stretch, achieved, % of ceiling, margin
+  vs llama.cpp, and met / short (with the reason).
 - If a port reached a higher efficiency than `EFF`, update `EFF` in `roofline.py`
-  and add the row to `reference/calibration.md`. This is how the targets get more
-  ambitious over time.
-- If a target was missed, also add the row. A class that keeps landing short means
+  and add the row to `reference/calibration.md`. Do the same for `STRETCH` if a
+  port beat it. This is how the targets get more ambitious over time.
+- If a target was missed, also add the row. A metric type (decode, prefill, c4) that keeps landing short means
   its efficiency is too optimistic.

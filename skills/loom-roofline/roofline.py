@@ -8,7 +8,7 @@ Reads tensor sizes straight from the GGUF, plus (optionally) the port's cfg.json
 geometry the GGUF does not spell out (sliding_layers, head_dim_swa, kv_layers for KV
 sharing). Prints, per metric, the hardware ceiling, the *practical* ceiling (ceiling x
 the efficiency Loom has demonstrated on this hardware, see EFF), and - if --baseline
-gives llama.cpp numbers - a recommended target with a feasibility class.
+gives llama.cpp numbers - the target, stretch and margin over llama.cpp.
 
 --baseline is a JSON object of llama.cpp ROCm numbers, keys as in perf.py output:
   {"decode_tps": 52.7, "decode_tps_2k": 48.7, "prefill_1000": 1593, "prefill_2000": 1678,
@@ -23,6 +23,13 @@ EFF = {
     "decode_moe": 0.78,  # expert gather. Flint 101 / 130
     "prefill": 0.26,     # end to end; GEMMs alone reach ~0.5 of peak. Bolt 0.26, Flint 0.22-0.28
     "c4": 0.70,          # Bolt 0.65, Flint 0.74
+}
+# Stretch: plausible with known-but-unbuilt levers (not yet demonstrated end to end).
+STRETCH = {
+    "decode": 0.95,      # small-op fusion + attention at the bandwidth limit
+    "decode_moe": 0.88,  # batched expert gather
+    "prefill": 0.45,     # GEMM efficiency already seen in isolation, plus flash attention
+    "c4": 0.85,
 }
 GATHERED = re.compile(r"(^|\.)(token_embd|per_layer_token_embd)\.weight$")
 EXPERT = re.compile(r"_exps\.weight$")
@@ -120,28 +127,26 @@ def attn_flops_per_token(geo, P):
     return tot
 
 
-def pick_target(name, base, practical, ceiling):
-    """Target = practical ceiling (best efficiency Loom has demonstrated x roofline).
+def pick_target(name, base, ceiling, eff, stretch):
+    """target = ceiling x demonstrated efficiency; stretch = ceiling x STRETCH.
 
-    Realistic: some port has already reached that efficiency on this hardware.
-    Impressive: it is reported as a margin over llama.cpp, so classify the headroom
-    (practical / baseline - 1) to decide where to spend effort:
-      >= 25 %  'large'      headline metric; usually needs a new/retuned kernel
-      10-25 %  'moderate'   tuning (dispatch shape, fusion) gets there
-      3-10 %   'tight'      ablation-driven; budget-limited, may land short
-      < 3 %    'at-ceiling' llama.cpp is near the roofline: target parity, spend effort elsewhere
+    The margin over llama.cpp is reported as is, with no cap and no label: it is
+    whatever the hardware allows given llama.cpp's own efficiency (2x-6x is normal
+    when llama.cpp is far from the roofline). The only class is 'at-ceiling'
+    (< 3 % headroom: target parity and spend the effort elsewhere).
     """
+    practical, st = ceiling * eff, ceiling * stretch
+    r = dict(metric=name, ceiling=round(ceiling, 1), target=round(practical, 1),
+             stretch=round(st, 1))
     if base is None:
-        return dict(metric=name, ceiling=round(ceiling, 1), practical=round(practical, 1),
-                    target=round(practical, 1), note="no baseline")
+        return r
     h = practical / base - 1
-    cls = ("large" if h >= 0.25 else "moderate" if h >= 0.10 else
-           "tight" if h >= 0.03 else "at-ceiling")
-    tgt = practical if h >= 0.03 else base
-    return dict(metric=name, baseline=base, ceiling=round(ceiling, 1),
-                practical=round(practical, 1), baseline_eff=round(base / ceiling, 3),
-                headroom=round(h, 3), feasibility=cls, target=round(tgt, 1),
-                target_vs_baseline=round(tgt / base - 1, 3))
+    r.update(baseline=base, baseline_eff=round(base / ceiling, 3),
+             margin=round(h, 3), stretch_margin=round(st / base - 1, 3),
+             at_ceiling=h < 0.03)
+    if h < 0.03:
+        r["target"] = base
+    return r
 
 
 def main():
@@ -163,45 +168,50 @@ def main():
 
     rows = []
     dec = a.bw / wb
-    ed = EFF["decode_moe"] if geo["n_exp"] else EFF["decode"]
-    rows.append(pick_target("decode_tps", base.get("decode_tps"), dec * ed, dec))
+    key = "decode_moe" if geo["n_exp"] else "decode"
+    ed, sd = EFF[key], STRETCH[key]
+    rows.append(pick_target("decode_tps", base.get("decode_tps"), dec, ed, sd))
     for c in ctxs:
         k = f"decode_tps_{c // 1000}k"
         r = a.bw / (wb + kv_read_bytes(geo, c))
-        rows.append(pick_target(k, base.get(k), r * ed, r))
+        rows.append(pick_target(k, base.get(k), r, ed, sd))
     for P in ctxs:
         k = f"prefill_{P}"
         hb = tensors.get("output.weight", tensors.get("token_embd.weight"))[1]
         f = 2 * (params - hb[0] * hb[1]) + attn_flops_per_token(geo, P)   # head: last token only
         r = a.flops / f
-        rows.append(pick_target(k, base.get(k), r * EFF["prefill"], r))
+        rows.append(pick_target(k, base.get(k), r, EFF["prefill"], STRETCH["prefill"]))
     # 4 streams: one weight pass serves 4 tokens; KV at ~short context
     exp = detail.get("experts (active)", 0)
     if exp:   # 4 tokens route independently: ~min(n_exp, 4*k) distinct experts per layer
         exp4 = exp * min(geo["n_exp"], 4 * geo["n_used"]) / geo["n_used"]
     c4 = 4 * a.bw / (wb - exp + (exp4 if exp else 0) + 4 * kv_read_bytes(geo, 600))
-    rows.append(pick_target("c4_steady", base.get("c4_steady"), c4 * EFF["c4"], c4))
+    rows.append(pick_target("c4_steady", base.get("c4_steady"), c4, EFF["c4"], STRETCH["c4"]))
 
     out = dict(gguf=a.gguf, geometry={k: (sorted(v) if isinstance(v, set) else v)
                                       for k, v in geo.items()},
                weight_bytes_per_token=round(wb), head_bytes=head,
                bytes_by_kind={k: round(v) for k, v in detail.items()},
-               matmul_params=round(params), efficiency_assumed=EFF,
+               matmul_params=round(params), efficiency_assumed=EFF, stretch_assumed=STRETCH,
                bw=a.bw, flops=a.flops, metrics=rows)
     if a.out:
         json.dump(out, open(a.out, "w"), indent=1)
     print(f"weights read / decode token: {wb/1e9:.3f} GB  (head {head/1e9:.3f} GB)  "
           + "  ".join(f"{k} {v/1e9:.2f}" for k, v in detail.items()))
     print(f"matmul params: {params/1e9:.2f} B    BW {a.bw/1e9:.0f} GB/s   peak {a.flops/1e12:.0f} TFLOP/s")
-    hdr = f"{'metric':16} {'ceiling':>9} {'practical':>9} {'llama.cpp':>9} {'eff':>6} {'headroom':>9} {'class':>11} {'TARGET':>9} {'vs base':>8}"
+    hdr = (f"{'metric':16} {'ceiling':>9} {'llama.cpp':>9} {'eff':>5} "
+           f"{'TARGET':>9} {'margin':>8} {'stretch':>9} {'margin':>8}")
     print(hdr)
     for r in rows:
         b = r.get("baseline")
-        print(f"{r['metric']:16} {r['ceiling']:9.1f} {r['practical']:9.1f} "
-              + (f"{b:9.1f} {r['baseline_eff']:6.2f} {r['headroom']:+9.0%} {r['feasibility']:>11} "
-                 f"{r['target']:9.1f} {r['target_vs_baseline']:+8.0%}" if b else
-                 f"{'-':>9} {'-':>6} {'-':>9} {'-':>11} {r['target']:9.1f}"))
-
+        line = f"{r['metric']:16} {r['ceiling']:9.1f} "
+        if b:
+            line += (f"{b:9.1f} {r['baseline_eff']:5.2f} {r['target']:9.1f} {r['margin']:+8.0%} "
+                     f"{r['stretch']:9.1f} {r['stretch_margin']:+8.0%}"
+                     + ("  at-ceiling: target parity" if r["at_ceiling"] else ""))
+        else:
+            line += f"{'-':>9} {'-':>5} {r['target']:9.1f} {'':>8} {r['stretch']:9.1f}"
+        print(line)
 
 if __name__ == "__main__":
     main()

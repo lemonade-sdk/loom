@@ -32,7 +32,7 @@ Typical cold-start order: `loom-setup` → (`loom-demo-ui`) → `loom-port-llm` 
 `loom-benchmark` (baseline + golden) → `loom-roofline` (targets) → `loom-optimize` ↔ `loom-benchmark`.
 
 **"Optimize this model" with no target** means: run `loom-roofline`, announce
-per-metric targets (llama.cpp, target, margin, class, lever) without asking the user
+per-metric targets (llama.cpp, target, margin, stretch, lever) without asking the user
 to choose, then iterate in `loom-optimize` until every headline target is met or
 its stop rule fires. Report met/short per metric with the reason. A user-supplied
 target still gets a roofline check: if it is above the practical ceiling, say so
