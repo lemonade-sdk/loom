@@ -94,6 +94,7 @@ A full cold-start run takes about 10–25 minutes for a small model. In order:
 .claude-plugin/{plugin.json,marketplace.json}   # plugin + single-plugin marketplace
 skills/<skill>/SKILL.md                          # the six skills, with their scripts and references
 install.sh                                       # copy-install alternative
+LICENSE                                          # MIT
 THIRD_PARTY_NOTICES.md
 ```
 
@@ -107,3 +108,8 @@ check the manifests with `claude plugin validate .`. When you fix a skill, rerun
 cold-start test: a fresh subagent follows the skills literally in a new install root
 and reports every wrong or missing instruction. That is how these skills were
 debugged.
+
+## License
+
+MIT; see [LICENSE](LICENSE). Bundled third-party material keeps its own license; see
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
