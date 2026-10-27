@@ -48,7 +48,8 @@ git clone https://github.com/lemonade-sdk/loom && ./loom/install.sh      # ./ins
 Ask in plain language, for example:
 - "install Loom and serve moonshine";
 - "port Qwen3-4B-Instruct-2507 to loom-serve and validate it against llama.cpp";
-- "benchmark my Loom port".
+- "benchmark my Loom port";
+- "optimize this model" (runs a roofline analysis, picks the targets, then iterates until they are met).
 
 The skill descriptions make Claude pick the right one. You can also invoke a skill by
 name:
@@ -59,6 +60,7 @@ name:
 | `/loom:loom-setup` | `/loom-setup` | Install the SDK wheel and the model library, `loom-fetch`, start/stop/inspect `loom-serve` (GPU and NPU) |
 | `/loom:loom-demo-ui` | `/loom-demo-ui` | Web playground: chat, transcribe, speak, image, embed. It finds models from the servers' `/v1/status` |
 | `/loom:loom-port-llm` | `/loom-port-llm` | Config-driven starter kit that turns a dense GGUF LLM into a Loom package: inspect → generate kernels → build → kernel unit tests → golden check |
+| `/loom:loom-roofline` | `/loom-roofline` | Roofline for decode/prefill/c4 from the GGUF, calibrated against achieved Loom efficiency; picks per-metric targets vs llama.cpp and the stop rules for the optimize loop |
 | `/loom:loom-optimize` | `/loom-optimize` | The measure / ablate / change / verify loop, a kernel A/B helper, a catalog of optimizations that worked (and that didn't), and the sources of a hand-tuned MoE port |
 | `/loom:loom-benchmark` | `/loom-benchmark` | Token-by-token golden comparison against llama.cpp ROCm, a batching-consistency check, throughput workloads, reporting rules |
 

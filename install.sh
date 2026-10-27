@@ -6,7 +6,7 @@
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 dest=${CLAUDE_SKILLS_DIR:-$HOME/.claude/skills}
-skills=(loom loom-setup loom-demo-ui loom-port-llm loom-optimize loom-benchmark)
+skills=(loom loom-setup loom-demo-ui loom-port-llm loom-roofline loom-optimize loom-benchmark)
 if [ "${1:-}" = "--uninstall" ]; then
   for s in "${skills[@]}"; do rm -rf "$dest/$s"; done; echo "removed ${skills[*]} from $dest"; exit 0
 fi

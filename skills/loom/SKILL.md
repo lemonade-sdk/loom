@@ -19,6 +19,7 @@ and exposes OpenAI-style HTTP endpoints.
 | Install the SDK + library, fetch a catalog model, start/stop `loom-serve`, NPU serving | `loom-setup` |
 | Browser playground (chat / ASR / TTS / image / embeddings) over running servers | `loom-demo-ui` |
 | Make an arbitrary GGUF LLM servable by loom-serve (write the program) | `loom-port-llm` |
+| What is possible for this model? Pick optimization targets (roofline vs llama.cpp) | `loom-roofline` |
 | Make a ported model faster without breaking correctness | `loom-optimize` |
 | Correctness gate vs llama.cpp, throughput methodology, reporting | `loom-benchmark` |
 
@@ -28,7 +29,14 @@ tools venv `~/loom/.tools`). Substitute your own root consistently. The scripts 
 and `LOOM_SERVE_STATE=` (the serve.sh PID/log dir).
 
 Typical cold-start order: `loom-setup` → (`loom-demo-ui`) → `loom-port-llm` →
-`loom-benchmark` (baseline + golden) → `loom-optimize` ↔ `loom-benchmark`.
+`loom-benchmark` (baseline + golden) → `loom-roofline` (targets) → `loom-optimize` ↔ `loom-benchmark`.
+
+**"Optimize this model" with no target** means: run `loom-roofline`, announce
+per-metric targets (llama.cpp, target, margin, class, lever) without asking the user
+to choose, then iterate in `loom-optimize` until every headline target is met or
+its stop rule fires. Report met/short per metric with the reason. A user-supplied
+target still gets a roofline check: if it is above the practical ceiling, say so
+once, with the numbers.
 
 ## Hard rules (learned the expensive way)
 
