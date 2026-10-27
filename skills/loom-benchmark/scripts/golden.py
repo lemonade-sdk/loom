@@ -33,6 +33,9 @@ for prompt, n_predict in items:
     ids = pkg.ids(pkg.render(prompt))
     r = requests.post(a.llama + "/completion", json={"prompt": ids, "n_predict": n_predict, "temperature": 0, "n_probs": 5,
                                                      "cache_prompt": False, "return_tokens": True}).json()
+    if "tokens" not in r:  # e.g. the prompt exceeds the server's context: skip, don't crash
+        print(f"SKIP {len(ids)} prompt tokens: {str(r)[:200]}", flush=True)
+        continue
     gen = r["tokens"]  # completion_probabilities omits byte-fallback (partial UTF-8) tokens, e.g. emoji
     cp = r["completion_probabilities"]
     if len(cp) != len(gen):  # keep top-5 lists only while they line up with the ids

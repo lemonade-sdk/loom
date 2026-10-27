@@ -63,6 +63,10 @@ $T $S/consistency.py http://127.0.0.1:8160 --model <model id>         # concurre
 - Golden ids come from llama.cpp's `tokens`. `completion_probabilities` omits
   byte-fallback tokens (emoji, partial UTF-8), so top-5 lists are kept only while
   they line up.
+- Document sizes are approximate. With a 262k-vocab tokenizer (Gemma),
+  `doc_32000` is about 35k tokens, which is over a 32768 context. Either build the
+  package (and llama-server) with a 40960 context, or use `--long 1000,2000,16000`
+  and say so.
 - Long goldens (16k/32k) are what catch KV paging, prefill chunking and attention
   masking bugs.
 - `consistency.py` catches mixed-sequence epoch bugs (padding, tile uniformity,

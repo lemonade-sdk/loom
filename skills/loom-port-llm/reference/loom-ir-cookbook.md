@@ -136,3 +136,17 @@ check.case public @mv_q6 {
 - `loom-run file.loom --root=@kernel --device=amdgpu --kernel-input-buffer=…` runs a
   single kernel. `loom-compile --root=@kernel` compiles one kernel; command programs
   can't be roots.
+
+## Compile errors seen in ports, and their fixes
+
+- **`LOWERING/036` on `scalar.geluf<tanh>`.** The exact tanh doesn't lower. Write
+  GELU-tanh as `x · logistic(2·√(2/π)·(x + 0.044715·x³))`, using
+  `vector.logisticf<afn>` or exp. It is mathematically identical.
+- **`TARGET/058`: a range assume on `workgroup.id` failed.** Do the bounds compare
+  (`lt(%row_id, %n)`) and branch first, then use the id inside the branch, where the
+  fact holds.
+- **"stage parameter root N differs".** A parameter, such as a norm weight, is used
+  only in one path (`scf.if` branch or stage). Bind it once in the command program's
+  shared params section, so every stage binds the same set.
+- **`SUBRANGE/024` in a store helper.** Pass the indices that carry the proven
+  bound (the ones you compared against n) to the store, not a recomputed value.

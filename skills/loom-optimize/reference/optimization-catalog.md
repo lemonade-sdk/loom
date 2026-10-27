@@ -22,6 +22,33 @@ same GGUF. All the kernels named here exist in `loom-port-llm/starter/gen_llm.py
 - **Q4_K folding.** `y = Σ_groups (d_g · dot(codes_g, x_g) − m_g · Σx_g)`. Σx_g is
   computed once per token.
 
+### Adaptive rows per workgroup (dense 4B-class decode: the biggest single win)
+- **Problem.** The starter's fixed R=16 rows per workgroup leaves the GPU
+  under-filled on narrow projections. For example, K/V with n = 512, giving only
+  32 workgroups, or q with n = 4096. Meanwhile the long-K down projection
+  (K = 10240) has few, very long workgroups.
+- **Rule (1-token variant).** Start at R=16 and halve R while
+  `n / R < WG_TARGET`, stopping at R=1. Use WG_TARGET ≈ 4096 by default, but
+  ≈ 640 when K ≥ 8192 (the down projection), whose workgroups are long already.
+  For the 4-token variant, use WG_TARGET ≈ 128: a larger value regresses c4.
+  Emit one kernel variant per (format, K, swiglu, R, TG), named `_r{R}`.
+- **Result.** On Nemotron-3.5-Bolt-E4B (Gemma-4 E4B, Q4_K_M), decode went from
+  54.2 to 59.9 tok/s, half of the gap to the roofline in one change. Check c4
+  afterwards: it regressed until the 4-token target was lowered to 128.
+
+### Fused 1-token QKV and paired-row gated FFN
+- **Fused QKV.** For a single decode token, one launch computes the q, k and v rows
+  (one row range over n_q+n_k+n_v, dispatching on the row id). Launch it under
+  `scf.if` for 1-token epochs only; multi-token epochs keep the separate kernels.
+  It gained about 0.5 %.
+- **Paired-row gate/up.** For the 1-token gated FFN (swiglu/geglu), have each
+  workgroup process gate row i and up row i side by side, with R ≥ 2, so no lanes
+  idle on the epilogue. Bolt went from 60.3 to 61.0.
+- **Serial small kernels.** Any kernel launched with a single workgroup, such as
+  per-layer-input prep or norms over many tokens, should get a (tokens, layers)
+  grid. It is cheap to find by ablation, because doubling it costs a visible
+  fraction of a millisecond.
+
 ### Argmax head (`head_mv()`)
 - Vocabulary rows are split into 128-row chunks. Each workgroup writes
   (max, argmax) per chunk per span, and `g_head_select` reduces the chunks.
@@ -101,6 +128,11 @@ same GGUF. All the kernels named here exist in `loom-port-llm/starter/gen_llm.py
 - **Larger MoE tiles or wide GEMM tiles.** More padding waste and less occupancy.
 - **LDS-staged x in the multi-token matvec.** Registers already hold x, so the
   extra barrier only cost time.
+- **Fusing the residual add + RMSNorm into the next matvec's prologue (decode).**
+  Every workgroup recomputes the norm, so the redundant reads cost more than the
+  launch saved (Bolt: slower). Launches are nearly free under graph replay.
+- **Unrolling the matvec row loop**, or head chunk sizes other than 128 rows.
+  Neither was measurably different.
 - **About 128 keys per decode-attention split.** Fewer splits under-filled the GPU
   at short context (−4 %).
 
@@ -120,3 +152,6 @@ same GGUF. All the kernels named here exist in `loom-port-llm/starter/gen_llm.py
 | Qwen3-0.6B prefill 2k | 13.0k | 10.5k |
 | Qwen3-0.6B decode at 2k | 179 | 193 |
 | Qwen3-0.6B 4-stream steady | 690 | 578 |
+| Nemotron-3.5-Bolt-E4B decode | 61.1 | 52.7 |
+| Nemotron-3.5-Bolt-E4B prefill 1k / 2k | 1830 / 1801 | 1593 / 1678 |
+| Nemotron-3.5-Bolt-E4B 4-stream steady | 165 | ~157 |

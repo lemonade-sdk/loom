@@ -142,6 +142,29 @@ recent llama.cpp; older trees have it in `src/llama-model.cpp`). Check these fie
   2. bucket tokens by expert, using an info buffer;
   3. grouped expert GEMMs over the buckets;
   4. combine.
+- **Gemma-3n / Gemma-4 family (arch `gemma3n`, `gemma4`).** Read llama.cpp's
+  `src/models/gemma*.cpp` closely. The starter has none of these features, and each
+  one silently breaks output if missed:
+  - **Per-layer embeddings (PLE).** A gathered `per_layer_token_embd` row, plus a
+    projection of the hidden state, then norm, then a per-layer gate, projection
+    and post-norm added to the residual. Count only the row read for bandwidth.
+  - **KV sharing.** Layers ≥ `n_layer_kv_from_start` reuse the KV of the last
+    owning layer of the same type (sliding or global), so they skip k/v and store
+    nothing. Size the KV planes for the owning layers only.
+  - **Mixed head_dim.** Sliding and global layers can differ (256 vs 512), with
+    different rope theta.
+  - **Partial "proportional" rope.** Global layers rotate only the pairs whose
+    `rope_freqs` entry is finite (the rest are 1e30).
+  - **Norms.** Q/K RMSNorm with weights, V RMSNorm *without* weights, attention
+    scale 1.0, post-attention and post-FFN norms, and a `layer_output_scale`.
+  - **FFN, embedding and head.** GELU-tanh gated FFN; embedding × √hidden; a final
+    logit softcap, which doesn't affect argmax.
+  - **Tensors.** bf16 tensors need a bf16 value helper (`view<32xbf16>` →
+    `vector.extf`).
+
+  head_dim ≠ 128 means the starter's flash2 prefill doesn't apply. Generalize the
+  split-K attention to Dh/32 values per lane and use it for prefill too. That
+  costs prefill efficiency, so record it as a new-kernel lever in the roofline.
 - **New quant format.** Add `@g_<fmt>_values` and `@g_<fmt>_dot` funcs in `COMMON`
   (gen_llm.py), add the entries to `FMT`/`SB`, and add a `dequant16` case in
   `gen_gemm.py`. Unit-test against `gguf.quants.dequantize`.

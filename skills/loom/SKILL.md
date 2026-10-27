@@ -19,7 +19,7 @@ and exposes OpenAI-style HTTP endpoints.
 | Install the SDK + library, fetch a catalog model, start/stop `loom-serve`, NPU serving | `loom-setup` |
 | Browser playground (chat / ASR / TTS / image / embeddings) over running servers | `loom-demo-ui` |
 | Make an arbitrary GGUF LLM servable by loom-serve (write the program) | `loom-port-llm` |
-| What is possible for this model? Pick optimization targets (roofline vs llama.cpp) | `loom-roofline` |
+| What is possible for this model? Pick optimization targets (roofline vs llama.cpp) | `loom-roofline` (`${CLAUDE_SKILL_DIR}/../loom-roofline/SKILL.md`) |
 | Make a ported model faster without breaking correctness | `loom-optimize` |
 | Correctness gate vs llama.cpp, throughput methodology, reporting | `loom-benchmark` |
 
@@ -46,6 +46,31 @@ the roofline is closing, per hour, and gives one of four verdicts:
 - done.
 
 Report met or short for each metric, with the approach curve.
+
+## End-to-end requests: one turn
+
+"Get X working, optimize it and report" is a single job. Run the whole pipeline
+without stopping:
+1. reuse the install;
+2. port;
+3. pass the gates;
+4. measure the llama.cpp baseline;
+5. run `loom-roofline` to set targets and a budget;
+6. optimize, under the rate controller;
+7. pass the gates again;
+8. serve;
+9. report.
+
+Stop to ask only for what the hard rules require: a gated-license click, or
+approval of a binary you downloaded. Avoid both where possible:
+- **Reuse what is installed.** Check `~/loom/.venv/bin/loom-serve` and the HF cache.
+- **Find a llama.cpp ROCm build already on the machine first**, with
+  `find ~ -maxdepth 5 -name llama-server -path "*rocm*" 2>/dev/null`. A build the
+  user already installed doesn't need approval; one you download in this session
+  does.
+
+The `loom-roofline` skill is at `${CLAUDE_SKILL_DIR}/../loom-roofline/SKILL.md`.
+Read it from there if it isn't in your skill list.
 
 ## Hard rules (learned the expensive way)
 
