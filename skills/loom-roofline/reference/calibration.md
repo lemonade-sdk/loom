@@ -13,6 +13,9 @@ campaign, including ones that missed their target.
 | 〃 | prefill 1k | 7146 | 1830 | 0.26 | 1593 | head_dim 256/512: no flash2, simple split attention |
 | 〃 | prefill 2k | 7094 | 1801 | 0.25 | 1678 | |
 | 〃 | c4 steady | 255 | 165 | 0.65 | 157 | |
+| Bolt-E4B, run 2 (fresh agent, 1 turn, 1 h budget) | decode | 68.1 | 60.0 | 0.88 | 52.7 (b1355) | adaptive rows only; fused QKV / paired-row not tried |
+| 〃 | prefill 1k / 2k | 7146 / 7094 | 2201 / 2339 | 0.31 / 0.33 | 1593 / 1678 | new flash prefill kernel for head_dim 256/512 (~30 min to build) |
+| 〃 | c4 steady | 255 | 169 | 0.66 | 157 | |
 | Flint (MoE 256×6, int4 q4_1) | decode | 130 | 99–104 | 0.78 | 62 | expert gather bound |
 | 〃 | decode @32k | 82.7 | 63 | 0.76 | 48 | |
 | 〃 | prefill 2k | 11946 | ~2650 | 0.22 | 1509 | |
@@ -22,7 +25,7 @@ campaign, including ones that missed their target.
 Observations:
 - Dense decode reaches about 0.9 of the bandwidth roofline. The last 10 % is the
   per-layer small kernels plus attention.
-- Prefill end to end is ~0.25 of WMMA peak, even though the GEMMs alone reach ~0.5.
+- Prefill end to end is ~0.25–0.33 of WMMA peak, even though the GEMMs alone reach ~0.5.
   Attention, norms and dispatch make up the rest. A target above ~0.3 needs new
   GEMM work (LDS double-buffering, dequant into fragments).
 - These efficiencies were fitted on the same two models, so targets for a new

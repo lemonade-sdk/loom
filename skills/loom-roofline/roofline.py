@@ -21,7 +21,7 @@ import argparse, json, math, re, sys
 EFF = {
     "decode": 0.90,      # dense. Bolt-E4B 61.1 / 68.1 (reference/calibration.md)
     "decode_moe": 0.78,  # expert gather. Flint 101 / 130
-    "prefill": 0.26,     # end to end; GEMMs alone reach ~0.5 of peak. Bolt 0.26, Flint 0.22-0.28
+    "prefill": 0.33,     # end to end. Bolt-E4B with d256/d512 flash prefill: 2339 / 7094 (Flint 0.22-0.28)
     "c4": 0.70,          # Bolt 0.65, Flint 0.74
 }
 # Stretch: plausible with known-but-unbuilt levers (not yet demonstrated end to end).

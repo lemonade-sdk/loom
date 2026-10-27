@@ -30,9 +30,13 @@ In every case:
 - If a user target is below TARGET, say how much more is available, then honor
   their target as the finish line.
 - Within a budget, spend time where the **expected gain per hour** is highest
-  across the headline metrics. With 1 h this usually means the tuning levers on
-  1–2 metrics. A new kernel usually needs a multi-hour budget: in a 1 h run,
-  report it as the next step, with its expected gain, instead of starting it.
+  across the headline metrics. New kernels count too. On Bolt-E4B, a flash prefill
+  kernel for head_dim 256/512 took about 30 min and gave +19–28 % prefill inside a
+  1 h budget.
+- **Catalog levers first.** Levers in `loom-optimize/reference/optimization-catalog.md`
+  that have a measured gain on a similar model are the cheapest ms/h there is. Apply
+  them in catalog order before inventing new ones. In run 2, skipping fused QKV and
+  paired-row gate/up, and trying two untested ideas instead, cost about 1–2 % decode.
 - Keep a reserve (default 10 min) at the end for the final `compare.py` +
   `consistency.py`, the server restart and the report. Never overrun the budget by
   starting an attempt that cannot finish its gates in time.
@@ -129,12 +133,14 @@ Optimization returns diminish, so the question is never "is there more to gain?"
 (there always is, up to the ceiling). The question is **how fast this path is
 closing the gap**, compared with the other paths available.
 
-**Log every measured build**, kept or reverted, to `bench/targets.jsonl`:
-`{"ts", "metric", "value", "commit", "change", "kept"}`. The first line has
-`"change": "start"`. Then, after each measurement, run:
+**Log every measured build**, kept or reverted, and evaluate in the same command.
+`--add` writes the line (timestamp, git commit) for you:
 ```bash
-$T $R/progress.py bench/roofline.json bench/targets.jsonl --budget-h 1   # [--goal-tps N] if the user gave a target
+$T $R/progress.py bench/roofline.json bench/targets.jsonl --budget-h 1 --metric decode_tps --add 54.6 --change start
+$T $R/progress.py bench/roofline.json bench/targets.jsonl --budget-h 1 --metric decode_tps --add 59.5 --change "adaptive mv rows"
+$T $R/progress.py bench/roofline.json bench/targets.jsonl --budget-h 1 --metric decode_tps --add 59.4 --change "fused PLE epilogue" --reverted
 ```
+Add `--goal-tps N` if the user gave a target.
 It works in **ms per token** (gains add; percentages don't), as follows:
 1. It takes the gap from the best kept build to the ceiling, the target and the
    stretch.
@@ -190,7 +196,8 @@ back-and-forth about feasibility with a measurement.
    record in the report why the remaining gap isn't worth it, with the numbers:
    the ablation table and the best candidate's expected rate.
 
-**Record decision points** in `bench/decisions.jsonl`, whenever you choose one
+**Record decision points** in `bench/decisions.jsonl`, written as you go and not
+reconstructed at the end, whenever you choose one
 design over another:
 `{"ts", "commit", "decision", "chosen", "rejected": [{"option", "measured", "why"}]}`.
 The rejected options, with their measured numbers and the reason, are what makes a

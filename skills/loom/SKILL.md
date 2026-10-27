@@ -65,9 +65,11 @@ Stop to ask only for what the hard rules require: a gated-license click, or
 approval of a binary you downloaded. Avoid both where possible:
 - **Reuse what is installed.** Check `~/loom/.venv/bin/loom-serve` and the HF cache.
 - **Find a llama.cpp ROCm build already on the machine first**, with
-  `find ~ -maxdepth 5 -name llama-server -path "*rocm*" 2>/dev/null`. A build the
-  user already installed doesn't need approval; one you download in this session
-  does.
+  `find ~ -maxdepth 7 -name llama-server 2>/dev/null`. If several builds exist, use
+  the **newest lemonade-sdk ROCm tag** (`bNNNN`, check with `llama-server --version`),
+  and report the tag. Older builds differ a lot: on Bolt-E4B, b1274 did 125 tok/s at
+  c4 where b1355 did 157, which inflates Loom's margin. A build the user already
+  installed doesn't need approval; one you download in this session does.
 
 The `loom-roofline` skill is at `${CLAUDE_SKILL_DIR}/../loom-roofline/SKILL.md`.
 Read it from there if it isn't in your skill list.
