@@ -1,0 +1,82 @@
+name: loom-factory
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  ANTHROPIC_FEDERATION_RULE_ID: fdrl_01H4DUTGWQpKxWJo6syehWrW
+  ANTHROPIC_ORGANIZATION_ID: 9bdff596-1595-4140-8301-817e43ef8412
+  ANTHROPIC_SERVICE_ACCOUNT_ID: svac_01RaWseoyo5MeWhBYqZYEkfr
+  ANTHROPIC_WORKSPACE_ID: wrkspc_01DcG9t7asPHNeFbcKtktSu3
+  ANTHROPIC_MODEL: claude-sonnet-4-5
+
+jobs:
+  call-claude:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch GitHub OIDC token
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const token = await core.getIDToken('https://api.anthropic.com');
+            core.setSecret(token);
+            core.exportVariable('JWT', token);
+
+      - name: Exchange for an Anthropic access token
+        run: |
+          set -euo pipefail
+
+          body=$(jq -n \
+            --arg assertion "$JWT" \
+            --arg rule "$ANTHROPIC_FEDERATION_RULE_ID" \
+            --arg org "$ANTHROPIC_ORGANIZATION_ID" \
+            --arg sa "$ANTHROPIC_SERVICE_ACCOUNT_ID" \
+            --arg ws "$ANTHROPIC_WORKSPACE_ID" \
+            '{
+              grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
+              assertion: $assertion,
+              federation_rule_id: $rule,
+              organization_id: $org,
+              service_account_id: $sa,
+              workspace_id: $ws
+            }')
+
+          response=$(curl -sS --fail-with-body https://api.anthropic.com/v1/oauth/token \
+            -H "content-type: application/json" \
+            --data "$body") || {
+              echo "Token exchange failed:"
+              echo "$response" | jq 'with_entries(if (.key | test("token$")) then .value = "<redacted>" else . end)' || echo "$response"
+              exit 1
+            }
+
+          access_token=$(echo "$response" | jq -r '.access_token // empty')
+          if [ -z "$access_token" ]; then
+            echo "No access_token in response:"
+            echo "$response" | jq 'with_entries(if (.key | test("token$")) then .value = "<redacted>" else . end)'
+            exit 1
+          fi
+
+          echo "::add-mask::$access_token"
+          echo "ANTHROPIC_ACCESS_TOKEN=$access_token" >> "$GITHUB_ENV"
+          echo "$response" | jq 'with_entries(if (.key | test("token$")) then .value = "<redacted>" else . end)'
+
+      - name: Call Claude
+        run: |
+          set -euo pipefail
+
+          body=$(jq -n --arg model "$ANTHROPIC_MODEL" '{
+            model: $model,
+            max_tokens: 256,
+            messages: [{role: "user", content: "Say hello from GitHub Actions via workload identity federation."}]
+          }')
+
+          curl -sS --fail-with-body https://api.anthropic.com/v1/messages \
+            -H "authorization: Bearer $ANTHROPIC_ACCESS_TOKEN" \
+            -H "anthropic-version: 2023-06-01" \
+            -H "content-type: application/json" \
+            --data "$body" | jq .
