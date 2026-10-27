@@ -61,7 +61,8 @@ without stopping:
 6. optimize, under the rate controller;
 7. pass the gates again;
 8. serve;
-9. report.
+9. run `loom-benchmark/scripts/audit.py` from `bench/`. It must print `AUDIT PASS`
+   (fix any FAIL first). Then report, using its headline table.
 
 Stop to ask only for what the hard rules require: a gated-license click, or
 approval of a binary you downloaded. Avoid both where possible:

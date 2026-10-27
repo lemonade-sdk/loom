@@ -32,6 +32,7 @@ ap.add_argument("--kind", default="loom", choices=["loom", "llama"])
 ap.add_argument("--model", default=None, help="Loom model id (model.json model.id)")
 ap.add_argument("--long", action="store_true")
 ap.add_argument("--log", default="perf_log.jsonl")
+ap.add_argument("--reverted", action="store_true", help="this build is not kept (still logged: its time counts)")
 ap.add_argument("--repeats", type=int, default=5, help="samples per short-prefill size (median reported)")
 a = ap.parse_args()
 U, M = a.url, a.model
@@ -83,3 +84,10 @@ for k, v in list(out.items()):
 print(json.dumps(out))
 with open(a.log, "a") as f:
     f.write(json.dumps(out) + "\n")
+if a.kind == "loom":  # campaign tracking: targets.jsonl + rate-of-approach verdict (needs roofline.json)
+    from campaign import log_metrics
+    vals = {k: out.get(k) for k in ("decode_tps", "decode_tps_1k", "decode_tps_2k", "decode_tps_32k", "c4_agg_tps")}
+    for p in out.get("prefill", []) + out.get("prefill_long", []):
+        n = min((1000, 2000, 8000, 16000, 32000), key=lambda x: abs(x - p["prompt_tokens"]))
+        vals[f"prefill_{n}"] = p["prefill_tps"]
+    log_metrics(vals, a.label, a.reverted, a.log)

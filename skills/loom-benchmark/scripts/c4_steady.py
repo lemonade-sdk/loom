@@ -17,6 +17,8 @@ ap.add_argument("url")
 ap.add_argument("n", type=int, nargs="?", default=4)
 ap.add_argument("--model", default=None)
 ap.add_argument("--max-tokens", type=int, default=400)
+ap.add_argument("--label", help="build label: logs c4_steady to targets.jsonl (Loom only, needs roofline.json)")
+ap.add_argument("--reverted", action="store_true")
 a = ap.parse_args()
 events = [[] for _ in range(a.n)]
 
@@ -48,3 +50,6 @@ end = min(e[-1] for e in events)
 count = sum(sum(1 for x in e if start <= x <= end) for e in events)
 print(json.dumps({"streams": a.n, "window_s": round(end - start, 2), "agg_tps": round(count / (end - start), 1),
                   "per_stream_events": [len(e) for e in events]}))
+if a.label and a.model:  # Loom run: track it in the optimization campaign
+    from campaign import log_metrics
+    log_metrics({"c4_steady": round(count / (end - start), 1)}, a.label, a.reverted)

@@ -4,6 +4,7 @@
 # version strings are unreliable (the lemonade nightly prints "version: 1") and builds
 # differ a lot (Bolt-E4B c4: b1274 125 vs b1355 157; LFM2.5-24B prefill: 1062 vs 2140).
 # usage: pick_llamacpp.sh MODEL.gguf [PORT=8139] [SEARCH_ROOT=$HOME]
+#   writes the ranking to ./llamacpp_pick.json (run it from bench/; audit.py checks it)
 set -u
 gguf=$1; port=${2:-8139}; root=${3:-$HOME}
 here=$(cd "$(dirname "$0")" && pwd)
@@ -36,3 +37,9 @@ E
 done
 echo "ranked by decode, then prefill (use the top one; report its path/tag):"
 printf '%s\n' "${res[@]}" | sort -k1,1nr -k2,2nr | awk '{printf "  %7s %7s  %s\n",$1,$2,$3}'
+printf '%s\n' "${res[@]}" | sort -k1,1nr -k2,2nr | "$py" -c '
+import json, sys
+rows = [dict(zip(("decode_tps", "prefill_1k_tps", "dir"), l.split(None, 2))) for l in sys.stdin if l.strip()]
+for r in rows: r["decode_tps"], r["prefill_1k_tps"] = float(r["decode_tps"]), float(r["prefill_1k_tps"])
+json.dump({"gguf": sys.argv[1], "ranked": rows}, open("llamacpp_pick.json", "w"), indent=1)
+print("wrote llamacpp_pick.json; baseline:", rows[0]["dir"] if rows else None)' "$gguf"

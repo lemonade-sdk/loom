@@ -136,6 +136,24 @@ Rules:
 
 ## 3. Reporting
 
+**Run the audit first** (from `bench/`):
+```bash
+$T $S/audit.py .     # -> headline table + checks; exit 1 on FAIL; writes audit.json
+```
+It checks:
+- **Baseline.** `llamacpp_pick.json` exists, and the measured baseline is the
+  fastest build (decode and prefill).
+- **Plausibility.** Loom is not above ~0.97 of a ceiling, and llama.cpp is not
+  implausibly far below one.
+- **Tracking.** `targets.jsonl` has a start row and later measurements.
+- **Gates.** `compare.py` and `consistency.py` log to `gates.jsonl` by themselves.
+  The latest compare must be PASS, and run on the final commit. Consistency must
+  be PASS, or a documented near-tie: write the token, the gap and the cause in
+  `consistency_note.md`.
+
+Fix every FAIL before reporting, and report every WARN. The headline table is the
+source for the report's numbers.
+
 - **Lead with the bottom line**: a table with Loom and llama.cpp ROCm side by side
   for each metric, followed by one line on the correctness gate (e.g. "28 prompts
   up to 32k tokens; all divergences near-ties (max gap 0.97); concurrent ==

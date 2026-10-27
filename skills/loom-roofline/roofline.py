@@ -167,6 +167,10 @@ def main():
     ap.add_argument("--bw", type=float, default=216e9)
     ap.add_argument("--flops", type=float, default=59e12)
     ap.add_argument("--ctx", default="1000,2000,16000,32000")
+    ap.add_argument("--budget-h", type=float, default=1.0,
+                    help="the user's time budget for optimization (default 1 h); saved for progress.py")
+    ap.add_argument("--goal", action="append", default=[],
+                    help="user target, METRIC=TOK_S (e.g. decode_tps=70); replaces target/stretch for it")
     a = ap.parse_args()
     cfg = json.load(open(a.cfg)) if a.cfg else {}
     meta, tensors = load(a.gguf)
@@ -205,7 +209,9 @@ def main():
                weight_bytes_per_token=round(wb), head_bytes=head,
                bytes_by_kind={k: round(v) for k, v in detail.items()},
                matmul_params=round(params), efficiency_assumed=EFF, stretch_assumed=STRETCH,
-               bw=a.bw, flops=a.flops, metrics=rows)
+               bw=a.bw, flops=a.flops, metrics=rows,
+               campaign=dict(budget_h=a.budget_h,
+                             goals={g.split("=")[0]: float(g.split("=")[1]) for g in a.goal}))
     if a.out:
         json.dump(out, open(a.out, "w"), indent=1)
     print(f"weights read / decode token: {wb/1e9:.3f} GB  (head {head/1e9:.3f} GB)  "

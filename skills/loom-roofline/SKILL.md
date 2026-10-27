@@ -55,7 +55,8 @@ In every case:
 
 ```bash
 T=~/loom/.tools/bin/python; R=${CLAUDE_SKILL_DIR}
-$T $R/roofline.py MODEL.gguf --cfg cfg.json --baseline baseline.json --ctx 1000,2000,16000 --out bench/roofline.json
+$T $R/roofline.py MODEL.gguf --cfg cfg.json --baseline baseline.json --ctx 1000,2000,16000 --out bench/roofline.json \
+   --budget-h 1            # the user's budget (section 0); add --goal decode_tps=70 for a user target
 ```
 The script prints the bytes read per decode token, broken down by kind, so you can
 see where decode time must go:
@@ -133,14 +134,18 @@ Optimization returns diminish, so the question is never "is there more to gain?"
 (there always is, up to the ceiling). The question is **how fast this path is
 closing the gap**, compared with the other paths available.
 
-**Log every measured build**, kept or reverted, and evaluate in the same command.
-`--add` writes the line (timestamp, git commit) for you:
+**Tracking is automatic.** Once `bench/roofline.json` exists, every Loom run of
+`perf.py` (run from `bench/`) and `c4_steady.py --label NAME` does three things:
+1. appends its numbers to `bench/targets.jsonl`, with the time and the git commit;
+2. marks the first measurement of each metric as the start;
+3. prints the controller verdict for each metric (`[campaign] … -> CONTINUE`).
+
+Label every build (`perf.py URL LABEL`), and pass `--reverted` for a build you
+discard: its time still counts. The budget and any user goals come from
+`roofline.json` (set with `--budget-h` / `--goal`). To run the controller by hand:
 ```bash
-$T $R/progress.py bench/roofline.json bench/targets.jsonl --budget-h 1 --metric decode_tps --add 54.6 --change start
-$T $R/progress.py bench/roofline.json bench/targets.jsonl --budget-h 1 --metric decode_tps --add 59.5 --change "adaptive mv rows"
-$T $R/progress.py bench/roofline.json bench/targets.jsonl --budget-h 1 --metric decode_tps --add 59.4 --change "fused PLE epilogue" --reverted
+$T $R/progress.py bench/roofline.json bench/targets.jsonl --metric decode_tps
 ```
-Add `--goal-tps N` if the user gave a target.
 It works in **ms per token** (gains add; percentages don't), as follows:
 1. It takes the gap from the best kept build to the ceiling, the target and the
    stretch.
@@ -211,6 +216,10 @@ Rules that override the rate:
   tolerates a longer exploration, such as building a new kernel, before a review.
 
 ## 6. Report and recalibrate
+
+Run `audit.py` from `bench/` before writing the report. It is the definition of
+done; see `loom-benchmark`. It must print `AUDIT PASS`. Use its headline table
+(llama.cpp, Loom, margin, % of ceiling, target, met) in the report.
 
 - Report each headline metric as: target, stretch, achieved, % of ceiling, margin
   vs llama.cpp, and met / short (with the reason). Include the approach curve (gap
