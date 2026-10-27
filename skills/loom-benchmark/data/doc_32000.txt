@@ -1,0 +1,2913 @@
+
+
+# Acquiring Loom
+
+The `hrx-loom` Python wheel installs the Loom compiler, runtime, Python APIs,
+and command-line tools, including `loom-fetch`, `loom-serve`, and
+`loom-benchmark`. Source models use the included JIT compiler. Running a
+published model requires neither a repository checkout nor a build toolchain.
+
+!!! info "First release"
+
+    The first PyPI release has not been published. Until then, install a tested
+    development wheel from a successful [Loom CI run](https://github.com/ROCm/hrx-system/actions/workflows/ci_iree.yml).
+    The PyPI commands below describe installation once a release is available.
+
+## Platform requirements
+
+Use Python 3.12 or newer and one of these platforms:
+
+| Platform | Required system runtime |
+| --- | --- |
+| Linux x86-64 | glibc 2.39 or newer and `libstdc++` providing `GLIBCXX_3.4.31`; Ubuntu 24.04 with its standard `libstdc++6` satisfies this baseline. |
+| Windows 11 x86-64 | [Microsoft Visual C++ v14 x64 Redistributable](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist). |
+
+AMD GPU and NPU execution uses libamdf with the operating system's device
+driver. The account running Loom needs permission to access the device.
+The SDK includes its native libraries and C++ importer support; a ROCm SDK
+installation is not required. A model must supply programs for the chosen
+device: installing the SDK does not make every model portable to every target.
+
+## Install in a virtual environment
+
+=== "Linux"
+
+    ```sh
+    python3 -m venv .venv
+    source .venv/bin/activate
+    python -m pip install 'hrx-loom[hf]'
+    ```
+
+=== "Windows PowerShell"
+
+    ```powershell
+    py -3.12 -m venv .venv
+    .\.venv\Scripts\Activate.ps1
+    python -m pip install 'hrx-loom[hf]'
+    ```
+
+The optional `[hf]` extra installs Hugging Face acquisition support. Plain
+`hrx-loom` is sufficient for models whose assets come from local directories
+or ordinary HTTP URLs. Both install the same native tools.
+
+For a development wheel, download `loom-sdk-wheel-linux-Release` or
+`loom-sdk-wheel-windows-Release` from a successful Loom CI run and extract its
+ZIP. These artifacts contain the qualified wheel for your platform. Install
+the `.whl` inside it instead of the package name. For example, the Linux
+development release profile uses:
+
+```sh
+python -m pip install './hrx_loom-0.0.0.dev0-py3-none-manylinux_2_39_x86_64.whl[hf]'
+```
+
+Windows uses the corresponding `win_amd64.whl`. Use the exact filename in the
+artifact; its version changes with the build. The `release` profile is the
+ordinary optimized SDK. Explicit `tracy`, `debug`, and `asan` artifacts contain
+the same package with different native instrumentation. They replace the
+installed SDK in that environment; they are not pip extras. Separate virtual
+environments let these builds coexist. Instrumented wheels are available from
+releases and explicit [SDK workflow runs](https://github.com/ROCm/hrx-system/actions/workflows/build_loom_sdk.yml).
+
+## Check the installation
+
+```sh
+loom-serve --help
+loom-fetch --help
+loom-benchmark --help
+loom-run --list_drivers
+```
+
+Activating the environment puts its `bin/` directory on PATH on Linux and its
+`Scripts/` directory on PATH on Windows. The tools load their matching native
+libraries from the installation. If a command is not found, activate the same
+environment in which pip installed the wheel.
+
+`task` selects CPU execution, `amdgpu` selects native AMD GPU execution, and
+`xdna` selects AMD NPU execution. The driver list reports compiled-in drivers;
+creating a device still requires supported hardware and operating-system access.
+
+Continue with [fetch and serve a model](../serving/workflows/fetch-and-serve.md)
+for a complete speech-recognition request, or [run your first
+kernel](first-kernel.md) to author and execute Loom programs.
+
+## Building from source
+
+Compiler contributors can build the tools from the
+[HRX System repository](https://github.com/ROCm/hrx-system). The repository's
+[Loom quickstart](https://github.com/ROCm/hrx-system/tree/main/loom#build-the-tools)
+tracks the source-build prerequisites and Bazel targets. The
+[SDK build guide](https://github.com/ROCm/hrx-system/tree/main/loom/packaging/python)
+describes building and testing wheels through Bazel.
+
+Direct source builds are a compiler-contributor workflow. The command-line
+pages deliberately use installed tools exactly as a kernel or application
+author sees them; Bazel authoring repositories consume those tool roles through
+the module boundary below.
+
+## Consuming Loom from Bazel
+
+An independent kernel or model repository can depend on the HRX Bzlmod module
+and load Loom's public authoring rules through `@hrx//loom/...`. The module
+registers source-built toolchains automatically, while a local module override
+keeps compiler and kernel edits in one live Bazel graph. [Build libraries and
+binaries with Bazel](../workflows/build-with-bazel.md#depend-on-hrx) defines the
+module declaration, public loads, target profiles, and deployment products.
+
+Once the tools or Bzlmod dependency are available, [run your first
+kernel](first-kernel.md) from one checked source file.
+
+
+# Run your first Loom kernel
+
+**Example files:**
+[`loom/docs/examples/getting-started/first-kernel/`](https://github.com/ROCm/hrx-system/tree/main/loom/docs/examples/getting-started/first-kernel)
+
+This quickstart takes one source file from readable kernel code to checked
+AMDGPU execution and a real benchmark. The example computes SAXPY,
+`y = alpha * x + y`, over a runtime-sized `f32` vector.
+
+The same file owns three related things:
+
+- the kernel and its launch geometry;
+- deterministic correctness samples and expected results; and
+- a named benchmark that selects one of those proven samples.
+
+There is no generated host harness or separate benchmark program. Loom's tools
+compile the kernel for the selected device, materialize the tensors declared by
+the case, launch the work, check the result, and measure the same workload when
+requested.
+
+This page assumes the Loom tools are on `PATH` and that `--device=amdgpu` is
+available. [Acquiring Loom](acquiring-loom.md) describes SDK installation
+and source-build setup.
+
+## Create one source file
+
+Save the following as `saxpy.loom`:
+
+```loom title="saxpy.loom"
+--8<-- "generated/examples/getting-started/first-kernel/saxpy.loom"
+```
+
+The [`kernel.def`](../reference/dialects/kernel/ops/def.md) has two regions. The
+first maps `%element_count` to a physical launch using 256 work-items per
+workgroup. The second is the device body. Each work-item computes one element
+index, guards the partial final workgroup, loads `x` and `y`, performs the fused
+multiply-add, and stores the result back to `y`.
+
+`%element_count` appears in both signatures for different reasons. The value
+before `launch` is workload input used by the host-side launch calculation. The
+value inside `launch(...)` is an explicit device argument used for bounds and
+buffer views. Loom does not silently turn one into the other.
+
+The [`check.case`](../reference/dialects/check/ops/case.md) expands to six
+deterministic samples. Sizes 255, 256, and 257 cover both sides of the workgroup
+boundary; 1009 exercises a larger tail; and 65536 supplies the benchmark
+workload. Every sample fills `x` with 2, initializes `y` to 3, launches with
+`alpha = 4`, and requires every result to equal 11.
+
+The final [`check.benchmark`](../reference/dialects/check/ops/benchmark.md) does
+not duplicate that setup. It gives the 65536-element assignment a stable
+workload name and reuses the case's inputs, launch, and expectation.
+
+## Check the source before compiling
+
+`loom-format --check` parses and verifies the complete program and rejects noncanonical text:
+
+```shell
+loom-format --check saxpy.loom
+```
+
+This is more than whitespace checking. Invalid SSA use, mismatched types, and
+malformed launch signatures fail at this boundary. The test and benchmark
+runners then plan concrete parameter samples and reject assignments that do
+not select a valid case sample.
+
+## Execute every correctness sample on AMDGPU
+
+Run the checked program directly:
+
+```shell
+loom-test saxpy.loom --device=amdgpu >saxpy-test.json
+```
+
+The runner discovers `@saxpy_f32_case`, plans its six parameter assignments,
+compiles the reachable kernel for the selected AMDGPU device, allocates and
+initializes each tensor, executes the launch, and evaluates
+`check.expect.equal`. It returns a failing process status if any sample fails
+and writes the structured report before exiting.
+
+The report distinguishes cases from their concrete samples. This case has one
+authored definition and six executions; a failure records the exact
+`element_count` and stable sample ordinal needed to reproduce it.
+
+Select one sample while editing without changing the source:
+
+```shell
+loom-test saxpy.loom \
+  --device=amdgpu \
+  --case=@saxpy_f32_case \
+  --sample=3
+```
+
+Sample 3 is the 257-element tail. The ordinal comes from the deterministic
+parameter plan rather than hidden random state.
+
+## Benchmark the proven workload
+
+Measure the named 64K dispatch workload:
+
+```shell
+loom-benchmark saxpy.loom \
+  --device=amdgpu \
+  --benchmark=@saxpy_f32_64k \
+  --measure=dispatch_complete \
+  --batch-size=64 \
+  --output=saxpy-benchmark.json
+```
+
+The benchmark runner executes the selected case and verifies its expected
+result before accepting timing evidence. `dispatch_complete` measures host
+submission through device completion for a prepared batch, and the report
+normalizes the result per logical SAXPY operation. The batch size remains part
+of the recorded measurement policy instead of becoming source metadata.
+
+Benchmark with an optimized, uninstrumented tool build on an otherwise quiet
+device. The JSON report carries device identity, parameter values, timing
+policy, score distribution, and warnings needed to interpret the number.
+
+The checked-in example wraps the same steps and also emits a generic gfx11
+deployment artifact:
+
+```shell
+loom/docs/examples/getting-started/first-kernel/run.sh \
+  gfx11-generic build/first-kernel/gfx11-generic
+```
+
+The script prints each public command before executing it and leaves the test,
+benchmark, plan, and native artifact reports together in the output directory.
+
+## Put the source under Bazel
+
+An authoring repository can give the same file automated format, lint, plan,
+correctness, and benchmark-smoke coverage with one rule:
+
+```starlark title="BUILD.bazel"
+--8<-- "generated/examples/getting-started/first-kernel/BUILD.bazel:kernel-library"
+```
+
+The built-in AMDGPU execution profile owns the compiler and driver
+requirements, `--device=amdgpu` argument, GPU resource serialization, and
+stable query tags. The source remains target-independent; the profile chooses
+where this test instance runs.
+
+Build the reusable bytecode library:
+
+```shell
+bazel build :saxpy
+```
+
+Run its generated test suite on a configured AMDGPU machine:
+
+```shell
+bazel test :saxpy_test
+```
+
+`saxpy_test` performs source lint and canonical-format checks, plans every
+benchmark without a device, emits and inspects the generic gfx11 deployment
+artifact, executes all correctness cases on AMDGPU, and runs every benchmark
+once with no warmups as a smoke test. Full repeated timing remains the explicit
+`loom-benchmark` command above; CI should prove that the workload remains
+correct and executable without turning shared runners into performance
+laboratories.
+
+`loom_kernel_library` links the authored file into reusable `.loombc` and builds
+a separate test module that retains the root library's checks. Deployment
+linking selects exported production roots such as `@saxpy_f32` and strips
+`check.case` and `check.benchmark` records before target compilation. Test code
+therefore stays next to the kernel without entering the native artifact.
+
+## Follow the boundary that matters next
+
+You now have one portable source file that formats, verifies, executes across
+tail sizes, names a benchmark workload, participates in automated AMDGPU
+testing, and remains linkable as a library.
+
+- [Kernels and launch configuration](../guide/kernels-and-launch.md) explains
+  the workload, launch, and device-argument split.
+- [Checks and benchmarks](../guide/checks-and-benchmarks.md) develops richer
+  generators, oracles, comparisons, and sample plans.
+- [Tune loop unrolling and pipelining](../workflows/tune-loop-schedules.md)
+  takes a streaming reduction through configurable schedules, correctness,
+  compile reports, and matched benchmarks.
+- [Benchmark checked work](../workflows/benchmark.md) covers timing modes, data
+  reuse, profiling, and interleaved comparisons.
+- [Build libraries and binaries with Bazel](../workflows/build-with-bazel.md)
+  grows this one-file rule into reusable libraries and deployment artifacts.
+- [From source to artifacts](source-to-artifacts.md) follows a larger
+  multi-module program through linking, target specialization, command
+  programs, and compiler reports.
+
+
+# From source to artifacts
+
+**Example files:** [`loom/docs/examples/elementwise-transform/`](https://github.com/ROCm/hrx-system/tree/main/loom/docs/examples/elementwise-transform)
+
+Loom keeps a program understandable while it moves from reusable source to a
+target-specific artifact. Linking, specialization, launch configuration,
+correctness cases, benchmark workloads, and compiler evidence operate on the
+same program instead of meeting only after code has become opaque.
+
+The useful unit is therefore larger than an instruction stream and smaller
+than a framework. A Loom module can contain reusable computation, alternative
+implementations, dispatchable kernels, executable checks, and command programs.
+An application chooses which roots and facts matter, then asks Loom to link and
+specialize only that reachable program.
+
+The canonical `elementwise-transform` example maps a selectable doubling motif
+over f32 buffers, then follows that program through linking, target
+specialization, native kernel emission, and command-program lowering.
+
+## One program, several forms
+
+`.loom` is the canonical, human-readable source form. `.loombc` preserves the
+same linkable program in bytecode. Neither form implies one target or one
+deployment strategy.
+
+```text
+motif.loom + kernel.loom + model.loom + configuration + target profile
+                                  │
+                          link and specialize
+                                  │
+                  lower the selected executable roots
+                                  │
+           native code + launch contracts + compiler evidence
+```
+
+The same source can be compiled ahead of time, linked and specialized when a
+model is loaded, or JIT-compiled for a concrete invocation. Those choices
+change when facts become available; they do not require different kernel
+languages.
+
+Modules are ordinary composition boundaries. Public symbols can become roots
+for another module or an embedding, private symbols remain implementation
+details, and unreachable helpers and providers can disappear after selection.
+The linker resolves declared symbol relationships; merely placing a module in
+a library does not make its entire contents live.
+
+## Compose explicit modules
+
+Every `.loom` file verifies independently. An exact call into another module
+therefore needs a local declaration that states the complete contract. The
+link invocation or embedding supplies the libraries that may satisfy it:
+
+**Source:** [`loom/docs/examples/module-composition/root.loom`](https://github.com/ROCm/hrx-system/blob/main/loom/docs/examples/module-composition/root.loom)
+
+```loom title="root.loom"
+--8<-- "examples/module-composition/root.loom"
+```
+
+The layer has its own declared dependency on `@scale`. The checked workflow
+links only the available layer, writes a standalone partial `.loombc`, reloads
+it, and then supplies the kernel library:
+
+```shell
+loom/docs/examples/module-composition/run.sh build/module-composition
+```
+
+| Source contract | Selection behavior |
+| --- | --- |
+| Exact declaration | Resolve the compatible direct definition or unique exported library definition from the explicitly supplied source universe. |
+| `template.decl` plus `template.apply` | Select an eligible family implementation from the supplied libraries using facts, requirements, and priority. |
+| Runtime import attributes on `func.decl` | Preserve an external ABI contract for runtime resolution instead of satisfying it from Loom libraries. |
+
+Library paths and insertion order do not participate in symbol identity. The
+application or build graph chooses the source universe; Loom declarations state
+what that program requires. A partial link may preserve reachable declarations
+for a later boundary, while a closed link rejects any exact requirement that
+remains unresolved.
+
+The [linking workflow](../workflows/link-and-package.md) follows partial and
+transitive composition in detail. The [source-module
+chapter](../guide/source-modules.md#definitions-declarations-and-roots)
+defines the language contract.
+
+## Exact calls and selectable implementations
+
+Loom separates naming one implementation from requesting an implementation
+that satisfies a contract.
+
+| Source construct | Meaning |
+| --- | --- |
+| [`func.def`](../reference/dialects/func/ops/def.md) and [`func.call`](../reference/dialects/func/ops/call.md) | Define and call an exact helper by symbol. |
+| [`template.decl`](../reference/dialects/template/ops/decl.md) | Declare a stable compile-time family contract in the module that uses or implements it. |
+| [`template.def`](../reference/dialects/template/ops/def.md) | Provide one selectable implementation of that family. |
+| [`template.apply`](../reference/dialects/template/ops/apply.md) | Request an implementation of that family at compile time. |
+| [`template.call`](../reference/dialects/template/ops/call.md) | Call one named template implementation without candidate ranking. |
+
+An exact bit-manipulation helper is naturally a `func.call`. An operation whose
+best implementation depends on element format, shape facts, subgroup size, or
+target capabilities is naturally a `template.apply`. During specialization, Loom
+matches the reachable providers, their predicates and requirements, and the
+known facts. The selected provider becomes an ordinary callable boundary that
+normal inlining and optimization can remove.
+
+This is the foundation of a scalable library: callers name semantic demands;
+libraries provide reusable implementations; target selection remains a fact of
+the final compilation rather than a global property baked into every helper.
+This example defines an exact helper, a wave32-specific provider, and a
+portable provider for the same `guide.elementwise_transform` contract:
+
+**Source:** [`loom/docs/examples/elementwise-transform/motif.loom`](https://github.com/ROCm/hrx-system/blob/main/loom/docs/examples/elementwise-transform/motif.loom)
+
+```loom title="motif.loom"
+--8<-- "examples/elementwise-transform/motif.loom"
+```
+
+All three definitions omit `public` and are therefore private. Supplying the
+motif as an explicit library makes those implementations available while Loom
+forms the requested program, but it does not add them to the module's public
+interface. Provider selection and normal reachability can then remove the
+implementations the selected root does not need.
+
+The wave32 provider is eligible only when the selected target establishes a
+subgroup size of 32. The fallback stays targetless, so the motif remains useful
+to targets that know nothing about AMDGPU.
+
+The complete operation inventories live in the generated
+[`func`](../reference/dialects/func/index.md) and
+[`template`](../reference/dialects/template/index.md) dialect references.
+
+## A kernel owns two contracts
+
+A [`kernel.def`](../reference/dialects/kernel/ops/def.md) contains a launch
+configuration region and a device body. They answer different questions.
+
+The launch configuration region receives workload values and computes the
+physical workgroup grid, required workgroup size, and optional cluster size.
+The body receives the arguments carried through the device launch ABI and uses
+workgroup, workitem, subgroup, and memory operations to perform the work.
+
+This distinction keeps a workload such as “process 1009 elements” separate
+from the physical decision “launch four workgroups of 256 invocations.” An
+embedding evaluates the compiled launch configuration for the workload; it
+does not reverse-engineer grid dimensions from a kernel name or duplicate the
+kernel's scheduling arithmetic.
+
+Workload arguments and device arguments are explicit even when the same value
+appears in both contracts. That explicit boundary lets Loom specialize launch
+geometry when facts are known while preserving a correct dynamic path when
+they are not. The generated [`kernel` dialect
+reference](../reference/dialects/kernel/index.md) defines the complete launch,
+execution, collective, and synchronization vocabulary.
+
+The kernel below accepts its element count as a workload and device value,
+uses a portable 64-thread workgroup, and applies the motif contract without
+naming either provider. The target profile still selects the eligible motif
+implementation independently of that launch geometry:
+
+**Source:** [`loom/docs/examples/elementwise-transform/kernel.loom`](https://github.com/ROCm/hrx-system/blob/main/loom/docs/examples/elementwise-transform/kernel.loom)
+
+```loom title="kernel.loom"
+--8<-- "examples/elementwise-transform/kernel.loom"
+```
+
+## Ask when a value becomes known
+
+Most confusion about specialization disappears once every value has a clear
+binding stage.
+
+| Value category | Binding stage | Role |
+| --- | --- | --- |
+| Configuration values | Link or compile time | Resolve [`config.decl`](../reference/dialects/config/ops/decl.md) through a matching definition and seed facts used by specialization. |
+| Target facts | Link or compile product boundary | Describe capabilities such as subgroup size, supported types, and resource limits for the selected executable root. |
+| Kernel workload values | Launch-configuration evaluation | Compute the physical launch for one workload without pretending the values were compile-time constants. |
+| Kernel launch arguments | Device issue | Carry scalars and buffers through the selected target ABI into the kernel body. |
+| Command specialization arguments | Command-program specialization | Shape source control flow and launch computation; direct counts and scalar command data must become exact before portable preparation. |
+| Command buffer bindings | Command-program issue | Attach concrete parameter, transient, input, and output storage without recompiling the schedule. |
+
+Configuration is not a hidden global flag. A module declares artifact-level
+choices such as a model's layer count or weight encoding, another input defines
+them, and ordinary symbol dependency analysis keeps their effect visible:
+
+```loom
+config.decl @model.layer_count : %value: index where [range(%value, 1, 256)]
+config.decl @model.weight_encoding : encoding<schema>
+```
+
+Per-launch element counts stay workload values instead of becoming global
+configuration. Likewise, target requirements are compile-time selection
+constraints rather than runtime branches. Reusable code generally stays
+targetless; a provider names a target requirement only when its algorithm
+actually depends on one.
+
+Loom can preserve only information the program supplies. The ranges and
+divisibility predicates on a
+[`config.decl`](../reference/dialects/config/ops/decl.md) constrain a value even
+before a composition root binds it to one constant. Control flow also supplies
+path facts: inside the guarded region in `kernel.loom`, Loom knows that
+`%element_index < %element_count` without an extra assumption. An
+[`index.assume`](../reference/dialects/index/ops/assume.md) is for information
+the compiler cannot derive, such as a range guaranteed by the producer of a
+loaded routing index. The `buffer.assume.*` family carries root alignment,
+memory-space, aliasing, and identity facts; the example's
+[`buffer.assume.noalias`](../reference/dialects/buffer/ops/assume-noalias.md)
+makes the input and output independence explicit.
+
+These are optimization inputs, not documentation comments. Shapes, ranges,
+alignment, aliasing, and target requirements survive linking and
+specialization so that each later stage can make a stronger decision without
+rediscovering information that the author or embedding already knew.
+
+The generated [`config`](../reference/dialects/config/index.md) and
+[`target`](../reference/dialects/target/index.md) references define those two
+fact sources.
+
+## Correctness and measurement stay beside the program
+
+A [`check.case`](../reference/dialects/check/ops/case.md) is an executable SSA
+program that creates inputs, launches code, obtains expected values, and states
+the comparison policy. A
+[`check.benchmark`](../reference/dialects/check/ops/benchmark.md) selects named
+assignments from a case for timing. The benchmark row does not copy the setup or
+invent a second workload description.
+
+Checks are test-only symbols, not deployment entry points. Keeping them in the
+same source gives formatters, verifiers, test runners, benchmark runners, and
+agents one authoritative statement of the workload while allowing published
+libraries to exclude the harness. The generated
+[`check` dialect reference](../reference/dialects/check/index.md) covers input
+generation, fixtures, requirements, expectations, and benchmark records.
+
+## Command programs move the same model upward
+
+A [`command.program.def`](../reference/dialects/command/ops/program-def.md)
+composes kernel launches, parameter views, resources, and serial or concurrent
+schedule regions into a reusable subgraph. Its leading specialization
+arguments participate in staged specialization and deterministic launch-count
+computation; its buffer bindings remain replaceable when the materialized
+program is issued. Exact counts become direct commands, while intentionally
+dynamic counts use an explicit `view<3xi32>` produced before an indirect
+dispatch.
+
+That separation allows one program to specialize around model structure and
+target facts while still accepting different weights, cache storage, inputs,
+and outputs. It is the same idea as a specialized kernel launch, applied to a
+larger ownership boundary rather than hidden behind a separate graph compiler.
+
+The outer module declares the exact kernel dependency and turns one concrete
+1009-element invocation into a reusable command program. Its portable
+workgroup geometry makes the physical count exact without loading the kernel
+implementation. The kernel itself retains its dynamic workload contract and
+can be launched with other counts by other roots:
+
+**Source:** [`loom/docs/examples/elementwise-transform/model.loom`](https://github.com/ROCm/hrx-system/blob/main/loom/docs/examples/elementwise-transform/model.loom)
+
+```loom title="model.loom"
+--8<-- "examples/elementwise-transform/model.loom"
+```
+
+!!! info "Command deployment products"
+
+    Command programs are constructed through LoomC together with the exact
+    kernel requests they publish. `loom-compile` emits standalone kernel and
+    module artifacts; it cannot preserve command-to-kernel bindings across
+    separate invocations.
+
+The generated [`command` dialect
+reference](../reference/dialects/command/index.md) documents the source
+constructs that exist today.
+
+## Follow one composition to Low
+
+The three source listings above are repository `.loom` files, not prose copies.
+With the Loom tools on `PATH`, this command formats them, links the selected
+program against the explicit provider universe, specializes that closure for
+the generic GFX11 profile, and emits the kernel product. It prints every Loom
+command it runs:
+
+```shell
+loom/docs/examples/elementwise-transform/run.sh \
+  gfx11-generic build/elementwise-transform/gfx11-generic
+```
+
+The resulting directory contains the closed target-specialized
+`elementwise-transform.loom` module, the GFX11 HSACO, and the captured target
+Low IR. The
+`--target=amdgpu:gfx11-generic` link argument makes subgroup facts
+available before template-provider pruning, so the wave32 implementation is
+selected without pulling the portable alternative into the product. The
+documentation build invokes the same script and regenerates the views below;
+neither output is checked-in source.
+
+=== "GFX11 kernel Low"
+
+    ```loom
+    --8<-- "generated/examples/elementwise-transform/elementwise-transform-gfx11.loom"
+    ```
+
+=== "Command-program Low"
+
+    ```loom
+    --8<-- "generated/examples/elementwise-transform/elementwise-transform-program.loom"
+    ```
+
+The GFX11 tab comes directly from the installed-tool workflow above. The
+documentation build lowers the same closed command root separately to produce
+the readable command-program tab: this example's scalar launch configuration
+is projected as pure caller IR, folded to an exact direct count, and lowered
+while the device implementation remains unopened. Production command
+construction uses the single LoomC transaction described in [Parallelize
+kernel JIT compilation](../integration/product-frontier.md).
+
+## Embedding chooses the deployment policy
+
+Loom produces modules, target artifacts, launch contracts, diagnostics, and
+structured compiler reports. The embedding decides when compilation happens,
+where artifacts are cached, how executable code is loaded, and how work is
+issued to a device runtime.
+
+The public [`loomc` C API](../reference/c-api/index.md) exposes the in-memory
+source, link, specialization, compilation, emission, and launch-configuration
+boundaries needed to build those policies. Executable embedding examples in
+this guide are included only from checked programs that build against that API;
+the generated header reference remains authoritative for ownership, lifetime,
+threading, and failure contracts.
+
+[Embed kernel JIT compilation](../integration/jit-kernel.md) follows one of
+those checked programs from targetless source through launch evaluation and an
+in-memory native executable.
+
+## Working rules
+
+- Keep reusable algorithms targetless until a real implementation requirement
+  needs target facts.
+- Use an exact call for an exact helper and a contract application when the
+  implementation is intentionally substitutable.
+- Use configuration for compile-time product choices, workload arguments for
+  per-launch shape, and launch arguments for the device ABI.
+- Put correctness policy in `check.case`; make benchmarks select those checked
+  workloads instead of reconstructing them.
+- Keep motifs as functions and templates. Add a kernel ABI where the program
+  actually becomes dispatchable, and a command-program ABI where a reusable
+  subgraph becomes materializable.
+
+Continue with [Source modules and canonical
+text](../guide/source-modules.md) to learn the source and composition contract,
+or browse the [generated language reference](../reference/index.md) for exact
+syntax and operation contracts. If the Loom tools are not yet on `PATH`,
+[Acquiring Loom](acquiring-loom.md) describes the current installation status.
+
+
+# Buffers, views, and memory
+
+**Example files:** [`loom/docs/examples/elementwise-transform/`](https://github.com/ROCm/hrx-system/tree/main/loom/docs/examples/elementwise-transform)
+
+Loom separates storage identity from the logical shape used to access that
+storage. This keeps aliasing, memory-space, alignment, layout, and bounds facts
+available to the compiler instead of hiding them behind pointer arithmetic.
+
+In this chapter, you will learn:
+
+- why kernels receive opaque `buffer` values and construct typed `view` values;
+- where byte offsets end and logical element coordinates begin;
+- how assumptions attach storage facts to new SSA values;
+- how scalar, vector, atomic, and masked accesses share one view model; and
+- how workgroup storage and synchronization remain explicit.
+
+## Storage identity and logical access are different contracts
+
+Three value kinds meet at a memory operation:
+
+| Value | What it owns | What it does not own |
+| --- | --- | --- |
+| `buffer` | Opaque storage identity and root facts such as memory space, alignment, and alias scope. | Element type, rank, shape, and address layout. |
+| `view` | A typed, non-owning logical coordinate space projected over a buffer. | Allocation lifetime or independent storage identity. |
+| `vector` or scalar | The value transferred to or from storage. | Address identity or a persistent attachment to memory. |
+
+This separation allows one allocation to have several useful projections. A
+packed weight buffer, for example, can expose byte payloads, integer words, and
+scale values through different views without pretending those views are
+different allocations.
+
+## Project a buffer into logical coordinates
+
+[`buffer.view`](../reference/dialects/buffer/ops/view.md) combines an opaque
+storage root, a physical base byte offset, and a result view type:
+
+```loom
+%base = index.constant 0 : offset
+%input_view = buffer.view %input[%base] : buffer -> view<[%row_count]x[%column_count]xf32>
+```
+
+The operation neither allocates nor copies. `%input_view` refers to the same
+storage root as `%input`. Its two dimensions and `f32` element type establish
+the logical coordinates accepted by later accesses.
+
+The value between brackets on `buffer.view` is an `offset` measured in bytes.
+Indices on [`view.load`](../reference/dialects/view/ops/load.md),
+[`view.store`](../reference/dialects/view/ops/store.md), and vector memory
+operations are `index` values measured in logical elements:
+
+```loom
+%value = view.load %input_view[%row, %column] : view<[%row_count]x[%column_count]xf32> -> f32
+view.store %value, %output_view[%row, %column] : f32, view<[%row_count]x[%column_count]xf32>
+```
+
+The full-rank index list names a position in view coordinates. An attached
+address layout, when present, maps that position to storage. Source operations
+do not reproduce the layout as flattened pointer arithmetic.
+
+## Cross the byte boundary once
+
+Use [`index.scale`](../reference/dialects/index/ops/scale.md) when a logical
+coordinate selects a byte-addressed subregion:
+
+```loom
+%row_stride = index.constant 4096 : offset
+%row_byte_offset = index.scale %first_row, %row_stride : index, offset -> offset
+%rows = buffer.view %storage[%row_byte_offset] : buffer -> view<[%row_count]x1024xf32>
+```
+
+Once `%rows` exists, its operations use row and column indices. Multiplying
+every access by four or carrying a flattened byte pointer through the function
+would discard the distinction that lets Loom reason about bounds and layouts.
+
+[`view.subview`](../reference/dialects/view/ops/subview.md) moves an origin in
+logical coordinates while retaining the same storage root and address layout:
+
+```loom
+%tile = view.subview %matrix[%row, %column] : view<[%m]x[%n]xf32> -> view<16x32xf32>
+```
+
+[`view.refine`](../reference/dialects/view/ops/refine.md) explicitly qualifies
+the shape, layout, or element-access alignment of the same view and byte base.
+Neither operation is an allocation or a data movement.
+
+Views over a common buffer can be carried through structured loops or selected
+as whole values. Their storage identity stays fixed while the chosen byte
+origin changes. [Rotating views over reusable storage](functions-and-control.md#rotate-views-over-reusable-storage)
+shows how to reuse two slots, preserve a live exit view, and handle empty or
+partially unrolled loops.
+
+When the choice changes the address mapping, construct the candidate
+`encoding.layout.strided` values and select or carry the layout as ordinary SSA
+state. The resulting view type names that layout, preserving runtime element
+strides without flattening logical indices into source-level pointer
+arithmetic. [Selecting and carrying address
+layouts](functions-and-control.md#select-and-carry-address-layouts) shows the
+complete relationship and a checked target-execution example.
+
+## Natural alignment is the ordinary access contract
+
+An ordinary typed access requires the natural alignment of its physical scalar
+element. An `i32` or `f32` access requires four-byte alignment without an authored
+assumption; `i64` and `f64` require eight. For byte-addressable physical scalars,
+the requirement is their storage byte width. The width of a transferred vector
+does not increase it: loading `vector<16xi8>` from an `i8` view requires only
+byte alignment.
+
+Packed storage carries an explicitly reduced requirement in the view type:
+
+```loom
+%packed = buffer.view %storage[%byte_offset] : buffer -> view<4xi32, align(1)>
+%word = view.load %packed[0] : view<4xi32, align(1)> -> i32
+```
+
+`align(...)` takes a positive power of two no greater than natural element
+alignment. Thus `view<4xi64, align(4)>` admits four-byte-aligned words, while
+`view<4xi32, align(4)>` canonicalizes to `view<4xi32>`. When a layout is present,
+the qualifier follows it: `view<4xi32, %layout, align(1)>`.
+
+This is a requirement on an executed access, not an unconditional fact about
+the view's origin. Forming, passing, or slicing a view performs no access.
+Inactive masked lanes have no alignment requirement, and an all-false mask can
+use an empty view at an otherwise unaligned origin. Prefetch hints likewise
+make no semantic access. An active access that violates its declared alignment
+is outside the language contract; it does not request runtime alignment checks
+or automatic fallback.
+
+The qualifier travels through function signatures and subviews. Exact call
+matching distinguishes packed and natural views. An explicit `view.refine`
+can relax or strengthen the requirement for subsequent accesses; automatic
+shape refinement preserves the existing alignment contract. Stronger address
+facts remain separate: `buffer.assume.alignment` describes the allocation root,
+and an assumption of one-byte root alignment cannot relax an ordinary `i32`
+access.
+
+Reduced alignment does not guarantee that every target implements the access.
+Targets diagnose unsupported memory contracts, including atomic operations
+whose required indivisible access cannot be implemented at that alignment.
+Alignment also grants no extra readable or writable bytes: footprint, masking,
+and bounds remain independent contracts.
+
+## State storage facts at the boundary that knows them
+
+External buffer parameters do not become independent merely because their SSA
+names differ. If the caller contract guarantees disjoint storage, make that
+guarantee visible:
+
+```loom
+%input_noalias, %output_noalias = buffer.assume.noalias %input, %output : buffer, buffer
+```
+
+Each assumption produces a refined SSA value over the same storage. Later uses
+must consume that result to benefit from the fact.
+
+| Operation | Fact supplied by the author or embedding |
+| --- | --- |
+| [`buffer.assume.noalias`](../reference/dialects/buffer/ops/assume-noalias.md) | The listed roots participate in comparable disjoint alias scopes. |
+| [`buffer.assume.alignment`](../reference/dialects/buffer/ops/assume-alignment.md) | Every listed root has at least the stated byte alignment. |
+| [`buffer.assume.memory_space`](../reference/dialects/buffer/ops/assume-memory_space.md) | A root belongs to a concrete target-independent memory space. |
+| [`buffer.assume.same_root`](../reference/dialects/buffer/ops/assume-same_root.md) | Two handles are known to refer to the same underlying allocation. |
+
+Kernel ABI buffer arguments already carry their global-memory fact. Reusable
+functions that accept buffers outside that boundary may remain generic or use
+an explicit assumption when their caller contract knows more. An assumption is
+a correctness promise: supplying a false alias, alignment, extent, or
+memory-space fact makes the program invalid.
+
+### Aligned bases enable wide transfers
+
+Examples and entry wrappers should expose the alignment guaranteed by their
+caller. For buffers allocated with at least 64-byte base alignment, an explicit
+64-byte contract gives the compiler useful freedom to select wide memory
+operations. This is particularly valuable for XDNA AIE2P's 512-bit transfers.
+
+The following example copies sixteen words from aligned buffer bases:
+
+```loom title="aligned-vector-copy.loom"
+--8<-- "examples/guide/structured-compute/aligned-vector-copy.loom"
+```
+
+On AIE2P, this copy can use one 512-bit load and one 512-bit store. With only
+the natural four-byte element requirement, the same vector copy lowers to
+sixteen scalar loads and sixteen scalar stores. The assumption supplies address
+information; it performs no allocation, realignment, or runtime check.
+
+The contract applies to each passed buffer base. A byte offset that is a
+multiple of 64 preserves the alignment; moving one `i32` element from that
+base guarantees only four-byte alignment at the new origin. Subviews retain
+these relationships without strengthening the root. When adapting an example,
+change or remove the assumption to match the embedding's actual guarantee;
+the scalar element-access requirement remains in force.
+
+## Transfer structured values through views
+
+Scalar access names one logical element. [`vector.load`](../reference/dialects/vector/ops/load.md)
+and [`vector.store`](../reference/dialects/vector/ops/store.md) name a logical
+origin and transfer a vector footprint:
+
+```loom
+%values = vector.load %matrix[%row, %column] : view<[%m]x[%n]xf32> -> vector<4x8xf32>
+vector.store %values, %result[%row, %column] : vector<4x8xf32>, view<[%m]x[%n]xf32>
+```
+
+Vector axes map to the trailing view axes. Leading view axes select the slice;
+the vector shape describes the transferred footprint. The source states the
+structured operation while target lowering chooses native instructions,
+splitting, or scalarization.
+
+Masked operations make tail behavior part of the access itself. A false load
+lane does not access memory and takes its passthrough value; a false store lane
+does not modify memory:
+
+```loom
+%loaded = vector.load.mask %input[%row, %column], %mask, %zero : view<[%m]x[%n]xf32>, vector<8xi1>, vector<8xf32>
+vector.store.mask %loaded, %output[%row, %column], %mask : vector<8xf32>, view<[%m]x[%n]xf32>, vector<8xi1>
+```
+
+Gather and scatter operations add per-lane logical offsets to the final view
+axis. Fragment loads and stores add a structured matrix-operand role. These are
+variations of the same view contract rather than separate pointer models.
+
+## Allocate scratch by physical extent
+
+[`buffer.alloca`](../reference/dialects/buffer/ops/alloca.md) creates a fresh
+scratch root in an allocatable memory space. Its requested extent and alignment
+are physical byte quantities:
+
+```loom
+%scratch_bytes = index.constant 4096 : offset
+%base = index.constant 0 : offset
+%scratch = buffer.alloca<workgroup> align(64) %scratch_bytes : buffer
+%scratch_view = buffer.view %scratch[%base] : buffer -> view<32x32xf32>
+```
+
+Every execution produces a distinct storage identity. A target requiring a
+static frame reserves the proven finite maximum, and the compiled launch
+contract reports the total workgroup-local storage required by the kernel.
+
+When several simultaneously live byte ranges share one slab,
+[`buffer.pack`](../reference/dialects/buffer/ops/pack.md) computes aligned,
+non-overlapping offsets and a repeatable total stride:
+
+```loom
+%total_bytes, %header_offset, %payload_offset = buffer.pack [align(16) %header_bytes, align(256) %payload_bytes] : offset
+```
+
+This is physical layout. Reusing one allocation across non-overlapping
+lifetimes is a compiler allocation decision and is not encoded by pretending
+the ranges are simultaneously live.
+
+## Synchronization names both rendezvous and memory
+
+Storage visibility is not implied by source order across invocations. When
+workitems exchange values through workgroup storage, the program names the
+execution scope, fenced memory space, and ordering:
+
+```loom
+vector.store %values, %scratch_view[%row, %column] : vector<4xf32>, view<32x32xf32>
+kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+%transposed = vector.load %scratch_view[%column, %row] : view<32x32xf32> -> vector<4xf32>
+```
+
+[`kernel.barrier`](../reference/dialects/kernel/ops/barrier.md) is a rendezvous
+for participating invocations plus a fence for the named memory space.
+Asynchronous transfers use `kernel.async.group` and `kernel.async.wait` for
+completion; a barrier is added only when invocations also need to rendezvous.
+
+A split barrier exposes useful per-invocation work between finishing one
+shared-memory phase and waiting for every other participant to finish it:
+
+```loom
+%observed = view.load %tile[%peer] : view<64xi32> -> i32
+%phase = kernel.barrier.arrive<workgroup> scope(workgroup) ordering(acq_rel) -> kernel.barrier.phase
+%updated = func.call pure @private_work(%observed, %sum) : (i32, i32) -> (i32)
+kernel.barrier.wait %phase : kernel.barrier.phase
+// The next shared-memory overwrite is now safe.
+```
+
+[`kernel.barrier.arrive`](../reference/dialects/kernel/ops/barrier-arrive.md)
+applies the release portion of the pair and returns an opaque phase identity.
+The unique
+[`kernel.barrier.wait`](../reference/dialects/kernel/ops/barrier-wait.md)
+consumes that identity, waits for every participant, and completes the acquire
+portion before later memory access. Every invocation in the execution scope
+executes matching dynamic arrive and wait instances. The open interval contains
+ordinary per-invocation work and pure calls; convergent operations, another
+barrier, and impure calls remain outside it.
+
+This pair states an authored scheduling contract. A target may legalize it to
+native split-barrier packets or reject it. A reusable motif can select a native
+provider on capable targets and retain a complete-barrier fallback elsewhere.
+The [loop-scheduling workflow](../workflows/tune-loop-schedules.md#overlap-private-work-with-shared-tile-release)
+shows that composition and the corresponding compile-report evidence.
+
+Atomic view operations similarly require an explicit scope and ordering. A
+plain store does not become atomic because several invocations may reach it,
+and a barrier does not resolve conflicting writes.
+
+Floating-point atomic addition uses the target's native subnormal behavior by
+default; inputs or results may flush to zero. Request `noftz` (no flush to zero)
+when those values must survive:
+
+```loom
+%old = view.atomic.rmw<addf, noftz> %increment, %view[0] {ordering = relaxed, scope = device} : f32, view<1xf32> -> f32
+```
+
+The same flag applies to atomic reductions and vector atomics, including masked
+forms. Returned old values retain their bits regardless of this flag. Explicit
+preservation may require a compare-exchange loop and rejects targets that cannot
+provide it for the requested element width. Vulkan supports preserving `f32`
+addition on devices with independent `f32` denormal control; a native floating
+atomic instruction alone does not establish that guarantee.
+
+## Preserve the strongest useful representation
+
+Common representation mistakes all erase information too early:
+
+| Symptom | Lost contract | Stronger source shape |
+| --- | --- | --- |
+| Every access performs byte arithmetic | Logical shape and element stride | Construct a view once, then index it logically. |
+| Two parameters are assumed independent by convention | Alias proof | Refine them together with `buffer.assume.noalias`. |
+| A flat view is used for a logical matrix | Rank and axis structure | Use a ranked view with the actual logical dimensions. |
+| Tail lanes load first and mask later | Memory safety | Use a guarded region or masked memory operation. |
+| Shared-memory communication relies on source order | Cross-invocation visibility | State the required barrier or async completion edge. |
+| Target address spaces appear throughout a motif | Reusability | Use target-independent memory spaces and specialize at the leaf. |
+
+The [source-to-artifacts kernel](../getting-started/source-to-artifacts.md#a-kernel-owns-two-contracts)
+shows the complete buffer-to-view path with dynamic extent, explicit no-alias
+facts, a control-flow-derived in-bounds proof, and scalar access.
+
+Continue with [Kernels and launch configuration](kernels-and-launch.md), where
+the storage operations become part of a dispatchable entry with separate
+workload and device contracts.
+
+
+# Checks and benchmarks
+
+**Example files:** [`loom/docs/examples/guide/checks-and-benchmarks/`](https://github.com/ROCm/hrx-system/tree/main/loom/docs/examples/guide/checks-and-benchmarks)
+
+Loom correctness records are programs, not runner metadata. A `check.case`
+constructs values, selects deterministic samples, invokes kernels or reference
+oracles, and states expectations in the same linked symbol graph as the code it
+tests. A `check.scenario` runs one unchanged subject through independent target
+and oracle profiles over a finite, deterministic trial domain. A
+`check.benchmark` names a slice of either proven workload rather than recreating
+setup in a second harness.
+
+In this chapter, you will learn:
+
+- how one case expands into deterministic concrete samples;
+- how tensors cross from host-side materialization into kernel buffer bindings;
+- where expected values and comparison policy belong;
+- how one scenario compares independent target and oracle realizations;
+- why requirements, configuration, and case parameters are different domains;
+  and
+- how benchmark records preserve workload identity while tools own timing
+  policy.
+
+## A case is an isolated SSA program
+
+[`check.case`](../reference/dialects/check/ops/case.md) owns one isolated region
+terminated by [`check.return`](../reference/dialects/check/ops/return.md). Values
+inside the region flow through five semantic stages:
+
+1. **Requirements** decide whether the environment can execute the case.
+2. **Parameters** expand the case into concrete samples.
+3. **Value sources** materialize inputs, outputs, fixtures, and expected values.
+4. **Invocations** call an oracle provider or launch one or more kernels.
+5. **Expectations** compare resulting values or require structured runtime
+   events.
+
+The stages are an ownership model, not mandatory source blocks. Ordinary SSA
+dependencies determine the actual order. A case may launch several kernels,
+feed one output into another launch, compare several results, and write failure
+artifacts without moving that schedule into host test code.
+
+`public` makes a case visible to test discovery:
+
+```loom
+check.case public @decode_tail_case {
+  // Requirements, samples, values, work, and expectations.
+  check.return
+}
+```
+
+Cases and benchmark records are test-only symbols. They may live beside the
+code they exercise during authoring or move into a separate test module when a
+library boundary benefits from that separation.
+
+## Start with one self-contained program
+
+Co-locating a private kernel, its reproducing case, and its benchmark record is
+one of Loom's fastest authoring loops. One `.loom` file can be formatted, run,
+and measured directly without creating a build graph or translating a failure
+into a second harness language. A bug report can carry the exact source,
+deterministic inputs, expected result, and workload identity as one portable
+program. Agents can change the implementation and immediately rerun the same
+evidence.
+
+That shape remains valid as long as it remains readable. Check symbols do not
+change the production kernel contract, and deployment packaging can omit them
+with `loom-link --strip-check`.
+
+## Split when the library boundary becomes clearer
+
+The example for this chapter places a small production kernel in one
+module:
+
+**Source:** [`loom/docs/examples/guide/checks-and-benchmarks/kernel.loom`](https://github.com/ROCm/hrx-system/blob/main/loom/docs/examples/guide/checks-and-benchmarks/kernel.loom)
+
+```loom title="kernel.loom"
+--8<-- "examples/guide/checks-and-benchmarks/kernel.loom"
+```
+
+Its test module declares the exact dependency, constructs a deterministic seed
+sweep, launches the kernel, and compares the mutated output tensor:
+
+**Source:** [`loom/docs/examples/guide/checks-and-benchmarks/tests.loom`](https://github.com/ROCm/hrx-system/blob/main/loom/docs/examples/guide/checks-and-benchmarks/tests.loom)
+
+```loom title="tests.loom"
+--8<-- "examples/guide/checks-and-benchmarks/tests.loom"
+```
+
+The [`kernel.decl`](kernels-and-launch.md#declare-and-launch-the-complete-contract)
+is part of the test module's source contract. Supplying the production library
+can satisfy that declaration; it cannot make an undeclared launch valid. The
+test module therefore owns correctness and benchmark declarations independently
+while the production module remains free of check records.
+
+This is a scalable library shape: `motif/` and `kernel/` packages publish
+reusable modules, while their sibling `test/` packages own grouped test
+modules, cases, and benchmark records. The public Bazel `loom_test` rule merges
+its `srcs`, retains all tests and benchmarks they own, and links the definitions
+they reach through `deps`. Tests and benchmarks declared by dependencies are
+not part of the resulting test module. `loom-test` executes each selected
+case sample once for correctness. The test then runs each benchmark through
+`loom-benchmark` with one measured iteration and no warmup repetitions;
+full performance measurement remains an explicit benchmark workflow.
+
+## Parameters define the sample space
+
+Parameter operations produce ordinary scalar SSA values and a deterministic
+sample plan:
+
+| Operation | Sample domain |
+| --- | --- |
+| [`check.param.choice`](../reference/dialects/check/ops/param-choice.md) | An explicit set of integer or index values. |
+| [`check.param.range`](../reference/dialects/check/ops/param-range.md) | A linear or power-of-two sampling of a closed interval. |
+| [`check.param.seed`](../reference/dialects/check/ops/param-seed.md) | A fixed count of deterministic random-generator seeds. |
+
+Several parameter operations form a Cartesian sample space. The planner assigns
+stable ordinals in source order, and runners may select one ordinal or apply an
+explicit maximum when the full product is not the intended evidence.
+
+The optional `name` is the stable key used by benchmark assignments and
+structured reports:
+
+```loom
+%row_count = check.param.choice values([17, 64, 193]) name("row_count") : index
+%seed = check.param.seed base(1000) count(4) name("seed") : i64
+```
+
+Parameter values are runtime case inputs. They do not create compiled artifact
+versions. A `config.decl` instead states a value fixed for one specialization;
+a command-line timing flag states measurement policy. Keeping these domains
+separate allows one compiled candidate to run many case samples and lets the
+same named workload be measured under several policies.
+
+## Materialize reproducible values in source
+
+Value-source operations make a case self-contained:
+
+| Source | Intended use |
+| --- | --- |
+| [`check.literal`](../reference/dialects/check/ops/literal.md) | One typed scalar reproducer or expected value. |
+| [`check.generate.fill`](../reference/dialects/check/ops/generate-fill.md) | A tensor or scalar filled with a static payload. |
+| [`check.generate.iota`](../reference/dialects/check/ops/generate-iota.md) | Deterministic arithmetic sequences, optionally periodic. |
+| [`check.generate.random.uniform`](../reference/dialects/check/ops/generate-random-uniform.md) | Seeded values over a static numeric interval. |
+| [`check.file.read.npy`](../reference/dialects/check/ops/file-read-npy.md) | A typed external fixture whose exact bytes matter. |
+
+Generators accept dynamic tensor dimensions from case parameters:
+
+```loom
+%input = check.generate.iota offset(1.0) step(1.0) : tensor<[%row_count]xf32>
+%output = check.generate.fill value(0.0) : tensor<[%row_count]xf32>
+```
+
+A check `tensor` is a typed materialized value. Passing it to a kernel buffer
+argument binds its storage for that launch; writes through an output binding are
+visible to later invocations and expectations in the case. The tensor retains
+shape and element type for planning and comparison while the kernel continues
+to receive the opaque `buffer` ABI it declared.
+
+[`check.tensor.view`](../reference/dialects/check/ops/tensor-view.md) creates a
+typed alias over a byte subspan when several logical bindings intentionally
+share one fixture. Alias that is not part of the production workload should not
+be manufactured merely to reduce test allocation.
+
+Random generation is reproducible because the seed is explicit SSA input. In
+the checked copy case, `%input` and `%expected` use the same sampled seed and
+therefore materialize the same values. A failed sample report carries that seed
+assignment directly; no hidden process RNG state is needed to reproduce it.
+
+## Make the oracle and comparison policy explicit
+
+Expected values can be generated directly, read from a fixture, produced by an
+earlier launch, or returned by a configured
+[`check.oracle.call`](../reference/dialects/check/ops/oracle-call.md) provider.
+The oracle operation names its provider, callee contract, inputs, result types,
+and provider-specific attributes. The runner or embedding supplies the
+provider implementation; unavailable providers are planning failures unless a
+case requirement deliberately excludes that environment.
+
+The expectation operation records what equality means:
+
+| Expectation | Contract |
+| --- | --- |
+| [`check.expect.equal`](../reference/dialects/check/ops/expect-equal.md) | Typed value equality. |
+| [`check.expect.bitwise`](../reference/dialects/check/ops/expect-bitwise.md) | Exact payload-bit identity. |
+| [`check.expect.close`](../reference/dialects/check/ops/expect-close.md) | Floating-point comparison with explicit absolute tolerance, relative tolerance, and NaN policy. |
+| [`check.expect.shape`](../reference/dialects/check/ops/expect-shape.md) | Exact static and dynamic dimensions. |
+| [`check.expect.event`](../reference/dialects/check/ops/expect-event.md) | A provider-specific structured runtime event such as a sanitizer report. |
+
+Tolerance belongs in source because it is part of the operation's numeric
+contract. A benchmark or CI invocation may select a case, but it must not make a
+failing result pass by changing comparison thresholds out of band.
+
+Error and fatal device events fail every executed sample without an authored
+event expectation. Use `check.expect.event` only when successful execution is
+supposed to emit a structured event and the case must validate its payload.
+Such expectations require a positive count; additional or unmatched error
+events and event-capture overflow still fail the sample.
+
+[`check.file.write.npy`](../reference/dialects/check/ops/file-write-npy.md) can
+capture an actual value always or only on failure. This is an evidence output,
+not the oracle: checked source still states how success is decided.
+
+```loom
+check.file.write.npy value(%output) path("nested/actual.npy") mode(always) : tensor<1024xf32>
+```
+
+`loom-test module.loom --file-output-root=artifacts` writes that value to
+`artifacts/nested/actual.npy`, creating missing parent directories. The output
+root is required only when a write is performed, so a passing case with only
+`mode(on_failure)` writes needs no root. The test tool never chooses an implicit
+output location. The benchmark tool applies the same authored-path rules while
+retaining its per-run and artifact-bundle output defaults.
+
+Each performed write publishes buffered bytes before the case completes. A
+write or publication failure fails the case; publication does not promise
+durability across a system crash. Authored output paths are relative, use `/`
+separators, and contain no `..` components. Absolute, drive-qualified, empty,
+`-`, and embedded-NUL paths are rejected. These are lexical rules rather than
+a symbolic-link sandbox.
+
+Relative `check.file.read.npy` paths resolve beside the primary source or
+bytecode module. Stdin input resolves them from the working directory, and
+absolute fixture paths are accepted. Reads are independent of
+`--file-output-root`, so a later invocation names a previously exported file
+through its own module-relative path.
+
+## A scenario compares independent executions
+
+[`check.scenario`](../reference/dialects/check/ops/scenario.md) describes a
+finite differential campaign around one or more ordinary Loom subjects. Each
+[`check.trial`](../reference/dialects/check/ops/trial.md) owns a runtime recipe
+and ends in exactly one action. [`check.compare`](../reference/dialects/check/ops/compare.md)
+executes the named subject through the target and oracle profiles, while
+[`check.invoke`](../reference/dialects/check/ops/invoke.md) executes only the
+target.
+
+`check.compare<@subject>` compiles the same semantic subject through both
+profiles. When the executable target and semantic oracle need different Loom
+subjects, `check.compare<@target, @target_oracle>` names them in execution
+order: the first subject produces `actual` observations and the second produces
+`expected` observations. Both subjects receive independent realizations of the
+same authored arguments and must satisfy their corresponding result signature.
+
+This scenario varies a deterministic word, calls the same resultless function
+in both profiles, and checks the complete mutable state. The linked production
+module supplies the function definition:
+
+```loom
+func.decl @advance(%state: buffer, %word: i64)
+
+check.scenario public @advance_sweep {
+  check.trial[32](%trial: index, %entropy: check.entropy) {
+    %input_entropy = check.entropy.fork %entropy name("input") : check.entropy
+    %word = check.entropy.read %input_entropy[%trial] : check.entropy -> i64
+    %state = check.generate.iota offset(0.0) step(0.25) : tensor<64xf32>
+    check.compare<@advance>(%state, %word) : (tensor<64xf32>, i64) -> () {
+      check.expect.close actual(%state) expected(%state) atol(1.0e-6) rtol(1.0e-5) nan(same) : tensor<64xf32>
+    }
+  }
+  check.return
+}
+```
+
+Built-in `check.generate.*` operations cover compact synthetic data. An
+authored [`check.generate`](../reference/dialects/check/ops/generate.md) call
+can instead run an ordinary function as an ordered step in the trial recipe.
+It returns scalar values directly and may initialize shaped storage passed as
+an argument:
+
+```loom
+func.decl @make_advance_trial(%trial: index, %entropy_word: i64, %state: buffer) -> (i64)
+
+check.scenario public @authored_advance_sweep {
+  check.trial[32](%trial: index, %entropy: check.entropy) {
+    %input_entropy = check.entropy.fork %entropy name("input") : check.entropy
+    %entropy_word = check.entropy.read %input_entropy[%trial] : check.entropy -> i64
+    %state = check.generate.fill value(0.0) : tensor<64xf32>
+    %word = check.generate<@make_advance_trial>(%trial, %entropy_word, %state) : (index, i64, tensor<64xf32>) -> (i64)
+    check.compare<@advance>(%state, %word) : (tensor<64xf32>, i64) -> () {
+      check.expect.close actual(%state) expected(%state) atol(1.0e-6) rtol(1.0e-5) nan(same) : tensor<64xf32>
+    }
+  }
+  check.return
+}
+```
+
+The generator runs after product preparation, so its results cannot specialize
+the subject. A comparison executes it independently for the target and oracle
+value graphs. A scenario benchmark executes it once per target replica before
+the product enters its timing loop.
+
+The trial ordinal and entropy identity are stable parts of the trial. Named
+[`check.entropy.fork`](../reference/dialects/check/ops/entropy-fork.md)
+operations split independent generator streams, and explicit
+[`check.entropy.read`](../reference/dialects/check/ops/entropy-read.md)
+ordinals make every value independent of traversal and batching order. A
+failure report carries the scenario, configuration ordinal, trial declaration,
+trial ordinal, and root entropy needed to reconstruct the same recipe.
+
+Target and oracle products are prepared before any trial-local value exists.
+For a comparison, the trial recipe then materializes twice. Both realizations
+have the same scalar values and alias topology, while every mutable allocation
+is independent. When a subject returns values, the `actual` and `expected`
+result groups spell its return signature beside the values used by the checks.
+Captured values such as `%state` select the corresponding target or oracle
+realization inside an expectation. Returned buffer references compare by
+allocation-relative identity; tensors and views compare their contents
+according to the chosen expectation.
+
+An optional configuration domain sits outside the runtime trials:
+
+```loom
+kernel.decl @configured_kernel(%configuration: index) launch()
+
+check.scenario @configured configure[4](%configuration: index, %configuration_entropy: check.entropy) {
+  check.trial[16](%trial: index, %trial_entropy: check.entropy) {
+    check.invoke<@configured_kernel>[%configuration]() : [index]() -> ()
+  }
+  check.return
+}
+```
+
+Values in square brackets are compile-visible kernel workloads or
+command/pipeline specialization values. Values in parentheses are runtime
+arguments. Each configuration prepares its product before the nested trials
+materialize, so a runtime input cannot silently specialize the target or
+oracle. Functions, kernels, command programs, and pipelines share this verified
+action shape. The selected execution profile determines which subject kinds it
+can prepare. The standard VM profile prepares functions; the standard HAL
+profile prepares kernels and resultless ordinary functions. Their differential
+intersection is therefore a resultless function today, while VM-to-VM and
+other profiles with result transport can compare explicit return values.
+
+`check.invoke` keeps target-only execution first class. Its result types remain
+explicit even though no result SSA values escape the terminal action. A
+scenario benchmark uses this same target-only interpretation after staging its
+inputs: oracle execution, comparison, and output readback stay outside the
+measured path.
+
+## Requirements explain unavailable evidence
+
+[`check.requires`](../reference/dialects/check/ops/requires.md) names a provider
+capability needed to execute the case. An unmet requirement skips the case with
+a structured reason. [`check.skip_if`](../reference/dialects/check/ops/skip_if.md)
+names an exceptional environment predicate that makes execution invalid or
+unrepresentative.
+
+Requirements do not specialize the program and a skip is not a pass. Target
+requirements on function or kernel providers decide whether an implementation
+is valid during compilation. Check requirements decide whether this environment
+can produce the requested runtime evidence. Reports keep skipped, passed,
+failed, and unplannable samples distinct.
+
+Use positive requirements for the normal capability contract. `skip_if` is for
+exceptional conditions such as a fixture exceeding available device memory,
+not as a growing architecture allowlist.
+
+AMDGPU cases can require a target using the same processor and target-ID
+feature syntax as compiled artifacts:
+
+```loom
+check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+```
+
+The predicate accepts every device that satisfies that target, including both
+RDNA3 and RDNA3.5 for `gfx11-generic`. An exact selector such as `gfx1100`
+requires that processor; `gfx942:xnack-` also constrains its feature mode.
+A case that accepts any of several targets can list their selectors in one
+requirement:
+
+```loom
+check.requires<hal.amdgpu.target> {targets = ["gfx12-generic", "gfx1250"]}
+```
+
+Each entry uses the same selector grammar as `target`, and the list has OR
+semantics. The AMDGPU requirement provider validates every selector before
+device access and admits the case when the selected device satisfies any one of
+them. Because the selector strings remain opaque provider data on the generic
+`check.requires` operation, a compiler built without AMDGPU support can still
+load and selectively link the containing library. If such a runner selects the
+case, it skips it with `provider_not_registered`.
+A valid incompatible target reports `target_mismatch` before case compilation.
+An unknown target or malformed attribute fails the check. The
+`hal.amdgpu.descriptor_set` provider remains available when a case specifically
+requires one ISA descriptor set. Both correctness and benchmark runners honor
+these requirements.
+
+## A benchmark names proven work
+
+[`check.benchmark`](../reference/dialects/check/ops/benchmark.md) requires an
+explicit symbol name, references one case, and optionally binds named parameters:
+
+```loom
+check.benchmark<@copy_i32_case> @copy_i32_sweep
+
+check.benchmark<@copy_i32_case> @copy_i32_seed_1002 {seed = 1002}
+```
+
+The symbol is the record's identity through linking, reports, and selection by
+`--benchmark` or `--compare`. It is distinct from the referenced case's name.
+The first record selects the case's complete seed sweep. The second names one
+representative sample. Both reuse its value generation, kernel launch,
+expectation, and correctness contract. Several benchmark names that resolve to
+the same case assignments identify the same physical work item and can be
+deduplicated by the benchmark planner.
+
+The record does not mark a timer region or encode warmup, duration, batching,
+profiling, cache reuse, or target selection. The benchmark tool chooses whether
+to measure the complete case end to end or a prepared dispatch-completion
+schedule, and it records that policy with the result. Correctness runs before
+timing; a failed sample produces failure evidence instead of a score.
+
+This division keeps source workload identity stable. One benchmark record can
+be compared across targets, sanitizer configurations, compiler versions, and
+measurement policies without cloning the program or silently changing its
+inputs.
+
+## Keep every failure in its owning domain
+
+| Symptom | Contract to inspect |
+| --- | --- |
+| A case unexpectedly has thousands of samples | Parameter generators formed a larger Cartesian product than intended. |
+| A benchmark assignment is ignored or rejected | The parameter lacks the matching stable `name` or the value is outside its domain. |
+| A kernel symbol exists in a library but the launch is unresolved | The test module omitted the exact `kernel.decl`. |
+| Expected random values cannot be reproduced | Seed state was hidden outside the check program. |
+| A floating-point result passes one harness and fails another | Tolerance or NaN policy was not owned by the checked source. |
+| A target-specific case appears green elsewhere | An unmet requirement was counted as a pass instead of a structured skip. |
+| A benchmark has a number but correctness failed | The harness timed work without enforcing the case gate. |
+
+[Test correctness](../workflows/test-correctness.md) gives the concise
+`loom-test` commands for case and sample selection, devices, sanitizers,
+and structured reports. [Benchmark checked work](../workflows/benchmark.md)
+covers dry-run planning, end-to-end and dispatch-completion measurement,
+interleaved comparisons, profiling, and artifact bundles.
+
+Continue with [Command programs](command-programs.md): the same kernel launches
+and typed resources can become a reusable model subgraph while checks continue
+to exercise the program through its public schedule.
+
+
+# Command programs
+
+**Example files:** [`loom/docs/examples/guide/command-programs/`](https://github.com/ROCm/hrx-system/tree/main/loom/docs/examples/guide/command-programs)
+
+A kernel specializes one device entry point. A command program specializes a
+reusable subgraph: its kernel launches, immutable parameters, launch counts,
+and explicit dependency structure. The result keeps the same source, linking,
+fact, and target model as an individual kernel instead of introducing a second
+graph language around it.
+
+In this chapter, you will learn:
+
+- how a command-program signature separates specialization inputs from
+  explicit buffer roots and their materialization roles;
+- how named parameter content becomes a typed kernel argument;
+- how program declarations and launches compose independently packaged
+  subgraphs;
+- how `command.serial` and `command.concurrent` state dependency edges; and
+- what command planning preserves, specializes, and emits.
+
+## The signature separates host decisions from storage
+
+[`command.program.def`](../reference/dialects/command/ops/program-def.md) has
+two argument groups:
+
+```loom
+command.program.def @project_layer(%layer: index, %element_count: index) launch(
+    %parameters: buffer, %input: buffer, %output: buffer) {
+  // Reusable command schedule.
+  command.return
+}
+```
+
+The arguments before `launch` specialize the program. The arguments after
+`launch` are buffer roots supplied through the program ABI:
+
+| Argument group | Becomes known | What it can control |
+| --- | --- | --- |
+| Specializations | Facts participate during linking and planning; artifact-affecting scalar uses must resolve before portable lowering | Source control flow, parameter names, provider selection, direct launch counts, and exact scalar kernel arguments. |
+| Buffer roots | Roles are fixed during planning; storage is bound during materialization or issue | Immutable parameter storage or replaceable invocation storage. |
+
+This distinction is stronger than a conventional kernel argument list.
+Specializations are host-side program inputs, not push constants read by every
+kernel. Their known facts participate in planning the complete command
+root. An exact `%layer` can disappear into parameter placement and selected
+branches. A source root may retain `%element_count` while it remains linkable,
+but planning a direct dispatch requires its physical count to become exact.
+An issue-time dynamic count instead has an explicit `view<3xi32>` storage
+producer and lowers to indirect dispatch; it never becomes an implicit host
+callback outside the command artifact.
+
+## Effects are explicit commands
+
+A command program is not a pure function: launching a kernel and ordering work
+are its purpose. Those observable effects must nevertheless be represented by
+explicit command operations such as `kernel.launch`, `command.program.launch`,
+`command.serial`, and `command.concurrent`. Ordinary SSA computation around
+them is pure or deterministic read-only computation. Calls used to derive
+launch workloads carry the corresponding `pure` or `readonly` contract, just
+as calls in a kernel launch-configuration region do.
+
+The distinction keeps planning movable. The compiler can inline and fold
+pure shape arithmetic at its real caller-owned control-flow site. When a count
+must remain dynamic at issue time, an explicit device-side producer can write
+the indirect dispatch tuple without silently moving a memory observation or
+mutation. A `buffer.alloca` remains valid: it declares a fresh command-program
+storage identity for later scheduling rather than reading, writing, or
+synchronizing external state.
+
+The verifier enforces this at the source operation that violates the contract.
+An opaque ordinary call is rejected inside nested control flow instead of
+surviving until command outlining or schedule materialization.
+
+Schedule topology and parameter identity must be closed after planning.
+Launch-count expressions either fold to exact direct counts or terminate in
+explicit indirect-count storage. They cannot leave an unresolved source
+branch, dynamic parameter key, or free scalar result in the materialized
+command program.
+
+The launch-binding group is intentionally buffers only. Planning classifies
+roots used by `command.parameter` as fixed materialization resources and
+ordinary roots as rebindable issue-time resources. Scalar specializations do
+not silently become host callbacks or device push constants. A scalar used by
+varying device arithmetic must live in device-visible storage, while an exact
+scalar kernel argument may specialize away. The type checker rejects
+non-buffer launch bindings so a caller and a command program cannot silently
+disagree about which ABI carries a value.
+
+!!! note "Workloads and specializations are different"
+
+    A `kernel.launch @entry[%count](...)` workload configures that kernel's
+    physical launch without changing its device ABI. A
+    `command.program.launch @program[%variant](...)` specialization contributes
+    facts to the complete reachable subgraph. Exact facts may change which
+    kernels exist or make direct launch counts exact. Counts that intentionally
+    remain issue-time dynamic use explicit indirect storage.
+
+## Launch configuration stays with its caller
+
+Command planning does not open a selected kernel implementation. Linking
+projects only its logical contract and launch-configuration facet, then
+rewrites each workload-level launch at the same caller-owned CFG site:
+
+```loom
+%x, %y, %z = func.call pure @project_block$config(%element_count) : (index) -> (index, index, index)
+kernel.dispatch @project_block[%x, %y, %z](%weights, %input, %output) : [index, index, index](view<8xf32>, buffer, buffer)
+```
+
+Ordinary canonicalization, CSE, inlining, and folding optimize those calls
+before schedule construction. Equal calls with equal SSA inputs can collapse;
+calls in different branches or loop iterations retain the control-flow scope
+that gives their values meaning. There is no aggregate result function or
+command-specific memo table.
+
+A pure configuration call may move to the earliest scope that dominates its
+workloads. A read-only configuration call remains at its lexical launch so a
+storage producer cannot be crossed. Inlining preserves the same distinction:
+ordinary scalar arithmetic can fold freely, while loads retain their explicit
+buffer/view identities and schedule ordering.
+
+Exact scalar results become direct dispatch commands. An exact aligned
+`view<3xi32>` rooted in an immutable parameter becomes a static indirect
+dispatch, allowing the device to fetch counts early. Invocation buffers and
+transient command storage use dynamic indirect dispatch: the device reads the
+tuple immediately before issuing that dispatch. A count-producing kernel must
+precede its consumer in the command schedule. Invocation buffers may instead
+arrive initialized by the caller, so they can drive the first dispatch.
+
+Read-only launch expressions that still depend on device data become generated
+device kernels writing transient XYZ tuples. The command program orders those
+producers before their indirect consumers without a host readback.
+
+Each configured entry contributes one atomic executable-entry requirement.
+The embedding may satisfy it with a Loom-compiled executable, a cached object,
+or an externally supplied HIP or SPIR-V entry; command planning neither loads
+the kernel body nor chooses that compilation policy.
+
+## Turn named parameter content into typed views
+
+The layer example declares the kernel contract it uses, derives a
+typed view from one parameter root, and launches the kernel:
+
+**Source:** [`loom/docs/examples/guide/command-programs/layer.loom`](https://github.com/ROCm/hrx-system/blob/main/loom/docs/examples/guide/command-programs/layer.loom)
+
+```loom title="layer.loom"
+--8<-- "examples/guide/command-programs/layer.loom"
+```
+
+[`command.parameter`](../reference/dialects/command/ops/parameter.md) is a
+declarative association. It performs no string lookup, allocation, transfer,
+or synchronization at execution time. During command planning, each `{}` in
+the pattern receives one canonical decimal index substitution. The complete
+key and exact view footprint become a parameter requirement attached to the
+source buffer root.
+
+The model composition supplies exact layer constants. A `%layer` value of `12`
+therefore produces the key `blk.12.projection.weight`, while the forwarded
+`%element_count` remains a source specialization until a selected root fixes
+its launch. The `view<8xf32>` result states the exact 32-byte parameter block
+available to the kernel. `%element_count` independently selects a prefix from
+one through eight, so the view shape does not create one kernel version per
+active element count. Command lowering can place that content in a fixed
+resource range while `%input` and `%output` remain replaceable issue-time
+bindings.
+
+The substitutions must become exact nonnegative indices before the program is
+planned. The result type must also have an exact byte footprint. These are
+materialization contracts rather than runtime error cases: a program whose
+parameter identity or size remains unknown cannot describe an immutable
+command artifact.
+
+The kernel receives the typed view directly:
+
+**Source:** [`loom/docs/examples/guide/command-programs/kernels.loom`](https://github.com/ROCm/hrx-system/blob/main/loom/docs/examples/guide/command-programs/kernels.loom)
+
+```loom title="kernels.loom"
+--8<-- "examples/guide/command-programs/kernels.loom"
+```
+
+The view is more informative than an opaque pointer plus an offset. Its root,
+byte range, element type, and shape remain available while the kernel is
+specialized and compiled independently. The kernel can therefore use the same
+ordinary view and vector operations as a standalone kernel; it has no
+command-program-specific device implementation.
+
+## Expand model structure from configuration
+
+Model-level configuration can determine command topology without turning
+per-invocation shapes into global variants. This program resolves
+`@model.layer_count`, fully unrolls a source loop during command planning,
+and uses each exact induction value to select one layer's parameter block:
+
+**Source:** [`loom/docs/examples/guide/command-programs/stack.loom`](https://github.com/ROCm/hrx-system/blob/main/loom/docs/examples/guide/command-programs/stack.loom)
+
+```loom title="stack.loom"
+--8<-- "examples/guide/command-programs/stack.loom"
+```
+
+The `unroll` policy is part of the source contract. Command planning
+requires the layer count to resolve, expands the loop into a finite sequence,
+and then sees parameter keys such as `blk.0.projection.weight` and
+`blk.1.projection.weight`. The `%element_count` specialization remains a
+separate value that controls each kernel workload; it is not promoted to
+configuration merely because every layer consumes it. A host may keep the
+program parameterized in a source module, but it fixes that value before
+planning a direct portable command artifact.
+
+## Compose programs through exact contracts
+
+Command programs are symbols. A bodyless
+[`command.program.decl`](../reference/dialects/command/ops/program-decl.md)
+records the exact specialization and binding contract required by one source
+module. [`command.program.launch`](../reference/dialects/command/ops/program-launch.md)
+provides both groups explicitly at each call site.
+
+The model module depends on the layer library and composes it in two
+different ways:
+
+**Source:** [`loom/docs/examples/guide/command-programs/model.loom`](https://github.com/ROCm/hrx-system/blob/main/loom/docs/examples/guide/command-programs/model.loom)
+
+```loom title="model.loom"
+--8<-- "examples/guide/command-programs/model.loom"
+```
+
+The declaration does not keep a definition live and the linker does not guess
+which undeclared symbol a call intended. Linking the `model` module against
+the `layer` library resolves the exact declaration; omitting that dependency
+leaves an unresolved program symbol.
+
+Its Bazel target supplies the complete layer module. The exact declaration is
+resolved from the unique exported program definition in that explicit library
+universe.
+The [linking workflow](../workflows/link-and-package.md#link-transitive-dependencies-incrementally)
+shows the same model-to-layer-to-kernel shape across a standalone partial
+artifact.
+
+During command planning, reachable program launches are clone-inlined in
+callee-before-caller order. Each selected root becomes a closed command body,
+while independently selected roots and shared definitions remain ordinary
+symbols in the linked source. Recursive command composition is rejected
+because it cannot produce a finite materialized schedule.
+
+This is the same composition model used by motifs and kernels:
+
+```text
+kernel library      layer program       model program
+@project_block  <-  @project_layer  <-  @two_layer
+                         ^           <-  @two_branch
+                         |
+                   typed parameter view
+```
+
+Packaging boundaries stay source boundaries. They do not become routing
+layers in the application and they do not prevent specialization from seeing
+through the final linked closure.
+
+## State dependencies with structured schedules
+
+[`command.serial`](../reference/dialects/command/ops/serial.md) orders each
+child after the preceding child completes. In `@two_layer`, the first layer
+writes `%hidden` before the second layer consumes it.
+
+[`command.concurrent`](../reference/dialects/command/ops/concurrent.md) adds no
+dependency edge between sibling commands and joins all siblings on exit. In
+`@two_branch`, both projections may execute independently, but the command
+program cannot return until both have completed.
+
+These regions nest, so larger schedules can express serial chains, fork/join
+sections, and pipelines without flattening them into host callbacks. The two
+public roots in `model.loom` are the individual serial and concurrent building
+blocks; nesting those same regions preserves each region's entry and exit
+contract.
+
+The schedule structure owns ordering. Buffer identity or aliasing does not
+silently create dependency edges between concurrent siblings. If two commands
+have a read/write hazard, the source must place them in a serial relationship.
+This makes the schedule inspectable and keeps dependency analysis out of
+opaque device ABIs.
+
+## Specialize the subgraph as one program
+
+Planning one or more public command roots performs a bounded sequence of
+compiler operations:
+
+1. Link the dependency closure of the requested roots.
+2. Flatten reachable command-program composition.
+3. Project each referenced kernel's logical contract and deterministic launch
+   configuration without opening its implementation.
+4. Rewrite launches in caller IR, then specialize, inline, canonicalize, CSE,
+   and unroll the resulting ordinary dataflow.
+5. Resolve named parameters, physical dispatch counts, storage, and explicit
+   schedule waves.
+6. Optionally classify all reachable launch sites and stream one independent
+   source request per live semantic kernel class.
+7. Assign dense slots for distinct executable-entry requirements and lower
+   each closed root to portable command Low.
+
+The dependency kernels retain their ordinary target compilation paths. A
+command root can therefore lower to the portable `cmd.core` target while one
+kernel dependency lowers to AMDGPU ISA and another target configuration lowers
+the same source to SPIR-V. Command composition changes the unit of
+specialization; it does not create a command-only kernel language.
+
+Equivalent launch sites can share pure configuration computation through
+ordinary CSE when their SSA inputs match. Repeated entry uses also share one
+plan-wide executable-entry requirement while retaining root-local dense slots.
+Kernel specialization and cache policy remain an independent host workflow
+rather than a nested product of command compilation.
+
+Command planning has two independent ownership channels:
+
+| Owner | Responsibility |
+| --- | --- |
+| Command program plan | Portable roots, atomic entry requirements, parameter placements, rebindable bindings, transients, and explicit indirect-count storage. |
+| Optional request recipient | Immutable ordinary Loom bytecode requests specialized only by distinctions that change generated kernels. |
+
+The plan never retains a request, source provider, kernel body, or
+classification state. A request transfers to its recipient as it is published
+and can outlive the producer workspace; the parent operation's terminal result
+determines whether its provisional bindings are committed or cancelled.
+
+## Build one complete deployment transaction
+
+The public LoomC API plans and serializes selected command roots while
+publishing each live source-backed kernel request. Every request carries its
+exact parent requirement binding, so an embedding can enqueue compilation and
+bind the completed executable without rediscovering correspondence from names
+or files. Bodyless entries publish only binding requirements for executables
+the embedding already owns.
+
+Command construction and kernel request publication are one transaction.
+`loom-compile` deliberately does not expose a command output mode: separate
+invocations could emit bytes for both sides, but could not preserve the exact
+planner-owned correspondence between them. [Parallelize kernel JIT
+compilation](../integration/product-frontier.md) walks the LoomC lifecycle end
+to end.
+
+## Keep failures in their owning contract
+
+| Symptom | Contract to inspect |
+| --- | --- |
+| Source control flow remains in the planned schedule | Its condition did not specialize to an exact value; portable command topology must be closed. |
+| A direct dispatch count remains dynamic | Specialize it to an exact unsigned 32-bit value or produce an aligned `view<3xi32>` for indirect dispatch. |
+| A launch binding is rejected | The command ABI accepts buffer roots only. |
+| A parameter key cannot be resolved during planning | A `{}` substitution did not become an exact nonnegative index. |
+| A parameter view has unknown storage size | Its type does not provide an exact byte footprint. |
+| A child program remains unresolved | Its module omitted the exact declaration or library dependency. |
+| Two supposedly parallel commands race | The source placed a hazard inside `command.concurrent`. |
+| Composition planning reports a cycle | Reachable command programs recursively launch one another. |
+
+[Source modules and canonical text](source-modules.md) explains declaration
+and library ownership. [Facts and specialization](facts-and-specialization.md)
+shows how configuration, assumptions, and target facts constrain the values
+used here. [Parallelize kernel JIT
+compilation](../integration/product-frontier.md) follows local, linked,
+classified, and external kernels through one checked LoomC transaction.
+
+
+# Facts and specialization
+
+**Example files:** [`loom/docs/examples/elementwise-transform/`](https://github.com/ROCm/hrx-system/tree/main/loom/docs/examples/elementwise-transform) and [`loom/docs/examples/guide/command-programs/`](https://github.com/ROCm/hrx-system/tree/main/loom/docs/examples/guide/command-programs)
+
+Loom specializes from facts already present in the program. Constants, dynamic
+shape bindings, configuration contracts, control-flow conditions, storage
+assumptions, and target profiles all contribute knowledge to the same program
+instead of disappearing into separate graph, kernel, and backend layers.
+
+In this chapter, you will learn:
+
+- where facts originate and how they follow SSA values;
+- when to use configuration, workload arguments, assumptions, or executable
+  assertions;
+- how value predicates and target requirements select template providers;
+- why unknown facts are different from false requirements; and
+- how specialization removes alternatives without creating runtime dispatch.
+
+## Facts are inputs to compilation
+
+A fact is a compiler-visible statement about a value, storage root, execution
+scope, or target version. Common fact categories include:
+
+| Category | Examples |
+| --- | --- |
+| Scalar value | Exact constant, signed range, nonzero, power of two, known divisor, finite floating point. |
+| Shape and representation | Dynamic dimension binding, element type, vector footprint, encoding, address layout. |
+| Storage | Root identity, byte extent, alignment, memory space, alias scope. |
+| Execution | Lane-varying or uniform value, workitem and workgroup topology domains. |
+| Target | Subgroup size, resource limits, supported operations, ABI and artifact capabilities. |
+
+Operations publish facts for their results and transfer facts from operands.
+An exact constant stays exact through arithmetic that can be folded. Ranges and
+divisibility propagate through index calculations. A view preserves its buffer
+root and layout facts. Kernel coordinate queries carry their topology and
+uniformity domains.
+
+This analysis is always on. Authors add facts at boundaries where the compiler
+cannot derive them; they do not manually annotate every intermediate result.
+
+## Declare compile-time configuration
+
+[`config.decl`](../reference/dialects/config/ops/decl.md) names a value that a
+composition root must eventually supply. Its `where` clause constrains the
+value even before an exact definition is available:
+
+```loom
+config.decl @model.layer_count : %value: index where [range(%value, 1, 256)]
+config.decl @model.prefill_batch_size : %value: index where [range(%value, 64, 512), multiple_of(%value, 64), power_of_two(%value)]
+config.decl @model.weight_encoding : encoding<schema>
+```
+
+`range(%value, lo, hi)` is inclusive. `multiple_of(%value, 64)` records
+divisibility without performing multiplication. `power_of_two` records a
+power-of-two contract. Relational predicates such as `lt`, `le`, `eq`, and
+`ne` may relate a value to a literal or another SSA value.
+
+[`config.get`](../reference/dialects/config/ops/get.md) makes the dependency an
+ordinary symbol edge and exposes its typed facts in executable IR:
+
+```loom
+%layer_count = config.get @model.layer_count : index
+%prefill_batch_size = config.get @model.prefill_batch_size : index
+%weight_encoding = config.get @model.weight_encoding : encoding<schema>
+```
+
+A source [`config.def`](../reference/dialects/config/ops/def.md), a `--config`
+binding, a JSON/JSONC configuration object, or an embedding's `loomc` options
+can provide the exact value. Materialization replaces the declaration with a
+definition, validates its predicates, and lets ordinary canonicalization fold
+dependent code. Encoding-valued configuration can select a complete physical
+schema such as `#ggml.q4_0` without reducing that choice to an integer enum.
+
+Partial links may preserve reachable declarations. A final executable
+compilation requires every reachable `config.get` to resolve to exactly one
+definition. Bindings for keys that a selected root does not use are ignored,
+so one model configuration bag can serve several smaller compiled programs.
+
+The [linking workflow](../workflows/link-and-package.md) shows schema
+inspection, individual bindings, and resolved-config enforcement.
+
+## Keep per-launch values out of global configuration
+
+Configuration describes a compiled artifact version. A kernel workload
+describes one launch. The distinction matters when the same kernel appears
+several times in one command program or accepts many shapes without
+recompilation.
+
+| Value changes when... | Source boundary |
+| --- | --- |
+| Building or selecting an artifact version | `config.decl` / `config.get`. |
+| Evaluating one kernel launch | Kernel workload argument. |
+| Issuing one device dispatch | Kernel launch argument. |
+| Specializing one reusable command program | Command specialization argument. |
+| Binding weights, cache, input, or output storage | Command buffer binding. |
+
+A maximum supported row count can be configuration while the actual row count
+remains a workload and device argument. This preserves one reusable artifact
+and still gives the compiler a finite capacity for launch planning and bounds:
+
+```loom
+%row_capacity = config.get @model.row_capacity : index
+%bounded_rows = index.assume %row_count [range(%row_count, 1, 65535), le(%row_count, %row_capacity)] : index
+```
+
+Moving every dynamic value into configuration creates global variants and
+prevents one program from launching the same kernel with different workloads.
+Keep a value dynamic unless changing it genuinely defines a new artifact or
+specialization boundary.
+
+## Refine the value that carries a proven contract
+
+[`index.assume`](../reference/dialects/index/ops/assume.md) returns identity
+aliases with stronger predicates. Use it when a fact comes from a caller or
+storage producer and is not visible in the current control flow:
+
+```loom
+%expert_id_i32 = view.load %routing[%token] : view<[%token_count]xi32> -> i32
+%expert_id = index.cast %expert_id_i32 : i32 to index
+%bounded_expert_id = index.assume %expert_id [range(%expert_id, 0, 127)] : index
+```
+
+The result equals the operand, but only `%bounded_expert_id` carries the new fact
+edge. Memory accesses, casts, loop transforms, and provider selection that need
+the proof consume the refined value.
+
+Range endpoints may be SSA values when one dynamic quantity is bounded by
+another. Each endpoint contributes the interval facts already known for that
+value, so the count below is non-negative and no greater than the maximum
+possible row count without repeating that maximum:
+
+```loom
+%rows = index.assume %rows0 [range(%rows0, 1, 709)] : index
+%count = index.assume %count0 [range(%count0, 0, %rows)] : index
+```
+
+This form keeps the relationship to `%rows` as well as the finite interval. It
+is useful for routed expert counts, page-table lengths, ragged tile extents, and
+other loaded metadata whose capacity is already represented by an SSA value.
+
+[`scalar.assume`](../reference/dialects/scalar/ops/assume.md) provides the same
+contract for fixed-width integer and floating-point payloads:
+
+```loom
+%finite_scale = scalar.assume %scale [finite(%scale)] : f32
+%aligned_length = scalar.assume %length [multiple_of(%length, 16)] : i64
+```
+
+An assumption is not an executable check. It records a fact established by the
+surrounding program, caller contract, or dominating condition. If runtime input
+is untrusted, [`sanitizer.assert.value`](../reference/dialects/sanitizer/ops/assert-value.md)
+checks the predicates, aborts the execution path on failure, and returns
+refined aliases on success:
+
+```loom
+%checked_length = sanitizer.assert.value %length [range(%length, 0, 4096), multiple_of(%length, 16)] : index
+```
+
+The distinction is semantic: `assume` makes a promise to the compiler;
+`sanitizer.assert.value` enforces a promise at runtime.
+
+## Control flow contributes path facts
+
+A dominating structured condition can establish facts without repeating an
+assumption. Template selection and later analysis evaluate an application site
+in its control-flow context:
+
+```loom
+%tile_size_sixteen = index.constant 16 : index
+%is_tile_size_sixteen = index.cmp eq, %tile_size, %tile_size_sixteen : index
+%result = scf.if %is_tile_size_sixteen -> (i32) {
+  %specialized = template.apply<@guide.scale>(%tile_size, %value) : (index, i32) -> (i32)
+  scf.yield %specialized : i32
+} else {
+  %fallback = template.apply<@guide.scale>(%tile_size, %value) : (index, i32) -> (i32)
+  scf.yield %fallback : i32
+}
+```
+
+Inside the first region, `%tile_size == 16`; inside the second, it does not.
+The condition controls runtime execution and simultaneously gives each
+compile-time application site a stronger context. This lets a structured
+program preserve the reason a specialization is valid instead of cloning a
+function under an opaque generated name.
+
+The same path facts feed bounds proofs and explicit loop schedules. For
+example, a true `%remaining >= %tile_size` edge makes
+`index.min %remaining, %tile_size` exact inside that region, so an enclosed
+fixed-tile pipeline or full unroll needs no duplicate `index.assume`. The false
+region retains the complementary relation but still has a dynamic tail length.
+
+## A template family selects an implementation
+
+[`template.decl`](../reference/dialects/template/ops/decl.md) defines the
+stable family signature. [`template.apply`](../reference/dialects/template/ops/apply.md)
+requests an implementation of that family, and
+[`template.def`](../reference/dialects/template/ops/def.md) provides one
+candidate whose signature and predicates may satisfy that demand:
+
+```loom
+template.decl @guide.scale(%tile_size: index, %value: i32) -> (i32)
+
+template.def<@guide.scale> priority(20) @tile16_scale(%tile_size: index, %value: i32) -> (i32) where [eq(%tile_size, 16)] {
+  %result = scalar.addi %value, %value : i32
+  template.return %result : i32
+}
+
+template.def<@guide.scale> priority(1) @portable_scale(%tile_size: index, %value: i32) -> (i32) {
+  template.return %value : i32
+}
+```
+
+An explicitly supplied library makes providers visible. For every reachable
+apply, specialization evaluates candidates in this order:
+
+1. Family symbol and exact operand/result types must match.
+2. Calling context and any explicit target identity must be compatible.
+3. Value predicates in `where` must be proven at the application site.
+4. Typed target requirements in `requires` must be proven by the active
+   function-version target facts.
+5. The highest-priority proven provider wins.
+
+Selection rewrites the semantic demand to an inline exact call. Normal
+inlining and dead-code elimination then remove the selected boundary and every
+unreachable alternative. No per-invocation provider switch remains in the
+device program.
+
+Distinct providers tied at the best priority are ambiguous. File order,
+library order, and symbol spelling never become accidental tie breakers.
+
+## Requirements filter; they do not manufacture facts
+
+A target requirement states when a provider is valid:
+
+```loom
+template.def<@guide.elementwise_transform> requires [#target.subgroup.size<32>] priority(20) @wave32_elementwise_transform(%value: f32) -> (f32) {
+  %result = func.call @double(%value) : (f32) -> (f32)
+  template.return %result : f32
+}
+```
+
+`requires [#target.subgroup.size<32>]` does not force wave32, select AMDGPU, or
+teach the caller that subgroup size is 32. It filters this provider against the
+facts of the function version containing the `template.apply`.
+
+Use an exact `target(@symbol)` provider only when target identity itself is an
+applicability requirement. Most reusable providers stay targetless and name the
+narrow normalized capability they need. The same requirement can then match
+AMDGPU, SPIR-V, or another target family that establishes it.
+
+The composition example's motif contains both the wave32 provider and its
+portable fallback:
+
+**Source:** [`loom/docs/examples/elementwise-transform/motif.loom`](https://github.com/ROCm/hrx-system/blob/main/loom/docs/examples/elementwise-transform/motif.loom)
+
+```loom title="motif.loom"
+--8<-- "examples/elementwise-transform/motif.loom"
+```
+
+## Unknown is not false
+
+Target profiles may be exact, generic, partial, saved, synthetic, or projected
+from a live device. A requirement can therefore be proven true, proven false,
+or remain unknown.
+
+| Candidate state | Early specialization | Final selection |
+| --- | --- | --- |
+| Requirement proven true | Candidate can be selected. | Candidate competes by priority. |
+| Requirement proven false | Candidate is rejected. | Candidate is absent from the choice set. |
+| Requirement unknown | A potentially better candidate remains live. | The best proven fallback may be selected; otherwise compilation diagnoses missing facts. |
+
+This prevents an early generic link from prematurely erasing a provider that a
+later device profile could prove valid. It also prevents final executable
+lowering from carrying an unresolved semantic demand into target code.
+
+Target facts attach to function versions rather than becoming one mutable
+module-global mode. A compile invocation can specialize different entries for
+different profiles while sharing the same linked libraries and targetless
+helpers. The public [`loomc` target API](../reference/c-api/generated/target_8h.html)
+defines target environments, immutable profiles, and per-function
+specialization rows.
+
+## Diagnose the missing fact, not the selected assembly
+
+Provider selection emits structured report rows for selected, fallback,
+rejected, ambiguous, and missing-fact outcomes. A blocked selection names the
+contract, candidate, and unresolved value or target requirement. That is a
+better repair boundary than inspecting final assembly and guessing why a
+specialized implementation disappeared.
+
+Typical mistakes expose the missing ownership decision:
+
+| Symptom | Actual problem | Repair |
+| --- | --- | --- |
+| A specialized provider never matches | Its `where` predicate is not proven at the apply site. | Carry the relevant value or refined alias to the apply. |
+| A target provider remains unknown | The active function version lacks the required target fact. | Supply a more exact profile or a portable fallback. |
+| Two providers are ambiguous | They have equal priority and distinct implementations. | State the intended priority or make their predicates disjoint. |
+| A fallback disappears during partial linking | The provider library was not an explicit input. | Declare and supply the library dependency. |
+| The program recompiles for every shape | Per-launch workload was modeled as artifact configuration. | Move the value back to workload and launch signatures. |
+| An assumption fixes a runtime failure | The source asserted an unverified promise. | Establish the fact with control flow or an executable assertion. |
+
+[Read compile reports](../workflows/compile-reports.md) explains how to capture
+details, inspect row-level JSON paths, and compare selection and emitted-code
+evidence across configurations or targets.
+
+Continue with [Checks and benchmarks](checks-and-benchmarks.md): executable
+cases provide runtime values, configuration bindings, expected results, and
+named performance rows without creating a second representation of the
+program.
+
+
+# Functions and structured control flow
+
+**Example files:** [`loom/docs/examples/elementwise-transform/`](https://github.com/ROCm/hrx-system/tree/main/loom/docs/examples/elementwise-transform)
+
+Functions are typed callables that can execute on the host or device. Structured
+control flow keeps conditions, iteration domains, and carried values visible to
+verification, specialization, unrolling, distribution, and lowering.
+
+In this chapter, you will learn:
+
+- how definitions, declarations, exact calls, and returns compose;
+- how function modifiers state visibility, effects, placement, and inline policy;
+- how authored Low helpers control target instructions and their order;
+- how `scf.if` and `scf.for` produce SSA values;
+- why loop-carried state is explicit; and
+- when to request an implementation from a template family instead of naming
+  one function.
+
+## Define a typed callable
+
+A [`func.def`](../reference/dialects/func/ops/def.md) owns a symbol, signature,
+and body. Every exit uses [`func.return`](../reference/dialects/func/ops/return.md)
+with the declared result types:
+
+```loom
+func.def pure @affine(%value: f32, %scale: f32, %bias: f32) -> (f32) {
+  %scaled = scalar.mulf %value, %scale : f32
+  %result = scalar.addf %scaled, %bias : f32
+  func.return %result : f32
+}
+```
+
+Function bodies do not capture module-local SSA values. Arguments, globals,
+configuration, and target queries make every input source explicit. That
+isolation lets a linker move a function with its dependency closure and lets a
+specializer reason about one callable without hidden lexical state.
+
+Function arguments keep their initial values throughout an invocation. A
+dependent result such as `vector<[%width]xf32>` names the width supplied by the
+caller, and argument predicates describe those same inputs. Structured loops
+bind separate carried values. When authoring CFG directly, a separate loop
+header owns the changing block arguments; branches cannot target the function
+entry block. This contract also applies to template, kernel, and Low bodies.
+
+Functions may return several values. Results remain ordinary SSA values at the
+call site:
+
+```loom
+%minimum, %maximum = func.call @bounds(%values) : (vector<8xf32>) -> (f32, f32)
+```
+
+## Name exact dependencies
+
+[`func.call`](../reference/dialects/func/ops/call.md) asks for one exact symbol.
+The current module contains either its definition or a compatible
+[`func.decl`](../reference/dialects/func/ops/decl.md):
+
+```loom
+func.decl pure @affine(%value: f32, %scale: f32, %bias: f32) -> (f32)
+
+func.def @apply_affine(%value: f32, %scale: f32, %bias: f32) -> (f32) {
+  %result = func.call @affine(%value, %scale, %bias) : (f32, f32, f32) -> (f32)
+  func.return %result : f32
+}
+```
+
+The declaration records what this module requires. A linker can satisfy it from
+an explicitly supplied source or bytecode library. A missing declaration is a
+source verification error; a library search is never allowed to invent the
+dependency after seeing an unresolved call.
+
+The linker or embedding constructs the explicit library universe. A library
+definition must be exported to satisfy another module's declaration, and two
+eligible definitions with the same symbol are an error rather than an
+input-order choice.
+
+Exact calls are appropriate when identity is part of the algorithm: one bit
+decoder, one reference function, or one helper whose precise implementation the
+caller selected.
+
+## Function modifiers state contracts
+
+Modifiers sit on the definition or declaration whose behavior they constrain:
+
+| Modifier | Contract |
+| --- | --- |
+| `public` | The symbol is visible outside the module. Absence means private. |
+| `pure` | The function is deterministic and has no memory effects. |
+| `readonly` | The function may read memory deterministically but cannot write, order memory, allocate unique identities, converge, or produce independently observable effects. |
+| `host` / `device` | The calling convention and intended execution domain. |
+| `inline` | The current IR stage must remove the callable boundary. |
+| `noinline` | The current IR stage preserves the callable boundary. |
+| `hot` / `cold` | Execution-temperature evidence for downstream policy. |
+
+These are semantic inputs, not compiler folklore in comments. `inline` is not
+needed merely because a helper is small; it is used when the source contract
+requires the boundary to disappear at the current stage. Without an explicit
+policy, the consuming pass decides from target, call graph, and cost evidence.
+
+Effect modifiers are checked on definitions and carried by call sites. A
+`pure` call can target only a pure callable. A `readonly` call may target a
+pure or read-only callable, and retains its read effect so memory-aware passes
+cannot move it across an interfering write. An omitted effect modifier is
+conservative until canonicalization or another whole-module analysis proves a
+stronger contract.
+
+## Invoke an authored Low fragment
+
+[`low.invoke`](../reference/dialects/low/ops/invoke.md) lets a source function
+delegate part of its device implementation to an authored `low.func.def`.
+A helper can express a target instruction sequence while indexing, launch
+geometry, and the surrounding algorithm remain in source IR. On AMDGPU and
+x86, the compiler inlines these helpers before emission, and their instructions
+normally participate in scheduling and register allocation with the caller.
+The call's inline policy follows the same rules as other callable boundaries;
+`noinline` is rejected on targets that require Low calls to inline.
+
+The call site retains source types while the helper signature uses target-Low
+register types. Physical register classes are carrier-only: source semantic
+types are represented by the helper's predicates and facts rather than a
+second type inside the physical register carrier.
+
+```loom
+amdgpu.target<gfx11-generic> @schedule_target
+
+low.func.def target<amdgpu.gfx11.generic.core>(@schedule_target) @pack_pair(%even: reg<amdgpu.vgpr>, %odd: reg<amdgpu.vgpr>) -> (reg<amdgpu.vgpr>) asm {
+  %selector = s_mov_b32 0x05040100
+  %packed = v_perm_b32 %odd, %even, %selector
+  return %packed
+}
+
+// %even and %odd are produced by ordinary source-level vector loads.
+%packed = low.invoke @pack_pair(%even, %odd) : (vector<2xf16>, vector<2xf16>) -> (vector<2xf16>)
+```
+
+Lowering proves that each source operand and result maps exactly to the
+helper's register signature. Inlined helpers use virtual register allocation
+and receive inputs through arguments rather than `low.resource` or
+`low.live_in`. They may contain multiple control-flow blocks and nested Low
+calls. Each nested call must satisfy its own signature, target, and inline
+contracts; every returning path supplies the helper's declared results.
+
+Target compatibility is directional. A concrete `gfx1151` caller can invoke a
+helper authored for `gfx11-generic` because the concrete target satisfies the
+generic requirement. Lowering then projects the helper's register classes and
+instruction descriptors by stable identity into the caller's
+`amdgpu.rdna3_5.core` representation. A generic caller cannot invoke an
+exact-only `gfx1151` helper. A helper may omit its target witness when only the
+representation contract matters; the caller then supplies the target facts and
+must still use a target contract supported by that representation.
+
+Value-fact analysis remains local across this boundary. Source function
+argument predicates are remapped onto the generated Low function, while facts
+expressed by emitted Low producers are recomputed with the cloned operations.
+The helper's authored argument predicates are preconditions: lowering resolves
+each predicate against the call-site operands and proves it from caller-visible
+facts. An unknown or contradicted precondition rejects the invocation. Only
+after every precondition is proven does lowering remap the predicates to the
+call-site values as `low.assume` identities. The assumption therefore reifies
+an established fact for downstream local analysis; it never
+creates a fact needed to justify the call. This is the explicit source-to-Low
+fact bridge for scalar dimensions, indices, and similar register arguments. A
+helper states every fact its implementation requires in its `where` clause;
+`low.invoke` does not serialize the caller's analysis table or turn
+opportunistically inferred facts into hidden callee assumptions.
+
+### Control instruction order
+
+Authored Low uses a free schedule by default: SSA dependencies, memory effects,
+and target hazards constrain instruction placement, while independent work can
+move. This lets the compiler interleave a helper's instructions with its caller.
+Explicit scheduling controls let an author further constrain that placement.
+
+[`low.schedule.fence`](../reference/dialects/low/ops/schedule-fence.md) separates
+reorderable ranges. Instructions before the fence stay before instructions
+after it; instructions within either range remain free to move. For example,
+this helper places two loads ahead of the arithmetic that consumes one:
+
+```loom
+amdgpu.target<gfx11-generic> @schedule_target
+
+low.func.def target<amdgpu.gfx11.generic.core>(@schedule_target) @load_ahead_of_scale(%byte_offset: reg<amdgpu.vgpr>, %base: reg<amdgpu.sgpr x2>, %weight: reg<amdgpu.vgpr>) -> (reg<amdgpu.vgpr>, reg<amdgpu.vgpr>) asm {
+  %current = global_load_b32_saddr %byte_offset, %base
+  %future = global_load_b32_saddr %byte_offset, %base {offset = 4}
+  low.schedule.fence
+  %scaled = v_mul_f32 %current, %weight
+  return %scaled, %future
+}
+```
+
+The fence emits no instruction and performs no memory wait. The multiply still
+needs `%current`, so the compiler inserts any required operand-readiness wait;
+the fence itself does not require `%future` to complete.
+[`scf.schedule.fence`](../reference/dialects/scf/ops/schedule-fence.md) supplies
+the corresponding boundary in source IR and composes with
+[scheduled unrolling](#preserve-source-order-through-unrolling).
+
+`schedule(locked)` on a Low function or kernel preserves authored order within
+each block under every scheduling strategy. Here the second load stays after
+the multiply even though its address is already available:
+
+```loom
+amdgpu.target<gfx11-generic> @schedule_target
+
+low.func.def schedule(locked) target<amdgpu.gfx11.generic.core>(@schedule_target) @scale_then_load(%byte_offset: reg<amdgpu.vgpr>, %base: reg<amdgpu.sgpr x2>, %weight: reg<amdgpu.vgpr>) -> (reg<amdgpu.vgpr>, reg<amdgpu.vgpr>) asm {
+  %current = global_load_b32_saddr %byte_offset, %base
+  %scaled = v_mul_f32 %current, %weight
+  %future = global_load_b32_saddr %byte_offset, %base {offset = 4}
+  return %scaled, %future
+}
+```
+
+This contract also survives inlining through `low.invoke`. Inlining preserves
+each block's order and keeps surrounding instructions outside the locked
+sequence. Locked helpers can have control-flow blocks; operations with nested
+regions inside a locked helper are rejected. Register allocation remains
+virtual unless separately constrained, and required copies and hazard waits
+still apply. Separately locked AMDGPU instructions keep separate issue slots
+instead of being combined into a dual-issue instruction.
+
+These controls govern compiler instruction order. They do not synchronize
+lanes, publish shared-memory writes, or establish completion before storage
+reuse. Native AMDGPU and x86 emission preserve the requested order; hardware
+may still execute independent work concurrently or out of order. Intermediate
+artifacts such as SPIR-V pass through another compiler, so their textual order
+does not establish final native instruction order.
+
+The [checked WMMA example](https://github.com/ROCm/hrx-system/blob/main/loom/src/loom/tooling/target/amdgpu/test/corpus/gfx11/low_schedule.loom)
+compares free, fenced, locked, and explicitly overlapped two-tile schedules.
+After downloading `low_schedule.loom`, run its four correctness cases on an
+AMDGPU device supporting the example's GFX11 WMMA instructions:
+
+```shell
+loom-test low_schedule.loom --device=amdgpu
+```
+
+Numerical checks establish that every schedule consumes the intended tiles.
+[Native-code and compile-report inspection](../workflows/tune-loop-schedules.md#check-that-read-ahead-survives-native-code-generation)
+then establishes which loads remain pending, where waits occur, and how the
+chosen order changes register pressure.
+
+### Use flat pointers in authored AMDGPU helpers
+
+An AMDGPU flat pointer can address global or workgroup memory at runtime,
+including different spaces in different lanes of the same wave. The compiler
+tracks both completion domains for flat loads, stores, and atomics. Required
+waits protect consumers, register reuse, and workgroup publication in authored
+Low helpers, including `schedule(locked)` helpers inlined with `low.invoke`.
+
+To form a flat pointer from an LDS byte offset, read the shared aperture with
+`s_mov_b64_shared_base` and use its upper word. The 32-bit hardware read returns
+zero and cannot supply this address. For example, inside a GFX11 Low helper:
+
+```loom
+%aperture = s_mov_b64_shared_base
+%shared_base = slice %aperture[1] : reg<amdgpu.sgpr x2> -> reg<amdgpu.sgpr>
+%upper = v_mov_b32_copy %shared_base
+%address = concat(%local_byte_offset, %upper) : (reg<amdgpu.vgpr>, reg<amdgpu.vgpr>) -> reg<amdgpu.vgpr x2>
+%value = flat_load_dword %address
+```
+
+Here `%local_byte_offset` includes the workgroup allocation's base and the
+lane's offset. The [checked flat-pointer example](https://github.com/ROCm/hrx-system/blob/main/loom/src/loom/tooling/target/amdgpu/test/corpus/gfx11/flat_aperture.loom)
+passes a `buffer.alloca<workgroup>` allocation into a Low helper, exercises
+returning and non-returning atomics, and selects global or LDS addresses per
+lane. Download it and run `loom-test flat_aperture.loom --device=amdgpu`
+on a GFX11 device.
+
+Flat completion differs across families. GFX9 can report early completion in
+the unused address domain, so consuming a pending flat result requires full
+drains. GFX11 and GFX12 can retain younger requests with partial waits in both
+domains. [Inspect the native waits](../workflows/tune-loop-schedules.md#check-that-read-ahead-survives-native-code-generation)
+when evaluating how much of an authored schedule remains asynchronous.
+
+### Compose independently scheduled helpers
+
+A motif author can give a Low helper `schedule(phased)` and use
+[`low.schedule.phase`](../reference/dialects/low/ops/schedule-phase.md) to begin
+each subsequent phase. The first phase starts at function entry. Every
+invocation owns its phase order, while instructions within a phase and work
+from independent invocations remain free to interleave. This helper keeps its
+multiply ahead of its second load:
+
+```loom
+amdgpu.target<gfx11-generic> @schedule_target
+
+low.func.def schedule(phased) target<amdgpu.gfx11.generic.core>(@schedule_target) @scale_pair(%byte_offset: reg<amdgpu.vgpr>, %base: reg<amdgpu.sgpr x2>, %weight: reg<amdgpu.vgpr>) -> (reg<amdgpu.vgpr>) asm {
+  %first = global_load_b32_saddr %byte_offset, %base
+  low.schedule.phase
+  %scaled = v_mul_f32 %first, %weight
+  low.schedule.phase
+  %second = global_load_b32_saddr %byte_offset, %base {offset = 4}
+  %result = v_add_f32 %scaled, %second
+  return %result
+}
+```
+
+Values keep their ordinary SSA scope: `%first` and `%scaled` remain available
+after their phase boundaries without block arguments or region results. The
+function owns the schedule boundary and closes it on every return.
+
+The caller uses ordinary `low.invoke @scale_pair(...)` calls. Two calls create
+two independent scopes: each preserves `first load → multiply → second load`,
+while the compiler can issue another instance's load during the first
+instance's computation. Inlining and full or partial unrolling preserve this
+independence. The motif author chooses the separators; `scf.for pipeline(...)`
+does not assign native phases automatically.
+
+Expanded Low represents each inlined invocation with
+[`low.schedule.begin`](../reference/dialects/low/ops/schedule-begin.md) and
+[`low.schedule.end`](../reference/dialects/low/ops/schedule-end.md). These controls
+also support explicitly authored subscopes. A nested scope belongs to its
+parent's current phase, and empty phases are valid. Every reachable join and
+loop backedge must agree on explicit nesting, and every exit must close it.
+An explicit end cannot close the implicit function scope.
+
+`schedule(phased)` also applies to directly authored Low kernels. Phase
+separators appear in Low function or kernel body blocks; the enclosing scope
+may span CFG edges introduced by inlining. Source loops and conditionals can
+invoke phased Low helpers. Controls written directly inside nested Low
+structured regions are rejected.
+
+Scopes order surviving emitted instructions and emit no runtime instruction.
+They do not wait for loads, synchronize lanes, or publish memory. Full fences
+still order the whole instruction stream, and `schedule(locked)` still fixes
+block order. Native AMDGPU and x86 support scopes; SPIR-V, Wasm, and VM
+representations reject the native-order contract explicitly.
+
+The [checked paired-matrix example](https://github.com/ROCm/hrx-system/blob/main/loom/src/loom/tooling/target/amdgpu/test/corpus/gfx11/schedule_scopes.loom)
+invokes a two-tile WMMA helper twice with distinct inputs and expected results.
+Its compile report exposes the materialized scope count alongside register use
+and partial waits. [Scope report queries](../workflows/compile-report-queries.md#inspect-authored-scheduling-scopes)
+help compare this composition with a fully fenced or manually interleaved
+schedule. More overlap can keep more registers live; native evidence and
+workload measurements determine whether that trade is useful.
+
+## Conditionals can return values
+
+[`scf.if`](../reference/dialects/scf/ops/if.md) consumes an `i1` condition. A
+result-producing conditional has an `else` region, and each region yields the
+declared results:
+
+```loom
+%below_floor = scalar.cmpf olt, %value, %floor : f32
+%clamped = scf.if %below_floor -> (f32) {
+  scf.yield %floor : f32
+} else {
+  scf.yield %value : f32
+}
+```
+
+There is no mutable temporary shared by both branches. The yielded value is the
+definition of `%clamped`, so use-def analysis and specialization see exactly
+which alternatives can reach each consumer.
+
+A resultless `scf.if` can omit the textual `scf.yield`; the parser still
+materializes its terminator in memory. This keeps the in-memory region contract
+uniform without cluttering the common source form.
+
+## Counted loops carry state explicitly
+
+[`scf.for`](../reference/dialects/scf/ops/for.md) uses a half-open logical index
+range: the lower bound is inclusive, the upper bound is exclusive, and the step
+is positive. Parenthesized bindings initialize loop-carried values, and
+`scf.yield` forwards the next iteration state:
+
+```loom
+%result = scf.for %iteration = [%begin to %end step %step](%current = %initial : f32) -> (f32) {
+  %next = func.call @affine(%current, %scale, %bias) : (f32, f32, f32) -> (f32)
+  scf.yield %next : f32
+}
+```
+
+The induction variable has the bounds' address type: `index` for logical
+coordinates or `offset` for byte positions. If the lower bound is at least the
+upper bound, the results are the initial values. Otherwise, they are the last
+iteration's yielded values. A nonunit step visits only values below the upper
+bound: `[3 to 10 step 4]` visits `3` and `7`.
+
+Every carried value has the same type as its corresponding result. Multiple
+accumulators are ordinary parallel bindings:
+
+```loom
+%sum, %sum_of_squares = scf.for %column = [%begin to %column_count step %step](
+    %sum_acc = %zero : f32,
+    %square_acc = %zero : f32
+  ) -> (f32, f32) {
+  %value = view.load %input[%column] : view<[%column_count]xf32> -> f32
+  %square = scalar.mulf %value, %value : f32
+  %next_sum = scalar.addf %sum_acc, %value : f32
+  %next_square = scalar.addf %square_acc, %square : f32
+  scf.yield %next_sum, %next_square : f32, f32
+}
+```
+
+This spelling preserves recurrence edges. A scheduler can distinguish the two
+independent recurrence chains, an unroller can interleave their producers, and
+reports can attribute pressure to the values that actually stay live.
+
+## Rotate views over reusable storage
+
+Loop-carried state can include views over one buffer. Construct the slots from
+the same buffer value, carrying any alignment or alias assumptions established
+by the caller. Each view retains its shape and layout while its byte origin
+rotates through the loop. The backing allocation remains outside the loop.
+
+The yield tuple supplies the next state simultaneously. For example,
+`scf.yield %next, %current` exchanges the two views: each operand denotes the
+view from the current iteration. It does not copy their stored elements.
+
+This example uses two private slots to compute `1 + 7 * trip_count`. Each
+iteration consumes the current slot, writes the next slot, and rotates their
+roles. The caller supplies a trip count in `[0, 257]`:
+
+**Source:** [`rotating-views.loom`](https://github.com/ROCm/hrx-system/blob/main/loom/docs/examples/guide/functions-and-control/rotating-views.loom)
+
+```loom title="rotating-views.loom"
+--8<-- "examples/guide/functions-and-control/rotating-views.loom"
+```
+
+With zero iterations, `%last` is the initial `%first` view and the result is
+`1`. After three iterations, `%last` identifies the last written slot and the
+result is `22`. The returned views remain usable after the loop; they retain
+the lifetime of their backing storage. A view is non-owning, so returning a
+view never extends an allocation's lifetime.
+
+Views can also pass through `scf.while`, region yields, and whole-value
+selection. The [memory guide](buffers-views-memory.md) describes their storage,
+alignment, and synchronization contracts. Rotating a view does not establish
+completion of an asynchronous producer; consumption and storage reuse follow
+the program's completion dependencies.
+
+### Select and carry address layouts
+
+An address layout is an SSA value. Select a runtime layout directly when the
+same logical matrix may use different physical strides, then name the selected
+value in the view type:
+
+```loom
+%row_major = encoding.layout.strided [%columns, 1] : encoding<layout>
+%column_major = encoding.layout.strided [1, %rows] : encoding<layout>
+%layout = scf.if %use_rows -> (encoding<layout>) {
+  scf.yield %row_major : encoding<layout>
+} else {
+  scf.yield %column_major : encoding<layout>
+}
+%matrix = buffer.view %storage[%base] : buffer -> view<[%rows]x[%columns]xf32, %layout>
+%value = view.load %matrix[%row, %column] : view<[%rows]x[%columns]xf32, %layout> -> f32
+```
+
+The strides are measured in elements and may be runtime values. `scf.if`,
+`scf.for`, and `scf.while` preserve the selected per-axis strides, so a loop can
+rotate or replace a layout along with other recurrence state. The source keeps
+logical coordinates and one semantic layout value instead of reproducing each
+candidate as flattened address arithmetic.
+
+The [checked strided-layout
+case](https://github.com/ROCm/hrx-system/blob/main/loom/src/loom/test/corpus/memory/view/strided_recurrence.loom)
+selects between two runtime pitches, rotates them through counted and condition
+loops, and verifies the resulting addresses through a nonzero buffer origin.
+When a carried view's type refers to the layout, carry the layout beside the
+view as shown in the next section.
+
+### Change a carried view's shape
+
+A loop can change a carried view's extent or layout. Its result list defines
+the recurring tuple, including relationships between sibling results. Each
+edge expresses that same relationship with the SSA values in its own scope.
+This shrinking view carries a row count beside the view whose first dimension
+uses it:
+
+```loom
+%rows, %view = scf.for %iteration = [%begin to %count step %step](
+    %carried_rows = %initial_rows : index,
+    %carried_view = %initial_view : view<[%initial_rows]x4xi32>
+  ) -> (index, view<[%rows]x4xi32>) {
+  %next_rows = index.sub %carried_rows, %step : index
+  %next_view = view.subview %carried_view[1, 0] : view<[%carried_rows]x4xi32> -> view<[%next_rows]x4xi32>
+  scf.yield %next_rows, %next_view : index, view<[%next_rows]x4xi32>
+}
+%final = view.load %view[0, 1] : view<[%rows]x4xi32> -> i32
+```
+
+The initial view names `%initial_rows`, the body view names `%carried_rows`, the
+yielded view names `%next_rows`, and the final view names `%rows`. These are
+separate SSA definitions of one positional type relationship. A type that
+keeps an initial or body-local identity on the wrong edge is rejected instead
+of being treated as a static annotation.
+
+The [checked shrinking-view
+case](https://github.com/ROCm/hrx-system/blob/main/loom/src/loom/test/corpus/memory/view/shrinking.loom)
+changes the row extent while carrying its strided layout, consumes the view in
+the loop body, and checks the final view after zero, one, and three iterations
+on AMDGPU and Vulkan. Pipelining, unrolling, fusion, and other loop
+reconstruction retain the recurring type scheme; their ordinary legality rules
+still apply to the loop's effects and dependencies.
+
+Scalar values can rotate through the same carried tuple. A loop may issue a
+future input load before computing with an older carried input. On AMDGPU,
+completion waits account for register copies used to carry those values: a
+copied input is ready in the next iteration, while a value forwarded in place
+retains its pending dependency. The future load can remain outstanding during
+independent arithmetic, then completes before its result is read or copied.
+
+## Unrolling is a loop policy
+
+Keep the source loop when the algorithm is a loop. Request full local unrolling
+on the loop instead of pasting body copies:
+
+```loom
+%sum = scf.for %part = [%begin to %part_count step %step](%acc = %zero : f32) -> (f32) unroll {
+  %next = func.call @accumulate_part(%acc, %part) : (f32, index) -> (f32)
+  scf.yield %next : f32
+}
+```
+
+The unroll transform proves and materializes the trip structure. If source facts
+are insufficient, the request fails with the unresolved bounds rather than
+silently leaving a loop that the author required to be unrolled. More specific
+unroll schedules can express linear, interleaved, or recurrence-aware body
+ordering without changing the logical loop.
+
+An enclosing structured condition participates in that proof. Inside the true
+region of `%remaining >= %tile_size`, a loop ending at
+`index.min %remaining, %tile_size` has the exact full-tile bound. Bare `unroll`
+can materialize it directly; the source does not need to restate the guard with
+`index.assume`. The complementary region remains a runtime tail unless another
+visible fact makes its trip count exact.
+
+`unroll(%factor)` requests partial unrolling with a specialized positive factor.
+The two-slot example uses factor two with a runtime trip count. Each copied
+iteration advances the whole carried tuple once. Empty ranges execute no body,
+and a remainder executes only the iterations in the original half-open range:
+three iterations still produce `22`, including the final view identity.
+Unrolling preserves the program's data and completion dependencies.
+
+The [loop-tuning walkthrough](../workflows/tune-loop-schedules.md) combines
+these controls in checked row-sum and packed-dot examples, including serial
+controls, configuration sweeps, and compiler evidence.
+
+### Preserve source order through unrolling
+
+Source fences compose with full and partial unrolling, including `interleaved`
+and `recurrence` schedules. This boundary keeps a carried add ahead of an
+independent ID-table lookup and its dependent payload. Here `%begin` is zero,
+`%step` is one, `%end` is in `[0, 8]`, and the ID table contains indices in
+`[0, 7]`:
+
+```loom
+%result = scf.for %row = [%begin to %end step %step](%sum = %initial : f32) -> (f32) unroll(%factor) schedule(recurrence) {
+  %consumed = scalar.addf %sum, %bias : f32
+  scf.schedule.fence
+  %id = view.load %ids[%row] : view<8xi32> -> i32
+  %position = index.cast %id : i32 to index
+  %bounded = index.assume %position [range(%position, 0, 7)] : index
+  %payload = view.load %payloads[%bounded] : view<8xf32> -> f32
+  %next = scalar.addf %consumed, %payload : f32
+  scf.yield %next : f32
+}
+```
+
+`%factor` can be supplied by the surrounding template or computed from target
+properties, just like an unfenced loop's unroll factor. Each materialized
+iteration retains the boundary, and its unfenced ranges remain available for
+scheduling. A fence inside an inlined helper participates in the caller's
+source order. A fence inside a nested `scf.if` or `scf.for` retains that region's
+scope when the enclosing operation is cloned as a unit.
+
+The [checked dependent-lookup example](https://github.com/ROCm/hrx-system/blob/main/loom/src/loom/tooling/target/amdgpu/test/amdgpu_unroll_fences.loom)
+composes two helpers and exercises empty, short, full, and remainder tiles.
+A loop requesting `pipeline(%depth)` with depth greater than one rejects
+authored fences: the read-ahead transform cannot carry an explicit source-range
+constraint through its producer/consumer partition.
+
+## Pipeline reads ahead of ordered computation
+
+`pipeline(%depth)` requests read-ahead on one `scf.for`. The loop still describes
+one logical iteration. Ordinary loads and their address prerequisites run ahead
+of the ordered consumer; the compiler constructs startup, steady-state, and
+drain code and carries the values between them.
+
+This motif sums up to 64 rows of four-element vectors from four-byte-aligned
+buffers. Its depth and unroll factor are template arguments: each caller owns
+its schedule, and multiple instantiations can use different policies in one
+kernel. The caller here chooses depth four and factor six.
+
+**Source:** [`vector-read-ahead.loom`](https://github.com/ROCm/hrx-system/blob/main/loom/docs/examples/guide/functions-and-control/vector-read-ahead.loom)
+
+```loom title="vector-read-ahead.loom"
+--8<-- "examples/guide/functions-and-control/vector-read-ahead.loom"
+```
+
+Depth four keeps three iterations of loaded values queued. Each steady iteration
+fetches the next input and consumes the oldest queued value. The drain
+consumes the final three values in their original order. Empty loops perform no
+loads; loops shorter than the depth take the serial path. A partial unroll
+remainder also stays within the original half-open range. The accumulation order
+is preserved, including for floating-point recurrences.
+
+The clauses follow transformation order: `pipeline(%depth) unroll(%factor)`.
+Pipelining constructs the queue first; unrolling then groups iterations of the
+reconstructed loops. Depth three with unroll factor two still queues two original
+iterations, and each unrolled steady body advances the queue twice. An optional
+`schedule(...)` follows `unroll(...)` and controls how those copies are ordered.
+The target schedules independent instructions using its normal dependency
+constraints; the carried queue preserves the original iteration relationship.
+
+The example uses factor six with `schedule(recurrence)` so old queue values
+can be consumed before their registers receive new loads. Hardware overlap
+also depends on allocation: a materialized queue copy consumes its source and
+can require an early wait. The [native-overlap walkthrough](../workflows/tune-loop-schedules.md#check-that-read-ahead-survives-native-code-generation)
+shows a steady backedge with pending loads and how to inspect copy waits.
+
+Both controls are independent and explicit: loops without `pipeline(...)`
+receive no read-ahead transformation, and pipelining does not request unrolling.
+Depth one retains serial iteration and any separate unroll policy, providing a
+useful control. The depth must specialize to a positive exact value; the unroll
+factor must also specialize before its policy runs.
+
+Nested `scf.if` and `scf.for` normally remain intact within their assigned
+stage. A guarded load retains its guard, and a read-only inner reduction can
+produce one queued result for each outer iteration. One bounded exception lets
+a top-level `scf.if` contain a guarded load and the carried-state computation
+that consumes it. When exactly one branch reads, the compiler can retain the
+condition and branch-local read closure as a guarded producer, then rebuild the
+original conditional around the ordered consumer. The opposite branch, result
+types, yields, and skipped-update behavior remain unchanged. A pure inner loop
+can likewise consume queued values and the outer accumulator. Inner loops may
+also carry their own explicit pipeline and unroll policies; pipelining processes
+the inner policy before the outer one, then unrolling processes the reconstructed
+program. The [guarded-row example](../workflows/tune-loop-schedules.md#keep-guards-and-inner-loops-in-the-source)
+checks atomic nested units, and the
+[paged-attention example](../workflows/tune-loop-schedules.md#pipeline-cooperative-paged-attention)
+checks the retained guarded partition through native output.
+
+The read-ahead contract supports ordinary loads and memory-pure consumers, and
+global loads ahead of workgroup-memory consumers, with a positive exact step.
+Read prerequisites may depend on the induction variable and values outside the
+loop. An atomic nested unit containing reads requires all captured values,
+guards, bounds, and initial inner state to be independent of outer loop-carried
+state. For a retained guarded partition, that requirement applies to the
+condition and branch-local producer closure; the consumer remainder may use the
+outer carried tuple. A violation is diagnosed.
+Cross-stage value types must be invariant across iterations. Global or unknown
+memory writes, global barriers, volatile effects, explicit asynchronous groups,
+source-order fences, other nested control such as `scf.while`, and consuming
+result-storage ties on the requested loop require
+a different scheduling/ownership contract and are diagnosed when
+requested at depth greater than one. The depth is bounded by 65,535 and by the
+representable carried-state tuple; unsupported requests fail at the source
+policy instead of silently running serially.
+
+When the requested loop has compile-time exact bounds, global input loads can
+advance while workgroup loads, stores, and workgroup-memory barriers remain in
+the consumer. Publication, consumption, and the barrier before reusing shared
+storage keep their original order. Different views of the same workgroup
+allocation stay in that consumer. The compiler must establish the global and
+workgroup spaces; a `noalias` promise does not substitute for this separation.
+A workgroup read cannot supply a future global load's address or guard.
+
+A small inner loop that mixes global loads with workgroup stores can request
+full linear `unroll`. The compiler expands that explicit request before forming
+the enclosing read-ahead cut, exposing the loads separately from the stores.
+Partial or interleaved inner schedules remain intact and cannot expose a mixed
+unit. Read-only inner reductions keep their single queued result, and the
+enclosing loop's own unroll policy still runs after pipelining. The
+[workgroup-staging walkthrough](../workflows/tune-loop-schedules.md#read-ahead-across-workgroup-staging)
+links a checked example with empty, short, and combined-policy callers.
+
+Subgroup and workgroup reductions can remain in the ordered consumer when the
+requested loop's lower and upper bounds are compile-time exact. This keeps
+every original participant at the same collective site during startup, steady
+iteration, and drain. A fixed tile with runtime tail guards fits this contract:
+one top-level `scf.if` may contain the guarded loads, reduction, and carried
+update. The guarded producer advances only the independent read closure; the
+collective and update stay together in the consumer branch. A collective result
+cannot determine a read-ahead address or guard, and a conditional that cannot
+form this interior cut receives a diagnostic. Runtime bounds on the requested
+collective loop also receive a diagnostic; depth one preserves the original
+loop.
+
+Exactness may come from an enclosing structured edge. A full-tile `scf.if`
+guard can make a derived inner bound exact in its true region without an
+`index.assume`; its false region only proves a partial tail and cannot safely
+pipeline a convergent loop at depth greater than one from that fact alone.
+
+The [checked collective recurrence](https://github.com/ROCm/hrx-system/blob/main/loom/src/loom/test/corpus/kernel/workgroup/loop_state.loom)
+applies one template with serial and pipelined policies. It combines 16-lane
+cluster reductions, workgroup reductions, ragged reads, and a nested runtime
+consumer loop, checking each schedule against independent integer results.
+The [cooperative paged-attention workflow](../workflows/tune-loop-schedules.md#pipeline-cooperative-paged-attention)
+applies this shape to shared K/V page lookups, subgroup score reductions, online
+softmax state and ragged sequence tails, with matched checked benchmarks.
+The [sparse token variant](../workflows/tune-loop-schedules.md#pipeline-sparse-token-attention)
+adds dependent per-token IDs and an independent selected-prefix boundary,
+including ignored suffixes that point at poisoned payloads.
+The [grouped-query variant](../workflows/tune-loop-schedules.md#share-kv-loads-across-query-heads)
+shares each K/V fragment across two independent softmax states. It compares
+load reuse and pipelining separately, with per-head guards for unequal lengths.
+
+The caller can also calculate these values with `index` arithmetic from
+specialized template arguments or target properties. A global configuration
+key for a motif's depth would couple all its instantiations. Config overrides
+are useful in an experiment harness for sweeping schedules; the
+[loop-tuning walkthrough](../workflows/tune-loop-schedules.md#keep-one-checked-source-for-experiments)
+shows that separate workflow.
+
+Compile this instantiation and inspect its schedule:
+
+```shell
+loom-compile vector-read-ahead.loom --root=@sum_vector_rows \
+  --target=amdgpu:gfx1151 --format=amdgpu-hsaco --output=vector-rows.hsaco \
+  --compile-report=details --compile-report-output=vector-rows.report.json
+loom-compile-report show vector-rows.report.json
+loom-compile-report suggest vector-rows.report.json
+```
+
+The report retains the applied policy and operation schedule alongside final
+registers, spills, occupancy, and code size. A larger queue trades additional
+live state and generated code for read overlap; the useful depth depends on the
+kernel and target. [Compile reports](../workflows/compile-reports.md) explain
+how to compare those costs with runtime measurements while holding unrolling
+and workload fixed.
+
+## Select among whole values
+
+Not every choice needs a region. [`scf.select`](../reference/dialects/scf/ops/select.md)
+chooses between two whole values under one scalar condition. `scf.lookup`
+selects a value tuple from a keyed table, and `scf.switch` owns multi-region
+control flow when cases perform different work.
+
+Use the smallest construct that preserves the program distinction:
+
+- `scf.select` for two already-computed values;
+- `scf.lookup` for a static keyed value table;
+- `scf.if` when alternatives execute different operations;
+- `scf.switch` for several operation regions;
+- `scf.for` for bounded iteration;
+- `scf.while` when continuation is computed by the loop itself.
+
+The structured form is part of the optimization input. Lowering to branches is
+a target decision, not source authoring work.
+
+## Request a template family when identity is not fixed
+
+An exact call says *which symbol*. A
+[`template.apply`](../reference/dialects/template/ops/apply.md) says *which
+template family* and lets specialization select an eligible provider.
+
+The composition example's motif contains a concrete helper and two providers
+for one family:
+
+**Source:** [`loom/docs/examples/elementwise-transform/motif.loom`](https://github.com/ROCm/hrx-system/blob/main/loom/docs/examples/elementwise-transform/motif.loom)
+
+```loom title="motif.loom"
+--8<-- "examples/elementwise-transform/motif.loom"
+```
+
+The kernel requests that family without naming either provider:
+
+```loom
+%result = template.apply<@guide.elementwise_transform>(%value) : (f32) -> (f32)
+```
+
+Provider selection uses the family symbol, exact signature, available facts,
+requirements, and explicit priority. File order and module path do not break
+ties. The wave32 provider is eligible only when the application-site target
+facts prove a subgroup size of 32; the portable provider remains the fallback.
+
+After selection, the apply becomes an exact callable edge and ordinary inlining
+can erase the boundary. Templates therefore express library variability at
+specialization time without turning every device invocation into a runtime
+branch.
+
+The next guide boundary is buffers, views, and structured compute: functions
+will continue to own reusable algorithms while storage identity and memory
+access become explicit.
+
+
+# Programming guide
+
+The programming guide explains Loom by the boundary that owns each decision.
+It is written for systems and ML engineers who are comfortable reading a
+kernel.
+
+Start with [Run your first Loom kernel](../getting-started/first-kernel.md) for
+one direct author-test-benchmark loop. Continue with the
+[source-to-artifacts walkthrough](../getting-started/source-to-artifacts.md)
+when you are ready to add modules, templates, specialization, and command
+programs. Use the chapters here to understand why a source construct exists
+and when it is the right construct. Use the [generated
+reference](../reference/index.md) when you need the exhaustive syntax or field
+contract for one operation.
+
+## The language progression
+
+Loom source grows through a sequence of ownership boundaries. Later boundaries
+compose the earlier ones rather than replacing them with a separate kernel,
+graph, or deployment language.
+
+1. **Source modules and canonical text** establish independently verifiable
+   files, symbols, declarations, comments, bytecode, and deterministic source.
+   Begin with [Source modules and canonical text](source-modules.md).
+2. **Values, types, and shapes** distinguish logical coordinates, byte offsets,
+   scalars, vectors, tensors, buffers, views, and physical encodings. The
+   generated [type reference](../reference/types/index.md) is the exact catalog.
+   Continue with [Values,

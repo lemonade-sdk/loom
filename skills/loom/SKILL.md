@@ -1,0 +1,88 @@
+---
+name: loom
+description: Entry point for AMD Loom work (hrx-loom SDK, loom-serve, loom-fetch, Loom IR kernels) on AMD GPUs/NPUs such as Strix Halo — installing, serving catalog models, the demo web UI, porting a new LLM to Loom, optimizing it while preserving correctness, and benchmarking against llama.cpp. Use whenever the user mentions Loom, loom-serve, loom-fetch, hrx-loom, .loom files, or evaluating/porting models for Loom.
+---
+
+# Loom (umbrella)
+
+Loom = AMD's JIT compiler + runtime + model server (`hrx-loom` wheel; source at
+github.com/ROCm/hrx-system, models at github.com/ROCm/hrx-loom-library). Models
+ship as **Loom IR source** (`.loom` kernels + command/control programs) plus a
+package card (`model.json`) that points at unmodified checkpoints (GGUF or
+safetensors). `loom-serve` compiles the program for the live device at startup
+and exposes OpenAI-style HTTP endpoints.
+
+## Pick the sub-skill
+
+| Task | Skill |
+|---|---|
+| Install the SDK + library, fetch a catalog model, start/stop `loom-serve`, NPU serving | `loom-setup` |
+| Browser playground (chat / ASR / TTS / image / embeddings) over running servers | `loom-demo-ui` |
+| Make an arbitrary GGUF LLM servable by loom-serve (write the program) | `loom-port-llm` |
+| Make a ported model faster without breaking correctness | `loom-optimize` |
+| Correctness gate vs llama.cpp, throughput methodology, reporting | `loom-benchmark` |
+
+All paths in these skills assume the install root `~/loom` (SDK venv `~/loom/.venv`,
+tools venv `~/loom/.tools`). Substitute your own root consistently. The scripts take overrides:
+`VENV=` (serve.sh, run_kernel_tests.sh), `UI_VENV=` or the 2nd argument (start_ui.sh),
+and `LOOM_SERVE_STATE=` (the serve.sh PID/log dir).
+
+Typical cold-start order: `loom-setup` → (`loom-demo-ui`) → `loom-port-llm` →
+`loom-benchmark` (baseline + golden) → `loom-optimize` ↔ `loom-benchmark`.
+
+## Hard rules (learned the expensive way)
+
+- **Never load a model whose weights exceed the GPU's GTT/unified-memory budget.**
+  On the Strix Halo box (128 GB RAM) the GPU limit is ~61 GiB GTT. Qwen3.8-Flash-Next
+  (104 GiB) hard-crashed the machine during the original evaluation. Never retry it on a 128 GB box. Check
+  `du -shL <weights>` against `cat /sys/class/drm/card*/device/mem_info_gtt_total`
+  before serving anything big.
+- **Always pass `--memory_bytes`** to `loom-serve` (weights + KV pool + ~2 GiB
+  workspace). Too small → HTTP 503 "retained state leaves insufficient completion
+  capacity". Several models can share one budget with `--parameter_idle_ms=60000`.
+- **Freshly downloaded binaries need explicit user approval before running**
+  (e.g. llama.cpp release zips). The Loom wheel is installed via pip.
+- Gated Hugging Face models: give the user the exact model page URL so they can
+  accept the license; don't try to work around the gate.
+- Every chat/completions POST needs `Content-Type: application/json`. (Python
+  `requests` with an empty `Expect:` header breaks the connection.)
+- The first request after startup triggers lazy weight loading (seconds to a
+  minute); don't time it.
+- Stop servers by PID file (`loom-setup/scripts/stop.sh`). `pkill -f "...port..."`
+  can match and kill your own shell.
+- After a rebuild, make sure the old server is really gone. `serve.sh` refuses a
+  busy port and checks that its own PID owns the port before printing READY.
+  READY after about 1 s is normal, since compiled kernels are cached and weights
+  load on the first request. A stale server shows up as a READY from a PID that
+  isn't yours, or as old behavior.
+- Before starting llama-server or loom-serve, check the port is free (`ss -ltnp`).
+- Golden references must be external (llama.cpp ROCm or the model's own reference
+  implementation), never a numpy model you wrote yourself.
+
+## Facts about this hardware (Strix Halo, Ryzen AI Max+ 395)
+
+- GPU gfx1151 (RDNA 3.5), wave32, WMMA f16→f32 (~59 TFLOP/s peak), ~216 GB/s
+  measured DRAM bandwidth, 32 MB MALL (last-level cache), ~61 GiB GTT.
+- NPU: XDNA (`--device='xdna://0?columns=8' --pool_backing=fixed`). Only some
+  catalog models (e.g. Qwen3-Embedding-0.6B) run there, and it needed an older
+  SDK wheel (see `loom-setup`).
+- `loom-benchmark` hardware counters are UNIMPLEMENTED on this GPU. Profile by
+  ablation (remove or double a kernel, measure end to end) instead.
+
+## Where things are documented upstream
+
+- The docs site is rocm.github.io/hrx-system/loom. The same docs are in the repo:
+  `git clone --depth 1 https://github.com/ROCm/hrx-system` and open
+  `loom/docs/src/`.
+  - `guide/` covers the IR: values, buffers/views, kernels, vectors, facts,
+    and command programs.
+  - `serving/model-programs.md` covers package authoring.
+  - `serving/workflows/fetch-and-serve.md` and `live-model-development.md`
+    cover the serving workflows.
+  - `workflows/test-correctness.md` covers `check.case` tests.
+- Each tool prints an agent-oriented manual: `loom-test --agents_md`,
+  `loom-compile --agents_md`, `loom-serve --agents_md`, `loom-opt --agents_md`,
+  `loom-run --agents_md`, `loom-format --agents_md`.
+- Library model programs are the best worked examples. For example,
+  `library/program/text/qwen3_8/chat.loom` is a ChatML control program with
+  `<think>` parsing, and `library/model/*/` holds the cards.

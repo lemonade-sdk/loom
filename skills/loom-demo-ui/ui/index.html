@@ -1,0 +1,318 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Loom Playground</title>
+<style>
+:root { --bg:#f4f6f7; --surface:#fff; --fg:#1b2127; --muted:#5b6672; --rule:#d6dce1; --accent:#0f6e78; --accent-fg:#fff; --good:#1d7a3e; --bad:#b3261e;
+  --mono: ui-monospace, "SFMono-Regular", Menlo, monospace; --body: system-ui, -apple-system, "Segoe UI", sans-serif; }
+@media (prefers-color-scheme: dark) { :root { --bg:#12161a; --surface:#1a2026; --fg:#e4e8ec; --muted:#9aa5b0; --rule:#2e363e; --accent:#5cc3cc; --accent-fg:#0b1214; --good:#6fd08f; --bad:#f28b82; color-scheme: dark; } }
+* { box-sizing: border-box; }
+body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.5 var(--body); }
+header { display:flex; flex-wrap:wrap; gap:12px 24px; align-items:center; padding:14px 20px; border-bottom:1px solid var(--rule); background:var(--surface); }
+header h1 { font-size:1.15rem; margin:0; }
+#status { display:flex; flex-wrap:wrap; gap:8px; font:12px var(--mono); }
+.chip { padding:3px 8px; border-radius:99px; border:1px solid var(--rule); }
+.chip.ready { color:var(--good); } .chip.bad { color:var(--bad); }
+nav { display:flex; gap:4px; padding:0 20px; background:var(--surface); border-bottom:1px solid var(--rule); overflow-x:auto; }
+nav button { border:0; background:none; color:var(--muted); padding:12px 14px; font:inherit; cursor:pointer; border-bottom:2px solid transparent; white-space:nowrap; }
+nav button.on { color:var(--fg); border-bottom-color:var(--accent); font-weight:600; }
+main { max-width:900px; margin:0 auto; padding:24px 20px 60px; }
+section { display:none; gap:14px; } section.on { display:grid; }
+.hint { color:var(--muted); font-size:.88rem; margin:0; }
+textarea, input, select { font:inherit; color:var(--fg); background:var(--surface); border:1px solid var(--rule); border-radius:6px; padding:8px 10px; width:100%; }
+textarea { min-height:80px; resize:vertical; }
+.row { display:flex; flex-wrap:wrap; gap:10px; align-items:center; }
+.row > * { width:auto; }
+button.go { background:var(--accent); color:var(--accent-fg); border:0; border-radius:6px; padding:9px 16px; font:inherit; font-weight:600; cursor:pointer; }
+button.go:disabled { opacity:.5; cursor:wait; }
+button.alt { background:none; border:1px solid var(--rule); color:var(--fg); border-radius:6px; padding:8px 14px; font:inherit; cursor:pointer; }
+.out { background:var(--surface); border:1px solid var(--rule); border-radius:6px; padding:14px; white-space:pre-wrap; min-height:48px; }
+.metric { font:12px var(--mono); color:var(--muted); }
+#chatlog { display:grid; gap:10px; }
+.msg { padding:10px 14px; border-radius:8px; white-space:pre-wrap; max-width:85%; }
+.msg.user { background:var(--accent); color:var(--accent-fg); justify-self:end; }
+.msg.assistant { background:var(--surface); border:1px solid var(--rule); }
+.msg img { max-width:200px; display:block; border-radius:4px; margin-bottom:6px; }
+#imgout img { max-width:100%; border-radius:6px; border:1px solid var(--rule); }
+table { border-collapse:collapse; font:13px var(--mono); }
+td, th { border:1px solid var(--rule); padding:6px 8px; text-align:right; }
+th { color:var(--muted); font-weight:500; }
+td.l, th.l { text-align:left; max-width:240px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Loom Playground</h1>
+  <div id="status"><span class="chip">checking servers…</span></div>
+</header>
+<nav id="tabs">
+  <button data-t="chat" class="on">Chat</button>
+  <button data-t="asr">Transcribe</button>
+  <button data-t="tts">Speak</button>
+  <button data-t="img">Image</button>
+  <button data-t="emb">Embed</button>
+</nav>
+<main>
+
+<section id="chat" class="on">
+  <div class="row">
+    <select id="chatmodel"><option value="">(waiting for a text model)</option></select>
+  </div>
+  <p class="hint" id="chathint"></p>
+  <div id="chatlog"></div>
+  <textarea id="chatin">Explain in three sentences what a just-in-time compiler is.</textarea>
+  <div class="row">
+    <button class="go" id="chatgo">Send</button>
+    <label class="alt" style="cursor:pointer">Attach image <input type="file" id="chatimg" accept="image/*" hidden></label>
+    <span id="chatimgname" class="metric"></span>
+    <button class="alt" id="chatclear">Clear</button>
+  </div>
+  <div class="metric" id="chatm"></div>
+</section>
+
+<section id="asr">
+  <p class="hint">Moonshine Streaming Tiny on the GPU. English, up to 40 s. Upload WAV/MP3/FLAC or record from your microphone; audio is converted to 16 kHz mono in the browser.</p>
+  <div class="row">
+    <input type="file" id="asrfile" accept="audio/*">
+    <button class="alt" id="asrrec">● Record</button>
+    <button class="alt" id="asrsample">Use sample clip</button>
+  </div>
+  <audio id="asrplay" controls hidden></audio>
+  <button class="go" id="asrgo" disabled>Transcribe</button>
+  <div class="out" id="asrout"></div>
+  <div class="metric" id="asrm"></div>
+</section>
+
+<section id="tts">
+  <p class="hint">Pocket TTS on the GPU, 24 kHz. Keep sentences under ~30 words or use punctuation; very long run-on sentences are rejected.</p>
+  <textarea id="ttsin">Good afternoon. This sentence was generated on the Strix Halo GPU by Loom, using the Pocket text to speech model.</textarea>
+  <div class="row">
+    <select id="ttsvoice"><option>alba</option><option>marius</option><option>anna</option></select>
+    <label class="row" style="gap:4px">seed <input id="ttsseed" type="number" value="42" style="width:90px"></label>
+    <button class="go" id="ttsgo">Speak</button>
+  </div>
+  <audio id="ttsplay" controls hidden></audio>
+  <div class="metric" id="ttsm"></div>
+</section>
+
+<section id="img">
+  <p class="hint">Text-to-image with the first served image model (e.g. Krea 2 Turbo: 512×512 ~10–15 s, 1024×1024 ~40 s on Strix Halo).</p>
+  <textarea id="imgin">A cozy reading nook inside a lighthouse, warm lamplight, rain on the windows, detailed illustration.</textarea>
+  <div class="row">
+    <select id="imgsize"><option>512x512</option><option>768x768</option><option>1024x1024</option><option>768x1024</option><option>1024x768</option></select>
+    <label class="row" style="gap:4px">seed <input id="imgseed" type="number" value="42" style="width:90px"></label>
+    <button class="go" id="imggo">Generate</button>
+  </div>
+  <div id="imgout"></div>
+  <div class="metric" id="imgm"></div>
+</section>
+
+<section id="emb">
+  <p class="hint">Embeddings from the first served embedding model (e.g. Qwen3-Embedding-0.6B on the XDNA NPU). Enter one sentence per line (each ≤ ~100 tokens, at most 16 lines). Shows pairwise cosine similarity.</p>
+  <textarea id="embin" style="min-height:140px">The library is open on Saturday.
+Is the library closed on weekends?
+The stock market fell sharply today.
+Shares dropped significantly this afternoon.
+My cat likes to sleep in the sun.</textarea>
+  <button class="go" id="embgo">Embed</button>
+  <div id="embout" style="overflow-x:auto"></div>
+  <div class="metric" id="embm"></div>
+</section>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+const err = async r => { try { const j = await r.json(); return j.error?.message || JSON.stringify(j); } catch { return r.status + " " + r.statusText; } };
+
+// tabs
+document.querySelectorAll("#tabs button").forEach(b => b.onclick = () => {
+  document.querySelectorAll("#tabs button").forEach(x => x.classList.toggle("on", x === b));
+  document.querySelectorAll("main section").forEach(s => s.classList.toggle("on", s.id === b.dataset.t));
+});
+
+// status
+// Model registry from every upstream's /v1/status: kind -> [{target, id, inputs}].
+// Kinds: text, recognition (ASR), speech (TTS), image, embedding.
+let TARGETS = [], REG = {};
+const pick = kind => (REG[kind] || [])[0];
+async function status() {
+  const chips = [], reg = {};
+  if (!TARGETS.length) { try { TARGETS = await (await fetch("/api/targets")).json(); } catch { TARGETS = ["gpu", "npu"]; } }
+  for (const t of TARGETS) {
+    try {
+      const j = await (await fetch(`/api/${t}/v1/status`)).json();
+      for (const m of j.data) if (m.loom.registration === "ready") (reg[m.loom.kind] ||= []).push({ target: t, id: m.id, inputs: m.input_modalities || [] });
+      for (const m of j.data) chips.push(`<span class="chip ${m.loom.registration === "ready" ? "ready" : "bad"}">${t.toUpperCase()} · ${m.id.split("/")[1]} · ${m.loom.registration}${m.loom.status?.active_requests ? " · busy" : ""}</span>`);
+    } catch { chips.push(`<span class="chip bad">${t.toUpperCase()} server down</span>`); }
+  }
+  $("status").innerHTML = chips.join("");
+  REG = reg;
+  const sel = $("chatmodel"), want = (reg.text || []).map(m => m.target + "|" + m.id);
+  const have = [...sel.options].map(o => o.value);
+  if (want.length && want.join() !== have.join()) {
+    const cur = sel.value;
+    sel.innerHTML = (reg.text || []).map(m => `<option value="${m.target}|${m.id}">${m.id} (${m.target.toUpperCase()}${m.inputs.includes("image") ? ", images" : ""})</option>`).join("");
+    if (want.includes(cur)) sel.value = cur;
+    setHint();
+  }
+  const tabs = { asr: "recognition", tts: "speech", img: "image", emb: "embedding" };
+  for (const [tab, kind] of Object.entries(tabs)) {
+    const m = pick(kind), b = document.querySelector(`nav button[data-t="${tab}"]`);
+    b.textContent = b.textContent.split(" · ")[0] + (m ? " · " + m.id.split("/").pop() : " · (none)");
+  }
+}
+status(); setInterval(status, 5000);
+
+// chat
+let history = [], pendingImg = null;
+const chatSel = () => { const [target, ...rest] = ($("chatmodel").value || "|").split("|"); return { target, id: rest.join("|") }; };
+const chatModel = () => (REG.text || []).find(m => m.target + "|" + m.id === $("chatmodel").value);
+const setHint = () => { const m = chatModel(); $("chathint").textContent = m ? `${m.id} on ${m.target.toUpperCase()}. ` + (m.inputs.includes("image") ? "Attach an image to ask about it. " : "Text only. ") + "Reasoning (if any) is shown first; models sharing a memory budget may take a few seconds to (re)load weights." : "No text model is ready yet."; };
+$("chatmodel").onchange = () => { history = []; $("chatlog").innerHTML = ""; $("chatm").textContent = ""; setHint(); };
+setHint();
+$("chatimg").onchange = e => { const f = e.target.files[0]; if (!f) return; const r = new FileReader(); r.onload = () => { pendingImg = r.result; $("chatimgname").textContent = f.name; }; r.readAsDataURL(f); };
+$("chatclear").onclick = () => { history = []; $("chatlog").innerHTML = ""; $("chatm").textContent = ""; };
+function addMsg(role, text, img) { const d = document.createElement("div"); d.className = "msg " + role; if (img) { const i = new Image(); i.src = img; d.append(i); } const s = document.createElement("span"); s.textContent = text; d.append(s); $("chatlog").append(d); return s; }
+$("chatgo").onclick = async () => {
+  const text = $("chatin").value.trim(); if (!text) return;
+  if (!chatModel()) { $("chatm").textContent = "No text model is ready."; return; }
+  if (pendingImg && !chatModel().inputs.includes("image")) { $("chatm").textContent = "This model is text-only; remove the image or pick a vision model."; return; }
+  const content = pendingImg ? [{ type: "image_url", image_url: { url: pendingImg } }, { type: "text", text }] : text;
+  addMsg("user", text, pendingImg); history.push({ role: "user", content });
+  pendingImg = null; $("chatimgname").textContent = ""; $("chatimg").value = ""; $("chatin").value = "";
+  const out = addMsg("assistant", "…"); $("chatgo").disabled = true;
+  const t0 = performance.now(); let first = 0, txt = "", reasoning = "", usage = null;
+  try {
+    const body = { model: chatSel().id, messages: history, max_tokens: 1024, stream: true, stream_options: { include_usage: true } };
+    const r = await fetch(`/api/${chatSel().target}/v1/chat/completions`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    if (!r.ok) throw new Error(await err(r));
+    const rd = r.body.getReader(), dec = new TextDecoder(); let buf = "";
+    for (;;) {
+      const { done, value } = await rd.read(); if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let i; while ((i = buf.indexOf("\n")) >= 0) {
+        const line = buf.slice(0, i).trim(); buf = buf.slice(i + 1);
+        if (!line.startsWith("data: ") || line === "data: [DONE]") continue;
+        const d = JSON.parse(line.slice(6));
+        if (d.usage) usage = d.usage;
+        for (const c of d.choices || []) {
+          const dl = c.delta || {};
+          if (dl.reasoning_content) reasoning += dl.reasoning_content;
+          if (dl.content) { if (!first) first = performance.now(); txt += dl.content; }
+        }
+        out.textContent = (reasoning ? "[thinking] " + reasoning + "\n\n" : "") + txt;
+      }
+    }
+    history.push({ role: "assistant", content: txt });
+    const total = (performance.now() - t0) / 1000, n = usage?.completion_tokens;
+    $("chatm").textContent = `time to first token ${first ? ((first - t0) / 1000).toFixed(2) : "–"} s · ${n ?? "?"} tokens in ${total.toFixed(1)} s` + (n && first ? ` · ${((n - 1) / ((performance.now() - first) / 1000)).toFixed(1)} tok/s decode` : "");
+  } catch (e) { out.textContent = "Error: " + e.message; history.pop(); }
+  $("chatgo").disabled = false;
+};
+
+// asr
+let asrPCM = null;
+async function toPCM16(arrayBuf) {
+  const ctx = new AudioContext(); const dec = await ctx.decodeAudioData(arrayBuf); ctx.close();
+  const off = new OfflineAudioContext(1, Math.ceil(dec.duration * 16000), 16000);
+  const src = off.createBufferSource(); src.buffer = dec; src.connect(off.destination); src.start();
+  const f = (await off.startRendering()).getChannelData(0);
+  const pcm = new Int16Array(f.length); for (let i = 0; i < f.length; i++) pcm[i] = Math.max(-1, Math.min(1, f[i])) * 32767;
+  return { pcm, seconds: dec.duration };
+}
+async function setAudio(blob) {
+  $("asrplay").src = URL.createObjectURL(blob); $("asrplay").hidden = false;
+  const { pcm, seconds } = await toPCM16(await blob.arrayBuffer()); asrPCM = pcm;
+  $("asrm").textContent = `${seconds.toFixed(1)} s of audio ready` + (seconds > 40.9 ? " (too long: max 40.96 s)" : "");
+  $("asrgo").disabled = false;
+}
+$("asrfile").onchange = e => e.target.files[0] && setAudio(e.target.files[0]);
+$("asrsample").onclick = async () => setAudio(await (await fetch("/sample.wav")).blob());
+let rec = null;
+$("asrrec").onclick = async () => {
+  if (rec) { rec.stop(); return; }
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true }); const chunks = [];
+    rec = new MediaRecorder(stream); rec.ondataavailable = e => chunks.push(e.data);
+    rec.onstop = () => { stream.getTracks().forEach(t => t.stop()); rec = null; $("asrrec").textContent = "● Record"; setAudio(new Blob(chunks, { type: chunks[0]?.type })); };
+    rec.start(); $("asrrec").textContent = "■ Stop";
+  } catch (e) { $("asrm").textContent = "Microphone unavailable: " + e.message + " (open this page via http://localhost to allow the mic)"; }
+};
+$("asrgo").onclick = async () => {
+  $("asrgo").disabled = true; $("asrout").textContent = "…"; const t0 = performance.now();
+  const am = pick("recognition"); if (!am) { $("asrout").textContent = "No ASR (recognition) model is served."; $("asrgo").disabled = false; return; }
+  const fd = new FormData(); fd.append("model", am.id);
+  fd.append("file", new Blob([asrPCM.buffer], { type: "audio/pcm;rate=16000;channels=1" }), "audio.pcm");
+  try {
+    const r = await fetch(`/api/${am.target}/v1/audio/transcriptions`, { method: "POST", body: fd });
+    if (!r.ok) throw new Error(await err(r));
+    $("asrout").textContent = (await r.json()).text;
+    $("asrm").textContent = `${(asrPCM.length / 16000).toFixed(1)} s audio transcribed in ${((performance.now() - t0) / 1000).toFixed(2)} s`;
+  } catch (e) { $("asrout").textContent = "Error: " + e.message; }
+  $("asrgo").disabled = false;
+};
+
+// tts
+function wav(pcmBytes, rate) {
+  const h = new DataView(new ArrayBuffer(44)); const w = (o, s) => [...s].forEach((c, i) => h.setUint8(o + i, c.charCodeAt(0)));
+  w(0, "RIFF"); h.setUint32(4, 36 + pcmBytes.byteLength, true); w(8, "WAVEfmt "); h.setUint32(16, 16, true); h.setUint16(20, 1, true); h.setUint16(22, 1, true);
+  h.setUint32(24, rate, true); h.setUint32(28, rate * 2, true); h.setUint16(32, 2, true); h.setUint16(34, 16, true); w(36, "data"); h.setUint32(40, pcmBytes.byteLength, true);
+  return new Blob([h, pcmBytes], { type: "audio/wav" });
+}
+$("ttsgo").onclick = async () => {
+  $("ttsgo").disabled = true; $("ttsm").textContent = "synthesizing…"; const t0 = performance.now(); let first = 0;
+  try {
+    const sm = pick("speech"); if (!sm) throw new Error("no TTS (speech) model is served");
+    const r = await fetch(`/api/${sm.target}/v1/audio/speech`, { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model: sm.id, input: $("ttsin").value, voice: $("ttsvoice").value, seed: +$("ttsseed").value, response_format: "pcm" }) });
+    if (!r.ok) throw new Error(await err(r));
+    const rd = r.body.getReader(), parts = []; let n = 0;
+    for (;;) { const { done, value } = await rd.read(); if (done) break; if (!first) first = performance.now(); parts.push(value); n += value.length; }
+    const all = new Uint8Array(n); let o = 0; for (const p of parts) { all.set(p, o); o += p.length; }
+    $("ttsplay").src = URL.createObjectURL(wav(all.buffer, 24000)); $("ttsplay").hidden = false; $("ttsplay").play();
+    const secs = n / 2 / 24000, tot = (performance.now() - t0) / 1000;
+    $("ttsm").textContent = `first audio after ${((first - t0) / 1000).toFixed(2)} s · ${secs.toFixed(1)} s of speech in ${tot.toFixed(1)} s (${(secs / tot).toFixed(1)}× real-time)`;
+  } catch (e) { $("ttsm").textContent = "Error: " + e.message; }
+  $("ttsgo").disabled = false;
+};
+
+// image
+$("imggo").onclick = async () => {
+  $("imggo").disabled = true; $("imgm").textContent = "generating…"; const t0 = performance.now();
+  try {
+    const im = pick("image"); if (!im) throw new Error("no image model is served");
+    const r = await fetch(`/api/${im.target}/v1/images/generations`, { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model: im.id, prompt: $("imgin").value, size: $("imgsize").value, seed: +$("imgseed").value, response_format: "b64_json" }) });
+    if (!r.ok) throw new Error(await err(r));
+    const b64 = (await r.json()).data[0].b64_json;
+    $("imgout").innerHTML = `<img alt="generated image" src="data:image/png;base64,${b64}">`;
+    $("imgm").textContent = `${$("imgsize").value} in ${((performance.now() - t0) / 1000).toFixed(1)} s`;
+  } catch (e) { $("imgm").textContent = "Error: " + e.message; }
+  $("imggo").disabled = false;
+};
+
+// embeddings
+$("embgo").onclick = async () => {
+  const lines = $("embin").value.split("\n").map(s => s.trim()).filter(Boolean);
+  $("embgo").disabled = true; $("embm").textContent = "embedding…"; const t0 = performance.now();
+  try {
+    const vecs = [];
+    for (const l of lines) {  // one request per line keeps each within the NPU cohort limit
+      const em = pick("embedding"); if (!em) throw new Error("no embedding model is served");
+      const r = await fetch(`/api/${em.target}/v1/embeddings`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ model: em.id, input: l }) });
+      if (!r.ok) throw new Error(await err(r));
+      vecs.push((await r.json()).data[0].embedding);
+    }
+    const dot = (a, b) => a.reduce((s, x, i) => s + x * b[i], 0);
+    let h = "<table><tr><th class='l'></th>" + lines.map((_, i) => `<th>${i + 1}</th>`).join("") + "</tr>";
+    lines.forEach((l, i) => { h += `<tr><td class='l'>${i + 1}. ${l.replace(/</g, "&lt;")}</td>` + lines.map((_, j) => { const c = dot(vecs[i], vecs[j]); return `<td style="background:color-mix(in srgb, var(--accent) ${Math.max(0, (c - 0.2) / 0.8 * 70).toFixed(0)}%, transparent)">${c.toFixed(2)}</td>`; }).join("") + "</tr>"; });
+    $("embout").innerHTML = h + "</table>";
+    $("embm").textContent = `${lines.length} embeddings (${vecs[0].length}-d) in ${((performance.now() - t0) / 1000).toFixed(2)} s`;
+  } catch (e) { $("embm").textContent = "Error: " + e.message; }
+  $("embgo").disabled = false;
+};
+</script>
+</body>
+</html>

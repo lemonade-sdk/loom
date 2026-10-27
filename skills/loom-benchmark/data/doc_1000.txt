@@ -1,0 +1,70 @@
+# Serving HTTP profiles
+
+All TCP and Unix listeners expose the same catalog and HTTP endpoints.
+Inference requests select a registered deployment through the `model` field
+in JSON or multipart form data. Names come from
+[model documents](model-documents.md), not checkpoint filenames or an inferred
+architecture. An absent model returns 404.
+
+The text, image, embedding, speech and transcription profiles use familiar
+OpenAI response shapes, but are not the entire OpenAI API. Supported fields are
+explicit; unsupported execution options reject rather than being silently
+ignored. The server has no built-in authentication or TLS termination.
+
+## Request framing
+
+Request bodies accept either `Content-Length` or HTTP/1.1
+`Transfer-Encoding: chunked`. Supplying both rejects. Chunked transfer is decoded
+incrementally into the same bounded request body; the complete request is
+validated before routing. `--request_body_bytes` bounds decoded body bytes,
+independently of bounded HTTP/chunk framing and multipart metadata. This permits
+upload clients that do not know the body length in advance; it does not turn an
+inference endpoint into a continuing microphone-input session.
+
+Multipart fields retain their names, ordering and binary contents through
+request ownership. Consumers use those parsed fields without interpreting MIME
+boundaries again. Part order does not control routing. Unsupported transfer
+encodings, ambiguous framing and malformed/truncated multipart bodies reject.
+`Expect: 100-continue` is unsupported; upload examples explicitly clear that
+header.
+
+## Discovery and administration
+
+| Method and path | Input or result |
+| --- | --- |
+| `GET /healthz`, `GET /readyz` | Server availability: `{"status":"ready"}`. |
+| `GET /v1/models` | Prepared deployments not being removed, with input/output modalities and a `loom` capability object. |
+| `GET /v1/status` | Every registration, progress/errors, admission, scheduler state and shared server resources. |
+| `POST /v1/models/register` | Complete model document, optionally with uploaded source files; HTTP 202 accepts registration intent. |
+| `POST /v1/models/drain`, `POST /v1/models/undrain` | `{"model":"name"}`; HTTP 200 acknowledges the gate change. |
+| `POST /v1/models/unregister` | `{"model":"name","mode":"drain"}`; mode may instead be `"abort"`; HTTP 202 accepts removal. |
+| `POST /v1/models/activate`, `POST /v1/models/deactivate` | `{"model":"name","component":"primary"}`; HTTP 202 accepts a residency operation on a healthy drained registration. |
+| `POST /v1/models/pin`, `POST /v1/models/unpin` | Same component selector; HTTP 200 changes parameter eviction policy. |
+| `GET /v1/models/variants` | Native executable inventory or one candidate's retained compilation diagnostics. |
+| `POST /v1/models/variants` | Stage native providers against a ready base without selecting them. |
+| `POST /v1/models/variants/select` | Select a ready candidate with expected-current protection. |
+| `POST /v1/models/variants/remove` | Remove an unused terminal candidate. |
+| `POST /v1/devices/trim` | `{"device":0,"target_bytes":0}`; HTTP 200 schedules eligible reclamation and returns current resource accounting. |
+| `GET /metrics` | Prometheus text counters and ownership gauges. |
+| `GET /logz`, `GET /logz/stream` | Bounded JSONL polling or SSE with independent cursors. |
+| `GET /v1/requests`, `GET /v1/sessions` | Bounded live owner inspection; sessions require a retained-text service. |
+
+Prepared but drained or weight-evicted models remain discoverable.
+`created` is the registration timestamp; `owned_by` is `"local"`.
+`loom.kind`, optional `loom.endpoint`, and `loom.tokenize` describe the deployment
+role, HTTP inference route, and loaded tokenizer. Native-only activity models
+omit `loom.endpoint`; HTTP inference requests to them return 404. Management and
+tokenizer utilities remain available according to their normal capabilities.
+Text also reports configured `context_length` and
+`limits.max_output_tokens`, not training context or total cache-pool capacity.
+`loom.input_tokens:true` advertises exact prepared-chat input counting.
+Capabilities do not establish learned quality or support for every optional field.
+
+Residency controls default to `component:"primary"`. A text deployment with an
+image-input component also accepts `component:"image"`; an image-generation
+deployment's normal computation is still `primary`. An undeclared component
+returns 404; an invalid selector returns 400. Drain and unregister apply to the
+whole registration and do not accept a component selector.
+
+[Operation](workflows/operate-model-server.md) specifies asynchronous control
+completion, conflict and overload

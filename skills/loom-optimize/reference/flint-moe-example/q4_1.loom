@@ -1,0 +1,104 @@
+// GGML Q4_1: 32 values per 20-byte block = F16 scale d, F16 minimum m, then 16
+// bytes whose low nibbles are values 0-15 and high nibbles values 16-31.
+// value = d * q + m.
+
+// Partial dot of one lane's 32-value blocks of a Q4_1 row against x[token].
+func.def inline @flint_q4_1_row_dot(%w: buffer, %row_origin: offset, %x_view: view<[%tokens]x[%groups]x32xf32>, %tokens: index, %groups: index, %token: index, %lane: index, %lanes: index) -> (f32) {
+  %c0 = index.constant 0 : index
+  %c16 = index.constant 16 : index
+  %four = index.constant 4 : offset
+  %block_bytes = index.constant 20 : offset
+  %zero_f = scalar.constant 0.0 : f32
+  %mask = vector.constant 252645135 : vector<4xi32>
+  %shift4 = vector.constant 4 : vector<4xi32>
+  %bounded_token = index.assume %token [lt(%token, %tokens)] : index
+  %partial = scf.for %block = [%lane to %groups step %lanes](%sum = %zero_f : f32) -> (f32) {
+    %block_add = index.scale %block, %block_bytes : index, offset -> offset
+    %block_origin = index.add %row_origin, %block_add : offset
+    %code_origin = index.add %block_origin, %four : offset
+    %dm_view = buffer.view %w[%block_origin] : buffer -> view<2xf16>
+    %code_view = buffer.view %w[%code_origin] : buffer -> view<4xi32>
+    %d_half = view.load %dm_view[0] : view<2xf16> -> f16
+    %m_half = view.load %dm_view[1] : view<2xf16> -> f16
+    %d = scalar.extf %d_half : f16 to f32
+    %m = scalar.extf %m_half : f16 to f32
+    %packed = vector.load %code_view[0] : view<4xi32> -> vector<4xi32>
+    %lo_words = vector.andi %packed, %mask : vector<4xi32>
+    %hi_shift = vector.shrui %packed, %shift4 : vector<4xi32>
+    %hi_words = vector.andi %hi_shift, %mask : vector<4xi32>
+    %lo_bytes = vector.bitcast %lo_words : vector<4xi32> to vector<16xi8>
+    %hi_bytes = vector.bitcast %hi_words : vector<4xi32> to vector<16xi8>
+    %lo = vector.uitofp %lo_bytes : vector<16xi8> to vector<16xf32>
+    %hi = vector.uitofp %hi_bytes : vector<16xi8> to vector<16xf32>
+    %x_lo = vector.load %x_view[%bounded_token, %block, %c0] : view<[%tokens]x[%groups]x32xf32> -> vector<16xf32>
+    %x_hi = vector.load %x_view[%bounded_token, %block, %c16] : view<[%tokens]x[%groups]x32xf32> -> vector<16xf32>
+    %p_lo = vector.mulf %lo, %x_lo : vector<16xf32>
+    %p_qx = vector.fmaf %hi, %x_hi, %p_lo : vector<16xf32>
+    %qx = vector.reduce<addf> %p_qx, %zero_f : vector<16xf32>, f32
+    %x_sum_v = vector.addf %x_lo, %x_hi : vector<16xf32>
+    %xs = vector.reduce<addf> %x_sum_v, %zero_f : vector<16xf32>, f32
+    %scaled = scalar.fmaf %qx, %d, %sum : f32
+    %next = scalar.fmaf %xs, %m, %scaled : f32
+    scf.yield %next : f32
+  }
+  func.return %partial : f32
+}
+
+kernel.def export("flint_matmul_q4_1") @flint_matmul_q4_1(%n: index, %tokens: index) {
+  %c1 = index.constant 1 : index
+  %c32 = index.constant 32 : index
+  kernel.launch.config workgroups(%n, %tokens, %c1) workgroup_size(%c32, %c1, %c1) : index
+} launch(%k_arg: index, %n_arg: index, %tokens_arg: index, %accumulate: i32, %x: buffer, %w: buffer, %y: buffer) {
+  %k = index.assume %k_arg [range(%k_arg, 32, 65536)] : index
+  %n = index.assume %n_arg [range(%n_arg, 1, 262144)] : index
+  %tokens = index.assume %tokens_arg [range(%tokens_arg, 1, 8192)] : index
+  %row_id = kernel.workgroup.id<x> : index
+  %token_id = kernel.workgroup.id<y> : index
+  %row = index.assume %row_id [lt(%row_id, %n)] : index
+  %token = index.assume %token_id [lt(%token_id, %tokens)] : index
+  %lane = kernel.workitem.id<x> : index
+  %lanes = kernel.workgroup.size<x> : index
+  %c0 = index.constant 0 : index
+  %c32 = index.constant 32 : index
+  %zero = index.constant 0 : offset
+  %block_bytes = index.constant 20 : offset
+  %groups = index.div %k, %c32 : index
+  %row_bytes = index.scale %groups, %block_bytes : index, offset -> offset
+  %row_origin = index.scale %row, %row_bytes : index, offset -> offset
+  %x_view = buffer.view %x[%zero] : buffer -> view<[%tokens]x[%groups]x32xf32>
+  %partial = func.call @flint_q4_1_row_dot(%w, %row_origin, %x_view, %tokens, %groups, %token, %lane, %lanes) : (buffer, offset, view<[%tokens]x[%groups]x32xf32>, index, index, index, index, index) -> (f32)
+  %total = kernel.workgroup.reduce<addf> %partial : f32
+  %first = index.cmp eq, %lane, %c0 : index
+  scf.if %first {
+    func.call @flint_store_row(%y, %tokens, %n, %token, %row, %total, %accumulate) : (buffer, index, index, index, index, f32, i32)
+  }
+  kernel.return
+}
+
+// Embedding lookup from an F32 token table (2048 values per row).
+kernel.def export("flint_embed_f32") @flint_embed_f32(%tokens: index) {
+  %c1 = index.constant 1 : index
+  %c256 = index.constant 256 : index
+  kernel.launch.config workgroups(%tokens, %c1, %c1) workgroup_size(%c256, %c1, %c1) : index
+} launch(%tokens_arg: index, %ids: buffer, %w: buffer, %x: buffer) {
+  %tokens = index.assume %tokens_arg [range(%tokens_arg, 1, 8192)] : index
+  %token_id = kernel.workgroup.id<x> : index
+  %token = index.assume %token_id [lt(%token_id, %tokens)] : index
+  %lane_id = kernel.workitem.id<x> : index
+  %lane = index.assume %lane_id [range(%lane_id, 0, 255)] : index
+  %zero = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %ids_view = buffer.view %ids[%zero] : buffer -> view<[%tokens]xi32>
+  %raw = view.load %ids_view[%token] : view<[%tokens]xi32> -> i32
+  %c0_i32 = scalar.constant 0 : i32
+  %vocab_last = scalar.constant 150143 : i32
+  %low = scalar.maxsi %raw, %c0_i32 : i32
+  %clamped = scalar.minsi %low, %vocab_last : i32
+  %bounded = scalar.assume %clamped [range(%clamped, 0, 150143)] : i32
+  %id = index.cast %bounded : i32 to index
+  %table = buffer.view %w[%zero] : buffer -> view<150144x256x8xf32>
+  %values = vector.load %table[%id, %lane, %c0] : view<150144x256x8xf32> -> vector<8xf32>
+  %x_view = buffer.view %x[%zero] : buffer -> view<[%tokens]x256x8xf32>
+  vector.store %values, %x_view[%token, %lane, %c0] : vector<8xf32>, view<[%tokens]x256x8xf32>
+  kernel.return
+}

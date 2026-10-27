@@ -1,0 +1,215 @@
+// Flint quantized linear layers over GGUF weights.
+//
+// y[t, n] (+)= sum_k x[t, k] * W[n, k] for Q8_0 and Q4_K row-major weights.
+// One 32-lane workgroup computes one (output row, token); lanes stride over
+// 32-value groups and the workgroup reduces their partial dots. When
+// `accumulate` is nonzero the result is added to y (used for residual adds).
+
+// Q4_K affine metadata, from hrx-loom-library motif/format/ggml/q4_k.loom.
+func.def inline @flint_q4_k_unpack_scale_minimum(%packed_scales: vector<3xi32>, %group: index) -> (i32, i32) {
+  %bounded_group = index.assume %group [range(%group, 0, 7)] : index
+  %scale0 = vector.extract %packed_scales[0] : vector<3xi32> -> i32
+  %scale1 = vector.extract %packed_scales[1] : vector<3xi32> -> i32
+  %scale2 = vector.extract %packed_scales[2] : vector<3xi32> -> i32
+  %c4 = index.constant 4 : index
+  %c8 = index.constant 8 : index
+  %c2_i32 = scalar.constant 2 : i32
+  %c4_i32 = scalar.constant 4 : i32
+  %c15_i32 = scalar.constant 15 : i32
+  %c48_i32 = scalar.constant 48 : i32
+  %is_low_group = index.cmp ult, %bounded_group, %c4 : index
+  %lane = index.rem %bounded_group, %c4 : index
+  %shift_index = index.mul %lane, %c8 : index
+  %shift = index.cast %shift_index : index to i32
+  %high_shift = scalar.addi %shift, %c2_i32 : i32
+  %minimum_shift = scalar.addi %shift, %c4_i32 : i32
+  %scale_low_source = scf.select %is_low_group, %scale0, %scale2 : i32
+  %minimum_low_source = scf.select %is_low_group, %scale1, %scale2 : i32
+  %scale_high_shift = scf.select %is_low_group, %shift, %high_shift : i32
+  %minimum_low_shift = scf.select %is_low_group, %shift, %minimum_shift : i32
+  %scale_low_shifted = scalar.shrui %scale_low_source, %shift : i32
+  %scale_low = scalar.andi %scale_low_shifted, %c15_i32 : i32
+  %scale_high_shifted = scalar.shrui %scale0, %scale_high_shift : i32
+  %scale_high = scalar.andi %scale_high_shifted, %c48_i32 : i32
+  %scale = scalar.ori %scale_low, %scale_high : i32
+  %minimum_low_shifted = scalar.shrui %minimum_low_source, %minimum_low_shift : i32
+  %minimum_low = scalar.andi %minimum_low_shifted, %c15_i32 : i32
+  %minimum_high_shifted = scalar.shrui %scale1, %scale_high_shift : i32
+  %minimum_high = scalar.andi %minimum_high_shifted, %c48_i32 : i32
+  %minimum = scalar.ori %minimum_low, %minimum_high : i32
+  func.return %scale, %minimum : i32, i32
+}
+
+func.def inline @flint_q4_k_scaled_metadata(%header: vector<4xi32>, %group: index) -> (f32, f32) {
+  %halves = vector.bitcast %header : vector<4xi32> to vector<8xf16>
+  %d_half = vector.extract %halves[0] : vector<8xf16> -> f16
+  %minimum_half = vector.extract %halves[1] : vector<8xf16> -> f16
+  %d = scalar.extf %d_half : f16 to f32
+  %dmin = scalar.extf %minimum_half : f16 to f32
+  %first = vector.extract %header[1] : vector<4xi32> -> i32
+  %second = vector.extract %header[2] : vector<4xi32> -> i32
+  %third = vector.extract %header[3] : vector<4xi32> -> i32
+  %packed = vector.from_elements %first, %second, %third : vector<3xi32>
+  %scale, %minimum = func.call @flint_q4_k_unpack_scale_minimum(%packed, %group) : (vector<3xi32>, index) -> (i32, i32)
+  %scale_float = scalar.uitofp %scale : i32 to f32
+  %minimum_float = scalar.uitofp %minimum : i32 to f32
+  %scaled = scalar.mulf %d, %scale_float : f32
+  %minimum_scaled = scalar.mulf %dmin, %minimum_float : f32
+  func.return %scaled, %minimum_scaled : f32, f32
+}
+
+// Partial dot of one lane's 32-value groups of a Q8_0 row against x[token].
+func.def inline @flint_q8_0_row_dot(%w: buffer, %row_origin: offset, %x_view: view<[%tokens]x[%groups]x32xf32>, %tokens: index, %groups: index, %token: index, %lane: index, %lanes: index) -> (f32) {
+  %c0 = index.constant 0 : index
+  %two = index.constant 2 : offset
+  %block_bytes = index.constant 34 : offset
+  %zero_f = scalar.constant 0.0 : f32
+  %bounded_token = index.assume %token [lt(%token, %tokens)] : index
+  %partial = scf.for %block = [%lane to %groups step %lanes](%sum = %zero_f : f32) -> (f32) {
+    %block_add = index.scale %block, %block_bytes : index, offset -> offset
+    %block_origin = index.add %row_origin, %block_add : offset
+    %code_origin = index.add %block_origin, %two : offset
+    %scale_view = buffer.view %w[%block_origin] : buffer -> view<1xf16>
+    %code_view = buffer.view %w[%code_origin] : buffer -> view<32xi8>
+    %scale_half = view.load %scale_view[0] : view<1xf16> -> f16
+    %scale = scalar.extf %scale_half : f16 to f32
+    %codes = vector.load %code_view[0] : view<32xi8> -> vector<32xi8>
+    %values = vector.sitofp %codes : vector<32xi8> to vector<32xf32>
+    %inputs = vector.load %x_view[%bounded_token, %block, %c0] : view<[%tokens]x[%groups]x32xf32> -> vector<32xf32>
+    %products = vector.mulf %values, %inputs : vector<32xf32>
+    %dot = vector.reduce<addf> %products, %zero_f : vector<32xf32>, f32
+    %next = scalar.fmaf %dot, %scale, %sum : f32
+    scf.yield %next : f32
+  }
+  func.return %partial : f32
+}
+
+// Partial dot of one lane's 32-value groups of a Q4_K row against x[token].
+func.def inline @flint_q4_k_row_dot(%w: buffer, %row_origin: offset, %x_view: view<[%tokens]x[%groups]x32xf32>, %tokens: index, %groups: index, %token: index, %lane: index, %lanes: index) -> (f32) {
+  %c0 = index.constant 0 : index
+  %c2 = index.constant 2 : index
+  %c8 = index.constant 8 : index
+  %block_bytes = index.constant 144 : offset
+  %header_bytes = index.constant 16 : offset
+  %page_bytes = index.constant 32 : offset
+  %zero_f = scalar.constant 0.0 : f32
+  %nibble_mask = vector.constant 252645135 : vector<8xi32>
+  %bounded_token = index.assume %token [lt(%token, %tokens)] : index
+  %partial = scf.for %group = [%lane to %groups step %lanes](%sum = %zero_f : f32) -> (f32) {
+    %block = index.div %group, %c8 : index
+    %within = index.rem %group, %c8 : index
+    %block_add = index.scale %block, %block_bytes : index, offset -> offset
+    %block_origin = index.add %row_origin, %block_add : offset
+    %header_view = buffer.view %w[%block_origin] : buffer -> view<4xi32>
+    %header = vector.load %header_view[0] : view<4xi32> -> vector<4xi32>
+    %scale, %minimum = func.call @flint_q4_k_scaled_metadata(%header, %within) : (vector<4xi32>, index) -> (f32, f32)
+    %page = index.div %within, %c2 : index
+    %nibble = index.rem %within, %c2 : index
+    %page_add = index.scale %page, %page_bytes : index, offset -> offset
+    %payload = index.add %block_origin, %header_bytes : offset
+    %codes_origin = index.add %payload, %page_add : offset
+    %code_view = buffer.view %w[%codes_origin] : buffer -> view<8xi32>
+    %packed = vector.load %code_view[0] : view<8xi32> -> vector<8xi32>
+    %shift_index = index.mul %nibble, %c8 : index
+    %c4 = index.constant 4 : index
+    %shift_bits = index.mul %nibble, %c4 : index
+    %shift_i32 = index.cast %shift_bits : index to i32
+    %shift = vector.splat %shift_i32 : vector<8xi32>
+    %shifted = vector.shrui %packed, %shift : vector<8xi32>
+    %masked = vector.andi %shifted, %nibble_mask : vector<8xi32>
+    %bytes = vector.bitcast %masked : vector<8xi32> to vector<32xi8>
+    %values = vector.uitofp %bytes : vector<32xi8> to vector<32xf32>
+    %inputs = vector.load %x_view[%bounded_token, %group, %c0] : view<[%tokens]x[%groups]x32xf32> -> vector<32xf32>
+    %products = vector.mulf %values, %inputs : vector<32xf32>
+    %qx = vector.reduce<addf> %products, %zero_f : vector<32xf32>, f32
+    %xs = vector.reduce<addf> %inputs, %zero_f : vector<32xf32>, f32
+    %scaled = scalar.mulf %qx, %scale : f32
+    %offset_term = scalar.mulf %xs, %minimum : f32
+    %group_dot = scalar.subf %scaled, %offset_term : f32
+    %next = scalar.addf %sum, %group_dot : f32
+    scf.yield %next : f32
+  }
+  func.return %partial : f32
+}
+
+func.def inline @flint_store_row(%y: buffer, %tokens: index, %n: index, %token: index, %row: index, %value: f32, %accumulate: i32) {
+  %zero = index.constant 0 : offset
+  %c0_i32 = scalar.constant 0 : i32
+  %bounded_token = index.assume %token [lt(%token, %tokens)] : index
+  %bounded_row = index.assume %row [lt(%row, %n)] : index
+  %y_view = buffer.view %y[%zero] : buffer -> view<[%tokens]x[%n]xf32>
+  %add = scalar.cmpi ne, %accumulate, %c0_i32 : i32
+  %result = scf.if %add -> (f32) {
+    %old = view.load %y_view[%bounded_token, %bounded_row] : view<[%tokens]x[%n]xf32> -> f32
+    %sum = scalar.addf %old, %value : f32
+    scf.yield %sum : f32
+  } else {
+    scf.yield %value : f32
+  }
+  view.store %result, %y_view[%bounded_token, %bounded_row] : f32, view<[%tokens]x[%n]xf32>
+  func.return
+}
+
+kernel.def export("flint_matmul_q8_0") @flint_matmul_q8_0(%n: index, %tokens: index) {
+  %c1 = index.constant 1 : index
+  %c32 = index.constant 32 : index
+  kernel.launch.config workgroups(%n, %tokens, %c1) workgroup_size(%c32, %c1, %c1) : index
+} launch(%k_arg: index, %n_arg: index, %tokens_arg: index, %accumulate: i32, %x: buffer, %w: buffer, %y: buffer) {
+  %k = index.assume %k_arg [range(%k_arg, 32, 65536)] : index
+  %n = index.assume %n_arg [range(%n_arg, 1, 262144)] : index
+  %tokens = index.assume %tokens_arg [range(%tokens_arg, 1, 8192)] : index
+  %row_id = kernel.workgroup.id<x> : index
+  %token_id = kernel.workgroup.id<y> : index
+  %row = index.assume %row_id [lt(%row_id, %n)] : index
+  %token = index.assume %token_id [lt(%token_id, %tokens)] : index
+  %lane = kernel.workitem.id<x> : index
+  %lanes = kernel.workgroup.size<x> : index
+  %c0 = index.constant 0 : index
+  %c32 = index.constant 32 : index
+  %zero = index.constant 0 : offset
+  %block_bytes = index.constant 34 : offset
+  %groups = index.div %k, %c32 : index
+  %row_bytes = index.scale %groups, %block_bytes : index, offset -> offset
+  %row_origin = index.scale %row, %row_bytes : index, offset -> offset
+  %x_view = buffer.view %x[%zero] : buffer -> view<[%tokens]x[%groups]x32xf32>
+  %partial = func.call @flint_q8_0_row_dot(%w, %row_origin, %x_view, %tokens, %groups, %token, %lane, %lanes) : (buffer, offset, view<[%tokens]x[%groups]x32xf32>, index, index, index, index, index) -> (f32)
+  %total = kernel.workgroup.reduce<addf> %partial : f32
+  %first = index.cmp eq, %lane, %c0 : index
+  scf.if %first {
+    func.call @flint_store_row(%y, %tokens, %n, %token, %row, %total, %accumulate) : (buffer, index, index, index, index, f32, i32)
+  }
+  kernel.return
+}
+
+kernel.def export("flint_matmul_q4_k") @flint_matmul_q4_k(%n: index, %tokens: index) {
+  %c1 = index.constant 1 : index
+  %c32 = index.constant 32 : index
+  kernel.launch.config workgroups(%n, %tokens, %c1) workgroup_size(%c32, %c1, %c1) : index
+} launch(%k_arg: index, %n_arg: index, %tokens_arg: index, %accumulate: i32, %x: buffer, %w: buffer, %y: buffer) {
+  %k = index.assume %k_arg [range(%k_arg, 256, 65536)] : index
+  %n = index.assume %n_arg [range(%n_arg, 1, 262144)] : index
+  %tokens = index.assume %tokens_arg [range(%tokens_arg, 1, 8192)] : index
+  %row_id = kernel.workgroup.id<x> : index
+  %token_id = kernel.workgroup.id<y> : index
+  %row = index.assume %row_id [lt(%row_id, %n)] : index
+  %token = index.assume %token_id [lt(%token_id, %tokens)] : index
+  %lane = kernel.workitem.id<x> : index
+  %lanes = kernel.workgroup.size<x> : index
+  %c0 = index.constant 0 : index
+  %c32 = index.constant 32 : index
+  %c256 = index.constant 256 : index
+  %zero = index.constant 0 : offset
+  %block_bytes = index.constant 144 : offset
+  %groups = index.div %k, %c32 : index
+  %blocks = index.div %k, %c256 : index
+  %row_bytes = index.scale %blocks, %block_bytes : index, offset -> offset
+  %row_origin = index.scale %row, %row_bytes : index, offset -> offset
+  %x_view = buffer.view %x[%zero] : buffer -> view<[%tokens]x[%groups]x32xf32>
+  %partial = func.call @flint_q4_k_row_dot(%w, %row_origin, %x_view, %tokens, %groups, %token, %lane, %lanes) : (buffer, offset, view<[%tokens]x[%groups]x32xf32>, index, index, index, index, index) -> (f32)
+  %total = kernel.workgroup.reduce<addf> %partial : f32
+  %first = index.cmp eq, %lane, %c0 : index
+  scf.if %first {
+    func.call @flint_store_row(%y, %tokens, %n, %token, %row, %total, %accumulate) : (buffer, index, index, index, index, f32, i32)
+  }
+  kernel.return
+}

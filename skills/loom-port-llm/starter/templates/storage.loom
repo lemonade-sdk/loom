@@ -1,0 +1,129 @@
+// KV geometry: @@PLANES@@ planes (K and V per layer) of pool x @@POS_BYTES@@ bytes (F16 KV heads x 128 dims).
+func.def @allocation(%records: buffer, %slot: index, %bytes: i64, %clear: i64) {
+  %origin = index.constant 0 : offset
+  %bounded = index.assume %slot [range(%slot, 0, 10)] : index
+  %view = buffer.view %records[%origin] : buffer -> view<11x3xi64>
+  %alignment = scalar.constant 256 : i64
+  view.store %bytes, %view[%bounded, 0] : i64, view<11x3xi64>
+  view.store %alignment, %view[%bounded, 1] : i64, view<11x3xi64>
+  view.store %clear, %view[%bounded, 2] : i64, view<11x3xi64>
+  func.return
+}
+
+// KV is a stable prefix; private views and recurrent slots grow by appending.
+func.def public @llm_storage(%maximum: i64, %span_capacity: i64, %context: i64, %pool: i64, %rows: i64, %pins: i64) -> (buffer, buffer, buffer, buffer, buffer) {
+  %origin = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c0_i32 = scalar.constant 0 : i32
+  %c0_i64 = scalar.constant 0 : i64
+  %c1_i64 = scalar.constant 1 : i64
+  %c4_i64 = scalar.constant 4 : i64
+  %bounded_rows = scalar.assume %rows [range(%rows, 1, 2147483647)] : i64
+  %row_count = index.cast %bounded_rows : i64 to index
+  %slot_stride = scalar.constant 256 : i64
+  %token_bytes = scalar.muli %maximum, %c4_i64 : i64
+  %alignment_bias = scalar.constant 255 : i64
+  %biased_token_bytes = scalar.addi %token_bytes, %alignment_bias : i64
+  %token_slots = scalar.divui %biased_token_bytes, %slot_stride : i64
+  %padded_token_bytes = scalar.muli %token_slots, %slot_stride : i64
+  %progress_offset = scalar.addi %slot_stride, %padded_token_bytes : i64
+  %recurrent_offset = scalar.addi %progress_offset, %slot_stride : i64
+  %row_stride = scalar.addi %recurrent_offset, %slot_stride : i64
+  %pinned = scalar.cmpi ne, %pins, %c0_i64 : i64
+  %twice_rows = scalar.addi %rows, %rows : i64
+  %fork_slots = scalar.addi %twice_rows, %pins : i64
+  %slots = scf.select %pinned, %fork_slots, %rows : i64
+  %private_bytes = scalar.muli %slots, %row_stride : i64
+  %kv_position_bytes = scalar.constant @@POS_BYTES@@ : i64
+  %plane_count = scalar.constant @@PLANES@@ : i64
+  %plane_bytes = scalar.muli %pool, %kv_position_bytes : i64
+  %pool_bytes = scalar.muli %plane_bytes, %plane_count : i64
+  %biased_pool = scalar.addi %pool_bytes, %alignment_bias : i64
+  %pool_slots = scalar.divui %biased_pool, %slot_stride : i64
+  %private_origin = scalar.muli %pool_slots, %slot_stride : i64
+  %recurrent_origin = scalar.addi %private_origin, %recurrent_offset : i64
+  %arena_bytes = scalar.addi %private_origin, %private_bytes : i64
+  %c3_i64 = scalar.constant 3 : i64
+  %c15_i64 = scalar.constant 15 : i64
+  %c16_i64 = scalar.constant 16 : i64
+  %padded = scalar.addi %context, %c15_i64 : i64
+  %blocks = scalar.divui %padded, %c16_i64 : i64
+  %map_entries = scalar.muli %rows, %blocks : i64
+  %map_bytes = scalar.muli %map_entries, %c4_i64 : i64
+  %origin_stride = scalar.constant 40 : i64
+  %map_origin = scalar.muli %bounded_rows, %origin_stride : i64
+  %table_bytes = scalar.addi %map_origin, %map_bytes : i64
+  %allocation_bytes = index.constant 264 : offset
+  %allocations = buffer.alloca<private> align(8) %allocation_bytes : buffer
+  %allocation_count = index.constant 11 : index
+  scf.for %i = [%c0 to %allocation_count step %c1] {
+    func.call @allocation(%allocations, %i, %c0_i64, %c0_i64) : (buffer, index, i64, i64)
+  }
+  %residual_bytes = scalar.muli %span_capacity, %c4_i64 : i64
+  %header_bytes = scalar.constant 16 : i64
+  %record_bytes = scalar.constant 36 : i64
+  %plan_bytes = scalar.muli %span_capacity, %record_bytes : i64
+  %metadata_bytes = scalar.addi %header_bytes, %plan_bytes : i64
+  %c2 = index.constant 2 : index
+  %c3 = index.constant 3 : index
+  %c4 = index.constant 4 : index
+  %c5 = index.constant 5 : index
+  func.call @allocation(%allocations, %c0, %residual_bytes, %c0_i64) : (buffer, index, i64, i64)
+  func.call @allocation(%allocations, %c1, %arena_bytes, %c0_i64) : (buffer, index, i64, i64)
+  func.call @allocation(%allocations, %c2, %metadata_bytes, %c0_i64) : (buffer, index, i64, i64)
+  func.call @allocation(%allocations, %c3, %table_bytes, %c0_i64) : (buffer, index, i64, i64)
+  func.call @allocation(%allocations, %c4, %token_bytes, %c0_i64) : (buffer, index, i64, i64)
+  func.call @allocation(%allocations, %c5, %residual_bytes, %c0_i64) : (buffer, index, i64, i64)
+
+  %view_stride = index.constant 64 : offset
+  %view_bytes = index.scale %row_count, %view_stride : index, offset -> offset
+  %views = buffer.alloca<private> align(8) %view_bytes : buffer
+  %view_records = buffer.view %views[%origin] : buffer -> view<[%row_count]x4x2xi64>
+  %origin_bytes = index.cast %map_origin : i64 to offset
+  %origins = buffer.alloca<private> align(8) %origin_bytes : buffer
+  buffer.fill %c0_i32, %origins[%origin], %origin_bytes : i32
+  %origin_records = buffer.view %origins[%origin] : buffer -> view<[%row_count]x5xi64>
+  %control_bytes = scalar.constant 12 : i64
+  %progress_bytes = scalar.constant 32 : i64
+  scf.for %row = [%c0 to %row_count step %c1] {
+    %row64 = index.cast %row : index to i64
+    %relative = scalar.muli %row64, %row_stride : i64
+    %base = scalar.addi %private_origin, %relative : i64
+    %tokens = scalar.addi %base, %slot_stride : i64
+    %progress = scalar.addi %base, %progress_offset : i64
+    view.store %base, %view_records[%row, 0, 0] : i64, view<[%row_count]x4x2xi64>
+    view.store %control_bytes, %view_records[%row, 0, 1] : i64, view<[%row_count]x4x2xi64>
+    view.store %c0_i64, %view_records[%row, 1, 0] : i64, view<[%row_count]x4x2xi64>
+    view.store %c0_i64, %view_records[%row, 1, 1] : i64, view<[%row_count]x4x2xi64>
+    view.store %tokens, %view_records[%row, 2, 0] : i64, view<[%row_count]x4x2xi64>
+    view.store %token_bytes, %view_records[%row, 2, 1] : i64, view<[%row_count]x4x2xi64>
+    view.store %progress, %view_records[%row, 3, 0] : i64, view<[%row_count]x4x2xi64>
+    view.store %progress_bytes, %view_records[%row, 3, 1] : i64, view<[%row_count]x4x2xi64>
+    view.store %c0_i64, %origin_records[%row, 2] : i64, view<[%row_count]x5xi64>
+    %map_stride = scalar.muli %blocks, %c4_i64 : i64
+    %map_offset = scalar.muli %row64, %map_stride : i64
+    %map_base = scalar.addi %map_origin, %map_offset : i64
+    view.store %map_base, %origin_records[%row, 4] : i64, view<[%row_count]x5xi64>
+  }
+  %geometry_bytes = index.constant 104 : offset
+  %geometry = buffer.alloca<private> align(8) %geometry_bytes : buffer
+  %geometry_view = buffer.view %geometry[%origin] : buffer -> view<13xi64>
+  view.store %c16_i64, %geometry_view[0] : i64, view<13xi64>
+  view.store %map_origin, %geometry_view[1] : i64, view<13xi64>
+  view.store %c0_i64, %geometry_view[2] : i64, view<13xi64>
+  view.store %c4_i64, %geometry_view[3] : i64, view<13xi64>
+  view.store %recurrent_origin, %geometry_view[4] : i64, view<13xi64>
+  view.store %row_stride, %geometry_view[5] : i64, view<13xi64>
+  view.store %c4_i64, %geometry_view[6] : i64, view<13xi64>
+  view.store %slots, %geometry_view[7] : i64, view<13xi64>
+  view.store %c1_i64, %geometry_view[8] : i64, view<13xi64>
+  view.store %c0_i64, %geometry_view[9] : i64, view<13xi64>
+  view.store %plane_count, %geometry_view[10] : i64, view<13xi64>
+  view.store %plane_bytes, %geometry_view[11] : i64, view<13xi64>
+  %block_bytes = scalar.constant @@BLOCK_BYTES@@ : i64
+  view.store %block_bytes, %geometry_view[12] : i64, view<13xi64>
+  %empty_bytes = index.constant 0 : offset
+  %empty = buffer.alloca<private> align(1) %empty_bytes : buffer
+  func.return %allocations, %views, %origins, %empty, %geometry : buffer, buffer, buffer, buffer, buffer
+}

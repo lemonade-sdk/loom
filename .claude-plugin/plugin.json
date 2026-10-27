@@ -1,0 +1,8 @@
+{
+  "name": "loom",
+  "description": "Skills for AMD Loom (hrx-loom / loom-serve): install, fetch and serve catalog models, a web playground, port any GGUF LLM to Loom, optimize it while preserving correctness, and benchmark it against llama.cpp ROCm.",
+  "author": { "name": "Lemonade SDK" },
+  "homepage": "https://github.com/lemonade-sdk/loom",
+  "repository": "https://github.com/lemonade-sdk/loom",
+  "keywords": ["amd", "loom", "rocm", "strix-halo", "llm", "inference", "benchmark"]
+}

@@ -1,0 +1,1062 @@
+// Fused decode-oriented kernels: fewer launches and coalesced router reads.
+
+// Router logits: 8 workgroups x 8 subgroups x 4 experts per token. Each
+// 32-lane subgroup reads one contiguous 8 KiB expert row (64 values per lane).
+kernel.def export("flint_router_logits") @flint_router_logits(%tokens: index) {
+  %c1 = index.constant 1 : index
+  %c8 = index.constant 8 : index
+  %c256 = index.constant 256 : index
+  kernel.launch.config workgroups(%c8, %tokens, %c1) workgroup_size(%c256, %c1, %c1) : index
+} launch(%tokens_arg: index, %h: buffer, %w: buffer, %logits: buffer) {
+  %tokens = index.assume %tokens_arg [range(%tokens_arg, 1, 8192)] : index
+  %group_id = kernel.workgroup.id<x> : index
+  %group = index.assume %group_id [range(%group_id, 0, 7)] : index
+  %token_id = kernel.workgroup.id<y> : index
+  %token = index.assume %token_id [lt(%token_id, %tokens)] : index
+  %local = kernel.workitem.id<x> : index
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c4 = index.constant 4 : index
+  %c32 = index.constant 32 : index
+  %zero = index.constant 0 : offset
+  %zero_f = scalar.constant 0.0 : f32
+  %sub_value = index.div %local, %c32 : index
+  %sub = index.assume %sub_value [range(%sub_value, 0, 7)] : index
+  %lane_value = index.rem %local, %c32 : index
+  %lane = index.assume %lane_value [range(%lane_value, 0, 31)] : index
+  %h_view = buffer.view %h[%zero] : buffer -> view<[%tokens]x32x64xf32>
+  %w_view = buffer.view %w[%zero] : buffer -> view<256x32x64xf32>
+  %out = buffer.view %logits[%zero] : buffer -> view<[%tokens]x256xf32>
+  %hv = vector.load %h_view[%token, %lane, %c0] : view<[%tokens]x32x64xf32> -> vector<64xf32>
+  %base_a = index.mul %group, %c32 : index
+  %sub4 = index.mul %sub, %c4 : index
+  %base = index.add %base_a, %sub4 : index
+  scf.for %i = [%c0 to %c4 step %c1] {
+    %expert_value = index.add %base, %i : index
+    %expert = index.assume %expert_value [range(%expert_value, 0, 255)] : index
+    %wv = vector.load %w_view[%expert, %lane, %c0] : view<256x32x64xf32> -> vector<64xf32>
+    %prod = vector.mulf %hv, %wv : vector<64xf32>
+    %part = vector.reduce<addf> %prod, %zero_f : vector<64xf32>, f32
+    %logit = kernel.subgroup.reduce<addf> %part : f32
+    %first = index.cmp eq, %lane, %c0 : index
+    scf.if %first {
+      view.store %logit, %out[%token, %expert] : f32, view<[%tokens]x256xf32>
+    }
+  }
+  kernel.return
+}
+
+// Sigmoid top-6 with renormalization over precomputed router logits.
+kernel.def export("flint_router_topk") @flint_router_topk(%tokens: index) {
+  %c1 = index.constant 1 : index
+  %c256 = index.constant 256 : index
+  kernel.launch.config workgroups(%tokens, %c1, %c1) workgroup_size(%c256, %c1, %c1) : index
+} launch(%tokens_arg: index, %logits: buffer, %ids: buffer, %weights: buffer) {
+  %tokens = index.assume %tokens_arg [range(%tokens_arg, 1, 8192)] : index
+  %token_id = kernel.workgroup.id<x> : index
+  %token = index.assume %token_id [lt(%token_id, %tokens)] : index
+  %lane_id = kernel.workitem.id<x> : index
+  %lane = index.assume %lane_id [range(%lane_id, 0, 255)] : index
+  %zero = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c6 = index.constant 6 : index
+  %zero_f = scalar.constant 0.0 : f32
+  %one_f = scalar.constant 1.0 : f32
+  %in = buffer.view %logits[%zero] : buffer -> view<[%tokens]x256xf32>
+  %logit = view.load %in[%token, %lane] : view<[%tokens]x256xf32> -> f32
+  %negated = scalar.negf %logit : f32
+  %exp = scalar.expf<afn> %negated : f32
+  %denominator = scalar.addf %one_f, %exp : f32
+  %probability = scalar.divf %one_f, %denominator : f32
+  %ids_view = buffer.view %ids[%zero] : buffer -> view<[%tokens]x8xi32>
+  %weights_view = buffer.view %weights[%zero] : buffer -> view<[%tokens]x8xf32>
+  %lane32 = index.cast %lane : index to i32
+  %removed = scalar.constant -1.0 : f32
+  %big_id = scalar.constant 1000000 : i32
+  %remaining, %total = scf.for %round = [%c0 to %c6 step %c1](%p = %probability : f32, %sum = %zero_f : f32) -> (f32, f32) {
+    %best = kernel.workgroup.reduce<maxnumf> %p : f32
+    %is_best = scalar.cmpf oeq, %p, %best : f32
+    %candidate = scf.select %is_best, %lane32, %big_id : i32
+    %winner = kernel.workgroup.reduce<minsi> %candidate : i32
+    %won = scalar.cmpi eq, %winner, %lane32 : i32
+    %bounded_round = index.assume %round [range(%round, 0, 5)] : index
+    scf.if %won {
+      view.store %lane32, %ids_view[%token, %bounded_round] : i32, view<[%tokens]x8xi32>
+      view.store %p, %weights_view[%token, %bounded_round] : f32, view<[%tokens]x8xf32>
+    }
+    %next_p = scf.select %won, %removed, %p : f32
+    %next_sum = scalar.addf %sum, %best : f32
+    scf.yield %next_p, %next_sum : f32, f32
+  }
+  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+  %first = index.cmp ult, %lane, %c6 : index
+  scf.if %first {
+    %bounded = index.assume %lane [range(%lane, 0, 5)] : index
+    %w0 = view.load %weights_view[%token, %bounded] : view<[%tokens]x8xf32> -> f32
+    %normalized = scalar.divf %w0, %total : f32
+    view.store %normalized, %weights_view[%token, %bounded] : f32, view<[%tokens]x8xf32>
+  }
+  kernel.return
+}
+
+// Q, K and V projections in one launch: rows [0, 4096) are Q, [4096, 4608)
+// K and [4608, 5120) V.
+kernel.def export("flint_qkv_q8_0") @flint_qkv_q8_0(%tokens: index) {
+  %c1 = index.constant 1 : index
+  %c32 = index.constant 32 : index
+  %c5120 = index.constant 5120 : index
+  kernel.launch.config workgroups(%c5120, %tokens, %c1) workgroup_size(%c32, %c1, %c1) : index
+} launch(%tokens_arg: index, %x: buffer, %wq: buffer, %wk: buffer, %wv: buffer, %q: buffer, %k: buffer, %v: buffer) {
+  %tokens = index.assume %tokens_arg [range(%tokens_arg, 1, 8192)] : index
+  %row_id = kernel.workgroup.id<x> : index
+  %row = index.assume %row_id [range(%row_id, 0, 5119)] : index
+  %token_id = kernel.workgroup.id<y> : index
+  %token = index.assume %token_id [lt(%token_id, %tokens)] : index
+  %lane = kernel.workitem.id<x> : index
+  %lanes = kernel.workgroup.size<x> : index
+  %c0 = index.constant 0 : index
+  %c64 = index.constant 64 : index
+  %c512 = index.constant 512 : index
+  %c4096 = index.constant 4096 : index
+  %c4608 = index.constant 4608 : index
+  %zero = index.constant 0 : offset
+  %zero_i32 = scalar.constant 0 : i32
+  %row_bytes = index.constant 2176 : offset
+  %x_view = buffer.view %x[%zero] : buffer -> view<[%tokens]x[%c64]x32xf32>
+  %is_q = index.cmp ult, %row, %c4096 : index
+  %first = index.cmp eq, %lane, %c0 : index
+  scf.if %is_q {
+    %origin = index.scale %row, %row_bytes : index, offset -> offset
+    %part = func.call @flint_q8_0_row_dot(%wq, %origin, %x_view, %tokens, %c64, %token, %lane, %lanes) : (buffer, offset, view<[%tokens]x[%c64]x32xf32>, index, index, index, index, index) -> (f32)
+    %total = kernel.workgroup.reduce<addf> %part : f32
+    scf.if %first {
+      func.call @flint_store_row(%q, %tokens, %c4096, %token, %row, %total, %zero_i32) : (buffer, index, index, index, index, f32, i32)
+    }
+  } else {
+    %is_k = index.cmp ult, %row, %c4608 : index
+    %local_k = index.sub %row, %c4096 : index
+    %local_v = index.sub %row, %c4608 : index
+    %local = scf.select %is_k, %local_k, %local_v : index
+    %bounded = index.assume %local [range(%local, 0, 511)] : index
+    %origin = index.scale %bounded, %row_bytes : index, offset -> offset
+    scf.if %is_k {
+      %part = func.call @flint_q8_0_row_dot(%wk, %origin, %x_view, %tokens, %c64, %token, %lane, %lanes) : (buffer, offset, view<[%tokens]x[%c64]x32xf32>, index, index, index, index, index) -> (f32)
+      %total = kernel.workgroup.reduce<addf> %part : f32
+      scf.if %first {
+        func.call @flint_store_row(%k, %tokens, %c512, %token, %bounded, %total, %zero_i32) : (buffer, index, index, index, index, f32, i32)
+      }
+    } else {
+      %part = func.call @flint_q8_0_row_dot(%wv, %origin, %x_view, %tokens, %c64, %token, %lane, %lanes) : (buffer, offset, view<[%tokens]x[%c64]x32xf32>, index, index, index, index, index) -> (f32)
+      %total = kernel.workgroup.reduce<addf> %part : f32
+      scf.if %first {
+        func.call @flint_store_row(%v, %tokens, %c512, %token, %bounded, %total, %zero_i32) : (buffer, index, index, index, index, f32, i32)
+      }
+    }
+  }
+  kernel.return
+}
+
+func.def inline @flint_silu_mul(%g: f32, %u: f32) -> (f32) {
+  %one = scalar.constant 1.0 : f32
+  %neg = scalar.negf %g : f32
+  %e = scalar.expf<afn> %neg : f32
+  %den = scalar.addf %one, %e : f32
+  %silu = scalar.divf %g, %den : f32
+  %value = scalar.mulf %silu, %u : f32
+  func.return %value : f32
+}
+
+// out[t, j] = silu(gate[j] . x[t]) * (up[j] . x[t]) for Q8_0 rows of 2048.
+kernel.def export("flint_gate_up_q8_0") @flint_gate_up_q8_0(%n: index, %tokens: index) {
+  %c1 = index.constant 1 : index
+  %c32 = index.constant 32 : index
+  kernel.launch.config workgroups(%n, %tokens, %c1) workgroup_size(%c32, %c1, %c1) : index
+} launch(%n_arg: index, %tokens_arg: index, %x: buffer, %gate: buffer, %up: buffer, %out: buffer) {
+  %n = index.assume %n_arg [range(%n_arg, 1, 65536)] : index
+  %tokens = index.assume %tokens_arg [range(%tokens_arg, 1, 8192)] : index
+  %row_id = kernel.workgroup.id<x> : index
+  %row = index.assume %row_id [lt(%row_id, %n)] : index
+  %token_id = kernel.workgroup.id<y> : index
+  %token = index.assume %token_id [lt(%token_id, %tokens)] : index
+  %lane = kernel.workitem.id<x> : index
+  %lanes = kernel.workgroup.size<x> : index
+  %c0 = index.constant 0 : index
+  %c64 = index.constant 64 : index
+  %zero = index.constant 0 : offset
+  %zero_i32 = scalar.constant 0 : i32
+  %row_bytes = index.constant 2176 : offset
+  %origin = index.scale %row, %row_bytes : index, offset -> offset
+  %x_view = buffer.view %x[%zero] : buffer -> view<[%tokens]x[%c64]x32xf32>
+  %gp = func.call @flint_q8_0_row_dot(%gate, %origin, %x_view, %tokens, %c64, %token, %lane, %lanes) : (buffer, offset, view<[%tokens]x[%c64]x32xf32>, index, index, index, index, index) -> (f32)
+  %upp = func.call @flint_q8_0_row_dot(%up, %origin, %x_view, %tokens, %c64, %token, %lane, %lanes) : (buffer, offset, view<[%tokens]x[%c64]x32xf32>, index, index, index, index, index) -> (f32)
+  %g = kernel.workgroup.reduce<addf> %gp : f32
+  %u = kernel.workgroup.reduce<addf> %upp : f32
+  %first = index.cmp eq, %lane, %c0 : index
+  scf.if %first {
+    %value = func.call @flint_silu_mul(%g, %u) : (f32, f32) -> (f32)
+    func.call @flint_store_row(%out, %tokens, %n, %token, %row, %value, %zero_i32) : (buffer, index, index, index, index, f32, i32)
+  }
+  kernel.return
+}
+
+// Same as flint_gate_up_q8_0 for the dense Q4_K FFN (rows of 2048).
+kernel.def export("flint_gate_up_q4_k") @flint_gate_up_q4_k(%n: index, %tokens: index) {
+  %c1 = index.constant 1 : index
+  %c32 = index.constant 32 : index
+  kernel.launch.config workgroups(%n, %tokens, %c1) workgroup_size(%c32, %c1, %c1) : index
+} launch(%n_arg: index, %tokens_arg: index, %x: buffer, %gate: buffer, %up: buffer, %out: buffer) {
+  %n = index.assume %n_arg [range(%n_arg, 1, 65536)] : index
+  %tokens = index.assume %tokens_arg [range(%tokens_arg, 1, 8192)] : index
+  %row_id = kernel.workgroup.id<x> : index
+  %row = index.assume %row_id [lt(%row_id, %n)] : index
+  %token_id = kernel.workgroup.id<y> : index
+  %token = index.assume %token_id [lt(%token_id, %tokens)] : index
+  %lane = kernel.workitem.id<x> : index
+  %lanes = kernel.workgroup.size<x> : index
+  %c0 = index.constant 0 : index
+  %c64 = index.constant 64 : index
+  %zero = index.constant 0 : offset
+  %zero_i32 = scalar.constant 0 : i32
+  %row_bytes = index.constant 1152 : offset
+  %origin = index.scale %row, %row_bytes : index, offset -> offset
+  %x_view = buffer.view %x[%zero] : buffer -> view<[%tokens]x[%c64]x32xf32>
+  %gp = func.call @flint_q4_k_row_dot(%gate, %origin, %x_view, %tokens, %c64, %token, %lane, %lanes) : (buffer, offset, view<[%tokens]x[%c64]x32xf32>, index, index, index, index, index) -> (f32)
+  %upp = func.call @flint_q4_k_row_dot(%up, %origin, %x_view, %tokens, %c64, %token, %lane, %lanes) : (buffer, offset, view<[%tokens]x[%c64]x32xf32>, index, index, index, index, index) -> (f32)
+  %g = kernel.workgroup.reduce<addf> %gp : f32
+  %u = kernel.workgroup.reduce<addf> %upp : f32
+  %first = index.cmp eq, %lane, %c0 : index
+  scf.if %first {
+    %value = func.call @flint_silu_mul(%g, %u) : (f32, f32) -> (f32)
+    func.call @flint_store_row(%out, %tokens, %n, %token, %row, %value, %zero_i32) : (buffer, index, index, index, index, f32, i32)
+  }
+  kernel.return
+}
+
+// x[t, r] += sum_slot weight * (down_e[r] . act[t, slot]) + (down_shared[r] . shared[t]).
+kernel.def export("flint_moe_down") @flint_moe_down(%tokens: index) {
+  %c1 = index.constant 1 : index
+  %c32 = index.constant 32 : index
+  %c2048 = index.constant 2048 : index
+  kernel.launch.config workgroups(%c2048, %tokens, %c1) workgroup_size(%c32, %c1, %c1) : index
+} launch(%tokens_arg: index, %act: buffer, %ids: buffer, %weights: buffer, %down: buffer, %shared: buffer, %down_shared: buffer, %x: buffer) {
+  %tokens = index.assume %tokens_arg [range(%tokens_arg, 1, 8192)] : index
+  %row_id = kernel.workgroup.id<x> : index
+  %row = index.assume %row_id [range(%row_id, 0, 2047)] : index
+  %token_id = kernel.workgroup.id<y> : index
+  %token = index.assume %token_id [lt(%token_id, %tokens)] : index
+  %lane = kernel.workitem.id<x> : index
+  %lanes = kernel.workgroup.size<x> : index
+  %zero = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c6 = index.constant 6 : index
+  %c16 = index.constant 16 : index
+  %c32 = index.constant 32 : index
+  %zero_f = scalar.constant 0.0 : f32
+  %c0_i32 = scalar.constant 0 : i32
+  %c255_i32 = scalar.constant 255 : i32
+  %ids_view = buffer.view %ids[%zero] : buffer -> view<[%tokens]x8xi32>
+  %weights_view = buffer.view %weights[%zero] : buffer -> view<[%tokens]x8xf32>
+  %slots = index.mul %tokens, %c6 : index
+  %act_view = buffer.view %act[%zero] : buffer -> view<[%slots]x[%c16]x32xf32>
+  %expert_bytes = index.constant 589824 : offset
+  %row_bytes = index.constant 288 : offset
+  %row_add = index.scale %row, %row_bytes : index, offset -> offset
+  %routed = scf.for %slot = [%c0 to %c6 step %c1](%acc = %zero_f : f32) -> (f32) {
+    %bounded_slot = index.assume %slot [range(%slot, 0, 5)] : index
+    %expert32 = view.load %ids_view[%token, %bounded_slot] : view<[%tokens]x8xi32> -> i32
+    %weight = view.load %weights_view[%token, %bounded_slot] : view<[%tokens]x8xf32> -> f32
+    %expert_low = scalar.maxsi %expert32, %c0_i32 : i32
+    %expert_clamped = scalar.minsi %expert_low, %c255_i32 : i32
+    %expert_bound = scalar.assume %expert_clamped [range(%expert_clamped, 0, 255)] : i32
+    %expert = index.cast %expert_bound : i32 to index
+    %expert_origin = index.scale %expert, %expert_bytes : index, offset -> offset
+    %row_origin = index.add %expert_origin, %row_add : offset
+    %slot_row_value = index.madd %token, %c6, %bounded_slot : index
+    %slot_row = index.assume %slot_row_value [lt(%slot_row_value, %slots)] : index
+    %part = func.call @flint_q4_k_row_dot(%down, %row_origin, %act_view, %slots, %c16, %slot_row, %lane, %lanes) : (buffer, offset, view<[%slots]x[%c16]x32xf32>, index, index, index, index, index) -> (f32)
+    %next = scalar.fmaf %weight, %part, %acc : f32
+    scf.yield %next : f32
+  }
+  %shared_bytes = index.constant 1088 : offset
+  %shared_origin = index.scale %row, %shared_bytes : index, offset -> offset
+  %shared_view = buffer.view %shared[%zero] : buffer -> view<[%tokens]x[%c32]x32xf32>
+  %shared_part = func.call @flint_q8_0_row_dot(%down_shared, %shared_origin, %shared_view, %tokens, %c32, %token, %lane, %lanes) : (buffer, offset, view<[%tokens]x[%c32]x32xf32>, index, index, index, index, index) -> (f32)
+  %lane_total = scalar.addf %routed, %shared_part : f32
+  %total = kernel.workgroup.reduce<addf> %lane_total : f32
+  %first = index.cmp eq, %lane, %c0 : index
+  scf.if %first {
+    %c2048 = index.constant 2048 : index
+    %one = scalar.constant 1 : i32
+    func.call @flint_store_row(%x, %tokens, %c2048, %token, %row, %total, %one) : (buffer, index, index, index, index, f32, i32)
+  }
+  kernel.return
+}
+
+// Partial Q8_0 row dot with x scaled elementwise by a norm weight:
+// sum_k W[k] * x[k] * g[k] over this lane's 32-value blocks.
+func.def inline @flint_q8_0_row_dot_scaled(%w: buffer, %row_origin: offset, %x_view: view<[%tokens]x[%groups]x32xf32>, %g_view: view<[%groups]x32xf32>, %tokens: index, %groups: index, %token: index, %lane: index, %lanes: index) -> (f32) {
+  %c0 = index.constant 0 : index
+  %two = index.constant 2 : offset
+  %block_bytes = index.constant 34 : offset
+  %zero_f = scalar.constant 0.0 : f32
+  %bounded_token = index.assume %token [lt(%token, %tokens)] : index
+  %partial = scf.for %block = [%lane to %groups step %lanes](%sum = %zero_f : f32) -> (f32) {
+    %block_add = index.scale %block, %block_bytes : index, offset -> offset
+    %block_origin = index.add %row_origin, %block_add : offset
+    %code_origin = index.add %block_origin, %two : offset
+    %scale_view = buffer.view %w[%block_origin] : buffer -> view<1xf16>
+    %code_view = buffer.view %w[%code_origin] : buffer -> view<32xi8>
+    %scale_half = view.load %scale_view[0] : view<1xf16> -> f16
+    %scale = scalar.extf %scale_half : f16 to f32
+    %codes = vector.load %code_view[0] : view<32xi8> -> vector<32xi8>
+    %values = vector.sitofp %codes : vector<32xi8> to vector<32xf32>
+    %inputs = vector.load %x_view[%bounded_token, %block, %c0] : view<[%tokens]x[%groups]x32xf32> -> vector<32xf32>
+    %gains = vector.load %g_view[%block, %c0] : view<[%groups]x32xf32> -> vector<32xf32>
+    %normed = vector.mulf %inputs, %gains : vector<32xf32>
+    %products = vector.mulf %values, %normed : vector<32xf32>
+    %dot = vector.reduce<addf> %products, %zero_f : vector<32xf32>, f32
+    %next = scalar.fmaf %dot, %scale, %sum : f32
+    scf.yield %next : f32
+  }
+  func.return %partial : f32
+}
+
+// 1 / rms(x[token]) over 2048 channels with a 256-lane workgroup.
+func.def inline @flint_inverse_rms(%x: buffer, %tokens: index, %token: index, %lane: index) -> (f32) {
+  %zero = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %zero_f = scalar.constant 0.0 : f32
+  %bounded_token = index.assume %token [lt(%token, %tokens)] : index
+  %bounded_lane = index.assume %lane [range(%lane, 0, 255)] : index
+  %x_view = buffer.view %x[%zero] : buffer -> view<[%tokens]x256x8xf32>
+  %values = vector.load %x_view[%bounded_token, %bounded_lane, %c0] : view<[%tokens]x256x8xf32> -> vector<8xf32>
+  %squares = vector.mulf %values, %values : vector<8xf32>
+  %local = vector.reduce<addf> %squares, %zero_f : vector<8xf32>, f32
+  %sum = kernel.workgroup.reduce<addf> %local : f32
+  %count = scalar.constant 2048.0 : f32
+  %eps = scalar.constant 1.0e-6 : f32
+  %mean = scalar.divf %sum, %count : f32
+  %stable = scalar.addf %mean, %eps : f32
+  %inverse = scalar.rsqrtf %stable : f32
+  func.return %inverse : f32
+}
+
+// Attention norm + Q/K/V projection + per-head Q/K norm + NeoX RoPE + KV store.
+// Workgroup (head, token) with 256 lanes: heads 0-31 are Q, 32-35 K, 36-39 V.
+// Eight 32-lane subgroups each project 16 of the head's 128 rows.
+kernel.def export("flint_qkv_rope") @flint_qkv_rope(%tokens: index) {
+  %c1 = index.constant 1 : index
+  %c40 = index.constant 40 : index
+  %c256 = index.constant 256 : index
+  kernel.launch.config workgroups(%c40, %tokens, %c1) workgroup_size(%c256, %c1, %c1) : index
+} launch(%tokens_arg: index, %layer_arg: index, %rope: i32, %context_arg: index, %pool_arg: index, %x: buffer, %norm: buffer, %wq: buffer, %wk: buffer, %wv: buffer, %q_norm: buffer, %k_norm: buffer, %q: buffer, %info: buffer, %origins: buffer, %arena: buffer) {
+  %tokens = index.assume %tokens_arg [range(%tokens_arg, 1, 8192)] : index
+  %layer = index.assume %layer_arg [range(%layer_arg, 0, 48)] : index
+  %context = index.assume %context_arg [range(%context_arg, 16, 262144)] : index
+  %pool = index.assume %pool_arg [range(%pool_arg, 16, 1048576)] : index
+  %head_id = kernel.workgroup.id<x> : index
+  %head = index.assume %head_id [range(%head_id, 0, 39)] : index
+  %token_id = kernel.workgroup.id<y> : index
+  %token = index.assume %token_id [lt(%token_id, %tokens)] : index
+  %local = kernel.workitem.id<x> : index
+  %zero = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c4 = index.constant 4 : index
+  %c15 = index.constant 15 : index
+  %c16 = index.constant 16 : index
+  %c32 = index.constant 32 : index
+  %c36 = index.constant 36 : index
+  %c64 = index.constant 64 : index
+  %c128 = index.constant 128 : index
+  %c0_i32 = scalar.constant 0 : i32
+  %sub_value = index.div %local, %c32 : index
+  %sub = index.assume %sub_value [range(%sub_value, 0, 7)] : index
+  %lane_value = index.rem %local, %c32 : index
+  %lane = index.assume %lane_value [range(%lane_value, 0, 31)] : index
+  %inverse = func.call @flint_inverse_rms(%x, %tokens, %token, %local) : (buffer, index, index, index) -> (f32)
+  %x_view = buffer.view %x[%zero] : buffer -> view<[%tokens]x[%c64]x32xf32>
+  %g_view = buffer.view %norm[%zero] : buffer -> view<[%c64]x32xf32>
+  %row_bytes = index.constant 2176 : offset
+  %head_bytes = index.constant 278528 : offset
+  %is_q = index.cmp ult, %head, %c32 : index
+  %is_k = index.cmp ult, %head, %c36 : index
+  %k_head = index.sub %head, %c32 : index
+  %v_head = index.sub %head, %c36 : index
+  %kv_value = scf.select %is_k, %k_head, %v_head : index
+  %local_head_value = scf.select %is_q, %head, %kv_value : index
+  %local_head = index.assume %local_head_value [range(%local_head_value, 0, 31)] : index
+  %head_origin = index.scale %local_head, %head_bytes : index, offset -> offset
+  %values_bytes = index.constant 512 : offset
+  %values = buffer.alloca<workgroup> align(16) %values_bytes : buffer
+  %values_view = buffer.view %values[%zero] : buffer -> view<128xf32>
+  %first_row = index.mul %sub, %c16 : index
+  scf.for %r = [%c0 to %c16 step %c1] {
+    %row_value = index.add %first_row, %r : index
+    %row = index.assume %row_value [range(%row_value, 0, 127)] : index
+    %row_add = index.scale %row, %row_bytes : index, offset -> offset
+    %origin = index.add %head_origin, %row_add : offset
+    %part = scf.if %is_q -> (f32) {
+      %p = func.call @flint_q8_0_row_dot_scaled(%wq, %origin, %x_view, %g_view, %tokens, %c64, %token, %lane, %c32) : (buffer, offset, view<[%tokens]x[%c64]x32xf32>, view<[%c64]x32xf32>, index, index, index, index, index) -> (f32)
+      scf.yield %p : f32
+    } else {
+      %p = scf.if %is_k -> (f32) {
+        %pk = func.call @flint_q8_0_row_dot_scaled(%wk, %origin, %x_view, %g_view, %tokens, %c64, %token, %lane, %c32) : (buffer, offset, view<[%tokens]x[%c64]x32xf32>, view<[%c64]x32xf32>, index, index, index, index, index) -> (f32)
+        scf.yield %pk : f32
+      } else {
+        %pv = func.call @flint_q8_0_row_dot_scaled(%wv, %origin, %x_view, %g_view, %tokens, %c64, %token, %lane, %c32) : (buffer, offset, view<[%tokens]x[%c64]x32xf32>, view<[%c64]x32xf32>, index, index, index, index, index) -> (f32)
+        scf.yield %pv : f32
+      }
+      scf.yield %p : f32
+    }
+    %sum = kernel.subgroup.reduce<addf> %part : f32
+    %first = index.cmp eq, %lane, %c0 : index
+    scf.if %first {
+      %value = scalar.mulf %sum, %inverse : f32
+      view.store %value, %values_view[%row] : f32, view<128xf32>
+    }
+  }
+  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+  // Lanes 0-63 own rotary pairs (d, d + 64).
+  %active = index.cmp ult, %local, %c64 : index
+  %d = index.assume %local [range(%local, 0, 255)] : index
+  %pair = index.rem %d, %c64 : index
+  %bounded_pair = index.assume %pair [range(%pair, 0, 63)] : index
+  %high_index = index.add %bounded_pair, %c64 : index
+  %bounded_high = index.assume %high_index [range(%high_index, 64, 127)] : index
+  %low = view.load %values_view[%bounded_pair] : view<128xf32> -> f32
+  %high = view.load %values_view[%bounded_high] : view<128xf32> -> f32
+  %is_v = scalar.xori %is_k, %is_q : i1
+  %v_head_flag = index.cmp uge, %head, %c36 : index
+  %zero_f = scalar.constant 0.0 : f32
+  %square = scalar.mulf %low, %low : f32
+  %square_sum = scalar.fmaf %high, %high, %square : f32
+  %masked = scf.select %active, %square_sum, %zero_f : f32
+  %sum = kernel.workgroup.reduce<addf> %masked : f32
+  %dims = scalar.constant 128.0 : f32
+  %eps = scalar.constant 1.0e-6 : f32
+  %mean = scalar.divf %sum, %dims : f32
+  %stable = scalar.addf %mean, %eps : f32
+  %head_inverse = scalar.rsqrtf %stable : f32
+  scf.if %active {
+    %qn_view = buffer.view %q_norm[%zero] : buffer -> view<2x64xf32>
+    %kn_view = buffer.view %k_norm[%zero] : buffer -> view<2x64xf32>
+    %w_low, %w_high = scf.if %is_q -> (f32, f32) {
+      %a = view.load %qn_view[%c0, %bounded_pair] : view<2x64xf32> -> f32
+      %b = view.load %qn_view[%c1, %bounded_pair] : view<2x64xf32> -> f32
+      scf.yield %a, %b : f32, f32
+    } else {
+      %a = view.load %kn_view[%c0, %bounded_pair] : view<2x64xf32> -> f32
+      %b = view.load %kn_view[%c1, %bounded_pair] : view<2x64xf32> -> f32
+      scf.yield %a, %b : f32, f32
+    }
+    %n_low0 = scalar.mulf %low, %head_inverse : f32
+    %n_high0 = scalar.mulf %high, %head_inverse : f32
+    %n_low = scalar.mulf %n_low0, %w_low : f32
+    %n_high = scalar.mulf %n_high0, %w_high : f32
+    %info_view = buffer.view %info[%zero] : buffer -> view<[%tokens]x4xi32>
+    %row32 = view.load %info_view[%token, 0] : view<[%tokens]x4xi32> -> i32
+    %position32 = view.load %info_view[%token, 1] : view<[%tokens]x4xi32> -> i32
+    %live32 = view.load %info_view[%token, 2] : view<[%tokens]x4xi32> -> i32
+    %live = scalar.cmpi ne, %live32, %c0_i32 : i32
+    %position_low = scalar.maxsi %position32, %c0_i32 : i32
+    %apply_rope0 = scalar.cmpi ne, %rope, %c0_i32 : i32
+    %not_v = scalar.cmpi eq, %v_head_flag, %v_head_flag : i1
+    %rope_head = index.cmp ult, %head, %c36 : index
+    %apply_rope = scalar.andi %apply_rope0, %rope_head : i1
+    %r_low, %r_high = scf.if %apply_rope -> (f32, f32) {
+      %lane32 = index.cast %bounded_pair : index to i32
+      %lane_f = scalar.sitofp %lane32 : i32 to f32
+      %log2_base_over_64 = scalar.constant 0.20762050593046014 : f32
+      %neg = scalar.constant -1.0 : f32
+      %exponent0 = scalar.mulf %lane_f, %log2_base_over_64 : f32
+      %exponent = scalar.mulf %exponent0, %neg : f32
+      %ln2 = scalar.constant 0.6931471805599453 : f32
+      %natural = scalar.mulf %exponent, %ln2 : f32
+      %inv_freq = scalar.expf<afn> %natural : f32
+      %position_f = scalar.sitofp %position_low : i32 to f32
+      %raw_angle = scalar.mulf %position_f, %inv_freq : f32
+      %inv_two_pi = scalar.constant 0.15915494309189535 : f32
+      %two_pi = scalar.constant 6.283185307179586 : f32
+      %half = scalar.constant 0.5 : f32
+      %turns_raw = scalar.mulf %raw_angle, %inv_two_pi : f32
+      %turns_shifted = scalar.addf %turns_raw, %half : f32
+      %turns_i = scalar.fptosi %turns_shifted : f32 to i32
+      %turns = scalar.sitofp %turns_i : i32 to f32
+      %wrapped = scalar.mulf %turns, %two_pi : f32
+      %angle = scalar.subf %raw_angle, %wrapped : f32
+      %cos = scalar.cosf<afn> %angle : f32
+      %sin = scalar.sinf<afn> %angle : f32
+      %a_cos = scalar.mulf %n_low, %cos : f32
+      %b_sin = scalar.mulf %n_high, %sin : f32
+      %rotated_low = scalar.subf %a_cos, %b_sin : f32
+      %b_cos = scalar.mulf %n_high, %cos : f32
+      %a_sin = scalar.mulf %n_low, %sin : f32
+      %rotated_high = scalar.addf %b_cos, %a_sin : f32
+      scf.yield %rotated_low, %rotated_high : f32, f32
+    } else {
+      scf.yield %n_low, %n_high : f32, f32
+    }
+    // V heads skip the per-head norm.
+    %out_low = scf.select %v_head_flag, %low, %r_low : f32
+    %out_high = scf.select %v_head_flag, %high, %r_high : f32
+    scf.if %is_q {
+      %q_view = buffer.view %q[%zero] : buffer -> view<[%tokens]x32x2x64xf32>
+      view.store %out_low, %q_view[%token, %local_head, %c0, %bounded_pair] : f32, view<[%tokens]x32x2x64xf32>
+      view.store %out_high, %q_view[%token, %local_head, %c1, %bounded_pair] : f32, view<[%tokens]x32x2x64xf32>
+    } else {
+      scf.if %live {
+        %row_bound = scalar.assume %row32 [range(%row32, 0, 2147483646)] : i32
+        %row = index.cast %row_bound : i32 to index
+        %position_bound = scalar.assume %position_low [range(%position_low, 0, 262143)] : i32
+        %position = index.cast %position_bound : i32 to index
+        %padded = index.add %context, %c15 : index
+        %blocks = index.div %padded, %c16 : index
+        %k_plane = index.mul %layer, %c2 : index
+        %v_plane = index.add %k_plane, %c1 : index
+        %plane = scf.select %v_head_flag, %v_plane, %k_plane : index
+        %offset = func.call @flint_kv_offset(%origins, %row, %position, %blocks, %plane, %pool) : (buffer, index, index, index, index, index) -> (offset)
+        %cache = buffer.view %arena[%offset] : buffer -> view<4x2x64xf32>
+        %kv = index.assume %local_head [range(%local_head, 0, 3)] : index
+        view.store %out_low, %cache[%kv, %c0, %bounded_pair] : f32, view<4x2x64xf32>
+        view.store %out_high, %cache[%kv, %c1, %bounded_pair] : f32, view<4x2x64xf32>
+      }
+    }
+  }
+  kernel.return
+}
+
+// FFN norm + router logits; workgroup 0 also publishes the normalized
+// activations h for the expert kernels.
+kernel.def export("flint_norm_router") @flint_norm_router(%tokens: index) {
+  %c1 = index.constant 1 : index
+  %c8 = index.constant 8 : index
+  %c256 = index.constant 256 : index
+  %c32g = index.constant 32 : index
+  kernel.launch.config workgroups(%c32g, %tokens, %c1) workgroup_size(%c256, %c1, %c1) : index
+} launch(%tokens_arg: index, %x: buffer, %norm: buffer, %w: buffer, %h: buffer, %logits: buffer) {
+  %tokens = index.assume %tokens_arg [range(%tokens_arg, 1, 8192)] : index
+  %group_id = kernel.workgroup.id<x> : index
+  %group = index.assume %group_id [range(%group_id, 0, 31)] : index
+  %token_id = kernel.workgroup.id<y> : index
+  %token = index.assume %token_id [lt(%token_id, %tokens)] : index
+  %local = kernel.workitem.id<x> : index
+  %bounded_local = index.assume %local [range(%local, 0, 255)] : index
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c4 = index.constant 4 : index
+  %c32 = index.constant 32 : index
+  %zero = index.constant 0 : offset
+  %zero_f = scalar.constant 0.0 : f32
+  %inverse = func.call @flint_inverse_rms(%x, %tokens, %token, %local) : (buffer, index, index, index) -> (f32)
+  %publish = index.cmp eq, %group, %c0 : index
+  scf.if %publish {
+    %x8 = buffer.view %x[%zero] : buffer -> view<[%tokens]x256x8xf32>
+    %g8 = buffer.view %norm[%zero] : buffer -> view<256x8xf32>
+    %h8 = buffer.view %h[%zero] : buffer -> view<[%tokens]x256x8xf32>
+    %xv = vector.load %x8[%token, %bounded_local, %c0] : view<[%tokens]x256x8xf32> -> vector<8xf32>
+    %gv = vector.load %g8[%bounded_local, %c0] : view<256x8xf32> -> vector<8xf32>
+    %inv = vector.splat %inverse : vector<8xf32>
+    %n0 = vector.mulf %xv, %inv : vector<8xf32>
+    %n1 = vector.mulf %n0, %gv : vector<8xf32>
+    vector.store %n1, %h8[%token, %bounded_local, %c0] : vector<8xf32>, view<[%tokens]x256x8xf32>
+  }
+  %sub_value = index.div %local, %c32 : index
+  %sub = index.assume %sub_value [range(%sub_value, 0, 7)] : index
+  %lane_value = index.rem %local, %c32 : index
+  %lane = index.assume %lane_value [range(%lane_value, 0, 31)] : index
+  %x_view = buffer.view %x[%zero] : buffer -> view<[%tokens]x32x64xf32>
+  %g_view = buffer.view %norm[%zero] : buffer -> view<32x64xf32>
+  %w_view = buffer.view %w[%zero] : buffer -> view<256x32x64xf32>
+  %out = buffer.view %logits[%zero] : buffer -> view<[%tokens]x256xf32>
+  %xv = vector.load %x_view[%token, %lane, %c0] : view<[%tokens]x32x64xf32> -> vector<64xf32>
+  %gv = vector.load %g_view[%lane, %c0] : view<32x64xf32> -> vector<64xf32>
+  %hv = vector.mulf %xv, %gv : vector<64xf32>
+  %c8e = index.constant 8 : index
+  %expert_value = index.madd %group, %c8e, %sub : index
+  %expert = index.assume %expert_value [range(%expert_value, 0, 255)] : index
+  %wv = vector.load %w_view[%expert, %lane, %c0] : view<256x32x64xf32> -> vector<64xf32>
+  %prod = vector.mulf %hv, %wv : vector<64xf32>
+  %part = vector.reduce<addf> %prod, %zero_f : vector<64xf32>, f32
+  %dot = kernel.subgroup.reduce<addf> %part : f32
+  %logit = scalar.mulf %dot, %inverse : f32
+  %first = index.cmp eq, %lane, %c0 : index
+  scf.if %first {
+    view.store %logit, %out[%token, %expert] : f32, view<[%tokens]x256xf32>
+  }
+  kernel.return
+}
+
+// Routed-expert gate/up (rows 0-3071: slot x 512) and shared-expert gate/up
+// (rows 3072-4095) with SwiGLU, in one launch.
+kernel.def export("flint_moe_gate_up") @flint_moe_gate_up(%tokens: index) {
+  %c1 = index.constant 1 : index
+  %c32 = index.constant 32 : index
+  %c4096 = index.constant 4096 : index
+  kernel.launch.config workgroups(%c4096, %tokens, %c1) workgroup_size(%c32, %c1, %c1) : index
+} launch(%tokens_arg: index, %h: buffer, %ids: buffer, %gate: buffer, %up: buffer, %gate_shared: buffer, %up_shared: buffer, %act: buffer, %shared: buffer) {
+  %tokens = index.assume %tokens_arg [range(%tokens_arg, 1, 8192)] : index
+  %unit_id = kernel.workgroup.id<x> : index
+  %unit = index.assume %unit_id [range(%unit_id, 0, 4095)] : index
+  %token_id = kernel.workgroup.id<y> : index
+  %token = index.assume %token_id [lt(%token_id, %tokens)] : index
+  %lane = kernel.workitem.id<x> : index
+  %lanes = kernel.workgroup.size<x> : index
+  %zero = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c64 = index.constant 64 : index
+  %c512 = index.constant 512 : index
+  %c1024 = index.constant 1024 : index
+  %c3072 = index.constant 3072 : index
+  %zero_i32 = scalar.constant 0 : i32
+  %x_view = buffer.view %h[%zero] : buffer -> view<[%tokens]x[%c64]x32xf32>
+  %routed = index.cmp ult, %unit, %c3072 : index
+  %first = index.cmp eq, %lane, %c0 : index
+  scf.if %routed {
+    %slot_value = index.div %unit, %c512 : index
+    %slot = index.assume %slot_value [range(%slot_value, 0, 5)] : index
+    %row_value = index.rem %unit, %c512 : index
+    %row = index.assume %row_value [range(%row_value, 0, 511)] : index
+    %ids_view = buffer.view %ids[%zero] : buffer -> view<[%tokens]x8xi32>
+    %expert32 = view.load %ids_view[%token, %slot] : view<[%tokens]x8xi32> -> i32
+    %c255_i32 = scalar.constant 255 : i32
+    %expert_low = scalar.maxsi %expert32, %zero_i32 : i32
+    %expert_clamped = scalar.minsi %expert_low, %c255_i32 : i32
+    %expert_bound = scalar.assume %expert_clamped [range(%expert_clamped, 0, 255)] : i32
+    %expert = index.cast %expert_bound : i32 to index
+    %expert_bytes = index.constant 589824 : offset
+    %row_bytes = index.constant 1152 : offset
+    %expert_origin = index.scale %expert, %expert_bytes : index, offset -> offset
+    %row_add = index.scale %row, %row_bytes : index, offset -> offset
+    %origin = index.add %expert_origin, %row_add : offset
+    %gp = func.call @flint_q4_k_row_dot(%gate, %origin, %x_view, %tokens, %c64, %token, %lane, %lanes) : (buffer, offset, view<[%tokens]x[%c64]x32xf32>, index, index, index, index, index) -> (f32)
+    %upp = func.call @flint_q4_k_row_dot(%up, %origin, %x_view, %tokens, %c64, %token, %lane, %lanes) : (buffer, offset, view<[%tokens]x[%c64]x32xf32>, index, index, index, index, index) -> (f32)
+    %g = kernel.workgroup.reduce<addf> %gp : f32
+    %u = kernel.workgroup.reduce<addf> %upp : f32
+    scf.if %first {
+      %value = func.call @flint_silu_mul(%g, %u) : (f32, f32) -> (f32)
+      %act_view = buffer.view %act[%zero] : buffer -> view<[%tokens]x6x512xf32>
+      view.store %value, %act_view[%token, %slot, %row] : f32, view<[%tokens]x6x512xf32>
+    }
+  } else {
+    %row_value = index.sub %unit, %c3072 : index
+    %row = index.assume %row_value [range(%row_value, 0, 1023)] : index
+    %row_bytes = index.constant 2176 : offset
+    %origin = index.scale %row, %row_bytes : index, offset -> offset
+    %gp = func.call @flint_q8_0_row_dot(%gate_shared, %origin, %x_view, %tokens, %c64, %token, %lane, %lanes) : (buffer, offset, view<[%tokens]x[%c64]x32xf32>, index, index, index, index, index) -> (f32)
+    %upp = func.call @flint_q8_0_row_dot(%up_shared, %origin, %x_view, %tokens, %c64, %token, %lane, %lanes) : (buffer, offset, view<[%tokens]x[%c64]x32xf32>, index, index, index, index, index) -> (f32)
+    %g = kernel.workgroup.reduce<addf> %gp : f32
+    %u = kernel.workgroup.reduce<addf> %upp : f32
+    scf.if %first {
+      %value = func.call @flint_silu_mul(%g, %u) : (f32, f32) -> (f32)
+      func.call @flint_store_row(%shared, %tokens, %c1024, %token, %row, %value, %zero_i32) : (buffer, index, index, index, index, f32, i32)
+    }
+  }
+  kernel.return
+}
+
+// Per-row power-of-two scaling so F16 GEMM operands cannot overflow: rows
+// whose max |value| exceeds 2^14 get scale 2^-e (max * scale < 2^15), others
+// 1. Writes (scale, 1/scale) per row; power-of-two scaling is exact.
+kernel.def export("flint_row_scale") @flint_row_scale(%rows: index) {
+  %c1 = index.constant 1 : index
+  %c256 = index.constant 256 : index
+  kernel.launch.config workgroups(%rows, %c1, %c1) workgroup_size(%c256, %c1, %c1) : index
+} launch(%rows_arg: index, %k_arg: index, %x: buffer, %scales: buffer) {
+  %rows = index.assume %rows_arg [range(%rows_arg, 1, 2097152)] : index
+  %k = index.assume %k_arg [range(%k_arg, 256, 65536), multiple_of(%k_arg, 256)] : index
+  %row_id = kernel.workgroup.id<x> : index
+  %row = index.assume %row_id [lt(%row_id, %rows)] : index
+  %lane = kernel.workitem.id<x> : index
+  %zero = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c256 = index.constant 256 : index
+  %zero_f = scalar.constant 0.0 : f32
+  %x_view = buffer.view %x[%zero] : buffer -> view<[%rows]x[%k]xf32>
+  %local = scf.for %c = [%lane to %k step %c256](%m = %zero_f : f32) -> (f32) {
+    %bc = index.assume %c [lt(%c, %k)] : index
+    %v = view.load %x_view[%row, %bc] : view<[%rows]x[%k]xf32> -> f32
+    %a = scalar.absf %v : f32
+    %n = scalar.maxnumf %m, %a : f32
+    scf.yield %n : f32
+  }
+  %maximum = kernel.workgroup.reduce<maxnumf> %local : f32
+  %first = index.cmp eq, %lane, %c0 : index
+  scf.if %first {
+    %bits = scalar.bitcast %maximum : f32 to i32
+    %c23 = scalar.constant 23 : i32
+    %c255 = scalar.constant 255 : i32
+    %shifted = scalar.shrui %bits, %c23 : i32
+    %biased = scalar.andi %shifted, %c255 : i32
+    // e = exponent(max) - 13 when max >= 2^14 (biased exponent 141), else 0.
+    %c127 = scalar.constant 127 : i32
+    %c13 = scalar.constant 13 : i32
+    %c0_i32 = scalar.constant 0 : i32
+    %c100 = scalar.constant 100 : i32
+    %unbiased = scalar.subi %biased, %c127 : i32
+    %raw_e = scalar.subi %unbiased, %c13 : i32
+    %positive = scalar.maxsi %raw_e, %c0_i32 : i32
+    %e = scalar.minsi %positive, %c100 : i32
+    %scale_exp = scalar.subi %c127, %e : i32
+    %inverse_exp = scalar.addi %c127, %e : i32
+    %scale_bits = scalar.shli %scale_exp, %c23 : i32
+    %inverse_bits = scalar.shli %inverse_exp, %c23 : i32
+    %scale = scalar.bitcast %scale_bits : i32 to f32
+    %inverse = scalar.bitcast %inverse_bits : i32 to f32
+    %s_view = buffer.view %scales[%zero] : buffer -> view<[%rows]x2xf32>
+    view.store %scale, %s_view[%row, %c0] : f32, view<[%rows]x2xf32>
+    %c1 = index.constant 1 : index
+    view.store %inverse, %s_view[%row, %c1] : f32, view<[%rows]x2xf32>
+  }
+  kernel.return
+}
+
+// flint_row_scale for 2048-wide rows that also writes the scaled row as F16
+// (x16 = x * scale), so GEMMs can stage A without re-converting it.
+kernel.def export("flint_row_scale_f16") @flint_row_scale_f16(%rows: index) {
+  %c1 = index.constant 1 : index
+  %c256 = index.constant 256 : index
+  kernel.launch.config workgroups(%rows, %c1, %c1) workgroup_size(%c256, %c1, %c1) : index
+} launch(%rows_arg: index, %info: buffer, %x: buffer, %scales: buffer, %x16: buffer) {
+  %rows = index.assume %rows_arg [range(%rows_arg, 1, 2097152)] : index
+  %row_id = kernel.workgroup.id<x> : index
+  %row = index.assume %row_id [lt(%row_id, %rows)] : index
+  %lane_id = kernel.workitem.id<x> : index
+  %lane = index.assume %lane_id [range(%lane_id, 0, 255)] : index
+  %zero = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %zero_f = scalar.constant 0.0 : f32
+  %x_view = buffer.view %x[%zero] : buffer -> view<[%rows]x256x8xf32>
+  %v = vector.load %x_view[%row, %lane, %c0] : view<[%rows]x256x8xf32> -> vector<8xf32>
+  %a = vector.absf %v : vector<8xf32>
+  %local = vector.reduce<maxnumf> %a, %zero_f : vector<8xf32>, f32
+  %maximum = kernel.workgroup.reduce<maxnumf> %local : f32
+  %bits = scalar.bitcast %maximum : f32 to i32
+  %c23 = scalar.constant 23 : i32
+  %c255 = scalar.constant 255 : i32
+  %shifted = scalar.shrui %bits, %c23 : i32
+  %biased = scalar.andi %shifted, %c255 : i32
+  %c127 = scalar.constant 127 : i32
+  %c13 = scalar.constant 13 : i32
+  %c0_i32 = scalar.constant 0 : i32
+  %c100 = scalar.constant 100 : i32
+  %unbiased = scalar.subi %biased, %c127 : i32
+  %raw_e = scalar.subi %unbiased, %c13 : i32
+  %positive = scalar.maxsi %raw_e, %c0_i32 : i32
+  %e = scalar.minsi %positive, %c100 : i32
+  %scale_exp = scalar.subi %c127, %e : i32
+  %inverse_exp = scalar.addi %c127, %e : i32
+  %scale_bits = scalar.shli %scale_exp, %c23 : i32
+  %inverse_bits = scalar.shli %inverse_exp, %c23 : i32
+  %scale_raw = scalar.bitcast %scale_bits : i32 to f32
+  %inverse_raw = scalar.bitcast %inverse_bits : i32 to f32
+  // Padding rows (not live) get scale 0, which GEMM row tiles skip on.
+  %info_view = buffer.view %info[%zero] : buffer -> view<[%rows]x4xi32>
+  %c2_info = index.constant 2 : index
+  %live32 = view.load %info_view[%row, %c2_info] : view<[%rows]x4xi32> -> i32
+  %c0_live = scalar.constant 0 : i32
+  %live = scalar.cmpi ne, %live32, %c0_live : i32
+  %scale = scf.select %live, %scale_raw, %zero_f : f32
+  %live_v = vector.splat %live : vector<8xi1>
+  %inverse = scf.select %live, %inverse_raw, %zero_f : f32
+  %scale_v = vector.splat %scale : vector<8xf32>
+  %scaled = vector.mulf %v, %scale_v : vector<8xf32>
+  %zero8 = vector.constant 0.0 : vector<8xf32>
+  %scaled_live = vector.select %live_v, %scaled, %zero8 : vector<8xf32>
+  %half = vector.fptrunc %scaled_live : vector<8xf32> to vector<8xf16>
+  %x16_view = buffer.view %x16[%zero] : buffer -> view<[%rows]x256x8xf16>
+  vector.store %half, %x16_view[%row, %lane, %c0] : vector<8xf16>, view<[%rows]x256x8xf16>
+  %first = index.cmp eq, %lane, %c0 : index
+  scf.if %first {
+    %s_view = buffer.view %scales[%zero] : buffer -> view<[%rows]x2xf32>
+    view.store %scale, %s_view[%row, %c0] : f32, view<[%rows]x2xf32>
+    %c1 = index.constant 1 : index
+    view.store %inverse, %s_view[%row, %c1] : f32, view<[%rows]x2xf32>
+  }
+  kernel.return
+}
+
+// Prefill router logits as a tiled F32 GEMM: workgroup = 64 tokens x 256
+// experts; thread t computes tokens (t/32)*8..+8 x experts (t%32)*8..+8.
+// K advances 16 at a time through workgroup memory. F32 keeps expert
+// selection identical to the per-token path.
+kernel.def export("flint_router_gemm") @flint_router_gemm(%tokens: index) {
+  %c1 = index.constant 1 : index
+  %c64 = index.constant 64 : index
+  %c256 = index.constant 256 : index
+  %tiles = index.div %tokens, %c64 : index
+  kernel.launch.config workgroups(%tiles, %c1, %c1) workgroup_size(%c256, %c1, %c1) : index
+} launch(%tokens_arg: index, %h: buffer, %w: buffer, %logits: buffer) {
+  %tokens = index.assume %tokens_arg [range(%tokens_arg, 64, 8192), multiple_of(%tokens_arg, 64)] : index
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c4 = index.constant 4 : index
+  %c8 = index.constant 8 : index
+  %c16 = index.constant 16 : index
+  %c32 = index.constant 32 : index
+  %c64 = index.constant 64 : index
+  %c128 = index.constant 128 : index
+  %zero = index.constant 0 : offset
+  %tile_count = index.div %tokens, %c64 : index
+  %tile_id = kernel.workgroup.id<x> : index
+  %tile = index.assume %tile_id [lt(%tile_id, %tile_count)] : index
+  %t_id = kernel.workitem.id<x> : index
+  %t = index.assume %t_id [range(%t_id, 0, 255)] : index
+  %token_group = index.div %t, %c32 : index
+  %expert_group = index.rem %t, %c32 : index
+  %token0 = index.mul %token_group, %c8 : index
+  %expert0 = index.mul %expert_group, %c8 : index
+  %h_view = buffer.view %h[%zero] : buffer -> view<[%tokens]x2048xf32>
+  %w_view = buffer.view %w[%zero] : buffer -> view<256x2048xf32>
+  %h_bytes = index.constant 4352 : offset
+  %w_bytes = index.constant 17408 : offset
+  %h_stage = buffer.alloca<workgroup> align(16) %h_bytes : buffer
+  %w_stage = buffer.alloca<workgroup> align(16) %w_bytes : buffer
+  %hs = buffer.view %h_stage[%zero] : buffer -> view<16x68xf32>
+  %ws = buffer.view %w_stage[%zero] : buffer -> view<16x272xf32>
+  %row0 = index.mul %tile, %c64 : index
+  // Staging: h tile 64 tokens x 16 k (4 values per thread), W tile 256 x 16 (16 per thread), both stored k-major.
+  %h_tok = index.div %t, %c4 : index
+  %h_kq = index.rem %t, %c4 : index
+  %h_k = index.mul %h_kq, %c4 : index
+  %h_row_value = index.add %row0, %h_tok : index
+  %h_row = index.assume %h_row_value [lt(%h_row_value, %tokens)] : index
+  %zero_f = scalar.constant 0.0 : f32
+  %zero8v = vector.splat %zero_f : vector<8xf32>
+  %k_steps = index.constant 128 : index
+  %acc0, %acc1, %acc2, %acc3, %acc4, %acc5, %acc6, %acc7 = scf.for %step = [%c0 to %k_steps step %c1](%a0 = %zero8v : vector<8xf32>, %a1 = %zero8v : vector<8xf32>, %a2 = %zero8v : vector<8xf32>, %a3 = %zero8v : vector<8xf32>, %a4 = %zero8v : vector<8xf32>, %a5 = %zero8v : vector<8xf32>, %a6 = %zero8v : vector<8xf32>, %a7 = %zero8v : vector<8xf32>) -> (vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>) {
+    %k0 = index.mul %step, %c16 : index
+    %hk = index.add %k0, %h_k : index
+    %hv = vector.load %h_view[%h_row, %hk] : view<[%tokens]x2048xf32> -> vector<4xf32>
+    scf.for %j = [%c0 to %c4 step %c1] unroll {
+      %bj = index.assume %j [range(%j, 0, 3)] : index
+      %e = vector.extract %hv[%bj] : vector<4xf32> -> f32
+      %kk_value = index.add %h_k, %bj : index
+      %kk = index.assume %kk_value [range(%kk_value, 0, 15)] : index
+      %bt = index.assume %h_tok [range(%h_tok, 0, 63)] : index
+      view.store %e, %hs[%kk, %bt] : f32, view<16x68xf32>
+    }
+    %wv = vector.load %w_view[%t, %k0] : view<256x2048xf32> -> vector<16xf32>
+    scf.for %j = [%c0 to %c16 step %c1] unroll {
+      %bj = index.assume %j [range(%j, 0, 15)] : index
+      %e = vector.extract %wv[%bj] : vector<16xf32> -> f32
+      view.store %e, %ws[%bj, %t] : f32, view<16x272xf32>
+    }
+    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+    %n0, %n1, %n2, %n3, %n4, %n5, %n6, %n7 = scf.for %kk = [%c0 to %c16 step %c1](%b0 = %a0 : vector<8xf32>, %b1 = %a1 : vector<8xf32>, %b2 = %a2 : vector<8xf32>, %b3 = %a3 : vector<8xf32>, %b4 = %a4 : vector<8xf32>, %b5 = %a5 : vector<8xf32>, %b6 = %a6 : vector<8xf32>, %b7 = %a7 : vector<8xf32>) -> (vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>) unroll {
+      %bk = index.assume %kk [range(%kk, 0, 15)] : index
+      %hr = vector.load %hs[%bk, %token0] : view<16x68xf32> -> vector<8xf32>
+      %wr = vector.load %ws[%bk, %expert0] : view<16x272xf32> -> vector<8xf32>
+      %h0 = vector.extract %hr[0] : vector<8xf32> -> f32
+      %hs0 = vector.splat %h0 : vector<8xf32>
+      %u0 = vector.fmaf %hs0, %wr, %b0 : vector<8xf32>
+      %h1 = vector.extract %hr[1] : vector<8xf32> -> f32
+      %hs1 = vector.splat %h1 : vector<8xf32>
+      %u1 = vector.fmaf %hs1, %wr, %b1 : vector<8xf32>
+      %h2 = vector.extract %hr[2] : vector<8xf32> -> f32
+      %hs2 = vector.splat %h2 : vector<8xf32>
+      %u2 = vector.fmaf %hs2, %wr, %b2 : vector<8xf32>
+      %h3 = vector.extract %hr[3] : vector<8xf32> -> f32
+      %hs3 = vector.splat %h3 : vector<8xf32>
+      %u3 = vector.fmaf %hs3, %wr, %b3 : vector<8xf32>
+      %h4 = vector.extract %hr[4] : vector<8xf32> -> f32
+      %hs4 = vector.splat %h4 : vector<8xf32>
+      %u4 = vector.fmaf %hs4, %wr, %b4 : vector<8xf32>
+      %h5 = vector.extract %hr[5] : vector<8xf32> -> f32
+      %hs5 = vector.splat %h5 : vector<8xf32>
+      %u5 = vector.fmaf %hs5, %wr, %b5 : vector<8xf32>
+      %h6 = vector.extract %hr[6] : vector<8xf32> -> f32
+      %hs6 = vector.splat %h6 : vector<8xf32>
+      %u6 = vector.fmaf %hs6, %wr, %b6 : vector<8xf32>
+      %h7 = vector.extract %hr[7] : vector<8xf32> -> f32
+      %hs7 = vector.splat %h7 : vector<8xf32>
+      %u7 = vector.fmaf %hs7, %wr, %b7 : vector<8xf32>
+      scf.yield %u0, %u1, %u2, %u3, %u4, %u5, %u6, %u7 : vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>
+    }
+    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+    scf.yield %n0, %n1, %n2, %n3, %n4, %n5, %n6, %n7 : vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>
+  }
+  %out = buffer.view %logits[%zero] : buffer -> view<[%tokens]x256xf32>
+  %tok_base = index.add %row0, %token0 : index
+  %tok0_c = index.constant 0 : index
+  %tok0_v = index.add %tok_base, %tok0_c : index
+  %tok0 = index.assume %tok0_v [lt(%tok0_v, %tokens)] : index
+  vector.store %acc0, %out[%tok0, %expert0] : vector<8xf32>, view<[%tokens]x256xf32>
+  %tok1_c = index.constant 1 : index
+  %tok1_v = index.add %tok_base, %tok1_c : index
+  %tok1 = index.assume %tok1_v [lt(%tok1_v, %tokens)] : index
+  vector.store %acc1, %out[%tok1, %expert0] : vector<8xf32>, view<[%tokens]x256xf32>
+  %tok2_c = index.constant 2 : index
+  %tok2_v = index.add %tok_base, %tok2_c : index
+  %tok2 = index.assume %tok2_v [lt(%tok2_v, %tokens)] : index
+  vector.store %acc2, %out[%tok2, %expert0] : vector<8xf32>, view<[%tokens]x256xf32>
+  %tok3_c = index.constant 3 : index
+  %tok3_v = index.add %tok_base, %tok3_c : index
+  %tok3 = index.assume %tok3_v [lt(%tok3_v, %tokens)] : index
+  vector.store %acc3, %out[%tok3, %expert0] : vector<8xf32>, view<[%tokens]x256xf32>
+  %tok4_c = index.constant 4 : index
+  %tok4_v = index.add %tok_base, %tok4_c : index
+  %tok4 = index.assume %tok4_v [lt(%tok4_v, %tokens)] : index
+  vector.store %acc4, %out[%tok4, %expert0] : vector<8xf32>, view<[%tokens]x256xf32>
+  %tok5_c = index.constant 5 : index
+  %tok5_v = index.add %tok_base, %tok5_c : index
+  %tok5 = index.assume %tok5_v [lt(%tok5_v, %tokens)] : index
+  vector.store %acc5, %out[%tok5, %expert0] : vector<8xf32>, view<[%tokens]x256xf32>
+  %tok6_c = index.constant 6 : index
+  %tok6_v = index.add %tok_base, %tok6_c : index
+  %tok6 = index.assume %tok6_v [lt(%tok6_v, %tokens)] : index
+  vector.store %acc6, %out[%tok6, %expert0] : vector<8xf32>, view<[%tokens]x256xf32>
+  %tok7_c = index.constant 7 : index
+  %tok7_v = index.add %tok_base, %tok7_c : index
+  %tok7 = index.assume %tok7_v [lt(%tok7_v, %tokens)] : index
+  vector.store %acc7, %out[%tok7, %expert0] : vector<8xf32>, view<[%tokens]x256xf32>
+  kernel.return
+}
+
+// GEMM A operand: x16[r] = f16(x[r] * scale[r]).
+kernel.def export("flint_row_scale_f16k") @flint_row_scale_f16k(%rows: index) {
+  %c1 = index.constant 1 : index
+  %c256 = index.constant 256 : index
+  kernel.launch.config workgroups(%rows, %c1, %c1) workgroup_size(%c256, %c1, %c1) : index
+} launch(%rows_arg: index, %k_arg: index, %info: buffer, %x: buffer, %scales: buffer, %x16: buffer) {
+  %rows = index.assume %rows_arg [range(%rows_arg, 1, 2097152)] : index
+  %k = index.assume %k_arg [range(%k_arg, 256, 65536), multiple_of(%k_arg, 256)] : index
+  %row_id = kernel.workgroup.id<x> : index
+  %row = index.assume %row_id [lt(%row_id, %rows)] : index
+  %lane = kernel.workitem.id<x> : index
+  %zero = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c256 = index.constant 256 : index
+  %zero_f = scalar.constant 0.0 : f32
+  %x_view = buffer.view %x[%zero] : buffer -> view<[%rows]x[%k]xf32>
+  %h_view = buffer.view %x16[%zero] : buffer -> view<[%rows]x[%k]xf16>
+  %local = scf.for %c = [%lane to %k step %c256](%m = %zero_f : f32) -> (f32) {
+    %bc = index.assume %c [lt(%c, %k)] : index
+    %v = view.load %x_view[%row, %bc] : view<[%rows]x[%k]xf32> -> f32
+    %a = scalar.absf %v : f32
+    %n = scalar.maxnumf %m, %a : f32
+    scf.yield %n : f32
+  }
+  %maximum = kernel.workgroup.reduce<maxnumf> %local : f32
+  %bits = scalar.bitcast %maximum : f32 to i32
+  %c23 = scalar.constant 23 : i32
+  %c255 = scalar.constant 255 : i32
+  %shifted = scalar.shrui %bits, %c23 : i32
+  %biased = scalar.andi %shifted, %c255 : i32
+  %c127 = scalar.constant 127 : i32
+  %c13 = scalar.constant 13 : i32
+  %c0_i32 = scalar.constant 0 : i32
+  %c100 = scalar.constant 100 : i32
+  %unbiased = scalar.subi %biased, %c127 : i32
+  %raw_e = scalar.subi %unbiased, %c13 : i32
+  %positive = scalar.maxsi %raw_e, %c0_i32 : i32
+  %e = scalar.minsi %positive, %c100 : i32
+  %scale_exp = scalar.subi %c127, %e : i32
+  %inverse_exp = scalar.addi %c127, %e : i32
+  %scale_bits = scalar.shli %scale_exp, %c23 : i32
+  %inverse_bits = scalar.shli %inverse_exp, %c23 : i32
+  %scale_raw = scalar.bitcast %scale_bits : i32 to f32
+  %inverse_raw = scalar.bitcast %inverse_bits : i32 to f32
+  // Padding rows (not live) get scale 0, which GEMM row tiles skip on.
+  %info_view = buffer.view %info[%zero] : buffer -> view<[%rows]x4xi32>
+  %c2_info = index.constant 2 : index
+  %live32 = view.load %info_view[%row, %c2_info] : view<[%rows]x4xi32> -> i32
+  %c0_live = scalar.constant 0 : i32
+  %live = scalar.cmpi ne, %live32, %c0_live : i32
+  %scale = scf.select %live, %scale_raw, %zero_f : f32
+  %inverse = scf.select %live, %inverse_raw, %zero_f : f32
+  scf.for %c = [%lane to %k step %c256] {
+    %bc = index.assume %c [lt(%c, %k)] : index
+    %v = view.load %x_view[%row, %bc] : view<[%rows]x[%k]xf32> -> f32
+    %sv = scalar.mulf %v, %scale : f32
+    %sv_live = scf.select %live, %sv, %zero_f : f32
+    %hv = scalar.fptrunc %sv_live : f32 to f16
+    view.store %hv, %h_view[%row, %bc] : f16, view<[%rows]x[%k]xf16>
+  }
+  %first = index.cmp eq, %lane, %c0 : index
+  scf.if %first {
+    %s_view = buffer.view %scales[%zero] : buffer -> view<[%rows]x2xf32>
+    view.store %scale, %s_view[%row, %c0] : f32, view<[%rows]x2xf32>
+    view.store %inverse, %s_view[%row, %c1] : f32, view<[%rows]x2xf32>
+  }
+  kernel.return
+}
+
+// rmsnorm (eps 1e-6) writing h (F32) and, for prefill GEMMs, the per-row
+// power-of-two scale and the scaled F16 row (padding rows get scale 0).
+kernel.def export("flint_rmsnorm_f16") @flint_rmsnorm_f16(%tokens: index) {
+  %c1 = index.constant 1 : index
+  %c256 = index.constant 256 : index
+  kernel.launch.config workgroups(%tokens, %c1, %c1) workgroup_size(%c256, %c1, %c1) : index
+} launch(%tokens_arg: index, %info: buffer, %x: buffer, %w: buffer, %y: buffer, %scales: buffer, %y16: buffer) {
+  %tokens = index.assume %tokens_arg [range(%tokens_arg, 1, 8192)] : index
+  %token_id = kernel.workgroup.id<x> : index
+  %token = index.assume %token_id [lt(%token_id, %tokens)] : index
+  %lane_id = kernel.workitem.id<x> : index
+  %lane = index.assume %lane_id [range(%lane_id, 0, 255)] : index
+  %zero = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1i = index.constant 1 : index
+  %zero_f = scalar.constant 0.0 : f32
+  %x_view = buffer.view %x[%zero] : buffer -> view<[%tokens]x256x8xf32>
+  %w_view = buffer.view %w[%zero] : buffer -> view<256x8xf32>
+  %y_view = buffer.view %y[%zero] : buffer -> view<[%tokens]x256x8xf32>
+  %values = vector.load %x_view[%token, %lane, %c0] : view<[%tokens]x256x8xf32> -> vector<8xf32>
+  %squares = vector.mulf %values, %values : vector<8xf32>
+  %local = vector.reduce<addf> %squares, %zero_f : vector<8xf32>, f32
+  %sum = kernel.workgroup.reduce<addf> %local : f32
+  %count = scalar.constant 2048.0 : f32
+  %eps = scalar.constant 1.0e-6 : f32
+  %mean = scalar.divf %sum, %count : f32
+  %stable = scalar.addf %mean, %eps : f32
+  %inverse_rms = scalar.rsqrtf %stable : f32
+  %inverses = vector.splat %inverse_rms : vector<8xf32>
+  %weights = vector.load %w_view[%lane, %c0] : view<256x8xf32> -> vector<8xf32>
+  %normalized = vector.mulf %values, %inverses : vector<8xf32>
+  %result = vector.mulf %normalized, %weights : vector<8xf32>
+  vector.store %result, %y_view[%token, %lane, %c0] : vector<8xf32>, view<[%tokens]x256x8xf32>
+  %a = vector.absf %result : vector<8xf32>
+  %lmax = vector.reduce<maxnumf> %a, %zero_f : vector<8xf32>, f32
+  %maximum = kernel.workgroup.reduce<maxnumf> %lmax : f32
+  %bits = scalar.bitcast %maximum : f32 to i32
+  %c23 = scalar.constant 23 : i32
+  %c255 = scalar.constant 255 : i32
+  %shifted = scalar.shrui %bits, %c23 : i32
+  %biased = scalar.andi %shifted, %c255 : i32
+  %c127 = scalar.constant 127 : i32
+  %c13 = scalar.constant 13 : i32
+  %c0_i32 = scalar.constant 0 : i32
+  %c100 = scalar.constant 100 : i32
+  %unbiased = scalar.subi %biased, %c127 : i32
+  %raw_e = scalar.subi %unbiased, %c13 : i32
+  %positive = scalar.maxsi %raw_e, %c0_i32 : i32
+  %e = scalar.minsi %positive, %c100 : i32
+  %scale_exp = scalar.subi %c127, %e : i32
+  %inverse_exp = scalar.addi %c127, %e : i32
+  %scale_bits = scalar.shli %scale_exp, %c23 : i32
+  %inverse_bits = scalar.shli %inverse_exp, %c23 : i32
+  %scale_raw = scalar.bitcast %scale_bits : i32 to f32
+  %inverse_raw = scalar.bitcast %inverse_bits : i32 to f32
+  %info_view = buffer.view %info[%zero] : buffer -> view<[%tokens]x4xi32>
+  %c2_info = index.constant 2 : index
+  %live32 = view.load %info_view[%token, %c2_info] : view<[%tokens]x4xi32> -> i32
+  %live = scalar.cmpi ne, %live32, %c0_i32 : i32
+  %scale = scf.select %live, %scale_raw, %zero_f : f32
+  %inverse = scf.select %live, %inverse_raw, %zero_f : f32
+  %scale_v = vector.splat %scale : vector<8xf32>
+  %scaled = vector.mulf %result, %scale_v : vector<8xf32>
+  %half = vector.fptrunc %scaled : vector<8xf32> to vector<8xf16>
+  %y16_view = buffer.view %y16[%zero] : buffer -> view<[%tokens]x256x8xf16>
+  vector.store %half, %y16_view[%token, %lane, %c0] : vector<8xf16>, view<[%tokens]x256x8xf16>
+  %first = index.cmp eq, %lane, %c0 : index
+  scf.if %first {
+    %s_view = buffer.view %scales[%zero] : buffer -> view<[%tokens]x2xf32>
+    view.store %scale, %s_view[%token, %c0] : f32, view<[%tokens]x2xf32>
+    view.store %inverse, %s_view[%token, %c1i] : f32, view<[%tokens]x2xf32>
+  }
+  kernel.return
+}

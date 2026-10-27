@@ -1,0 +1,284 @@
+// Flint forward pass for one packed epoch.
+//
+// Each prepared stage fixes the token and span capacity, so decode and prefill
+// buckets compile separately sized kernels. Layers 0-1 use a dense SwiGLU FFN;
+// the rest use sigmoid top-6 MoE plus a shared expert. Full-attention layers
+// (0, 1, 48 and every fourth from 1) use no RoPE; all others slide over 513
+// positions with NeoX RoPE. Scratch storage is transient command workspace.
+
+config.decl @flint.context : %value: index where [range(%value, 16, 262144)]
+
+config.decl @flint.spans : %value: index where [range(%value, 1, 8192)]
+
+config.decl @flint.tokens : %value: index where [range(%value, 1, 8192)]
+
+config.decl @flint.pool : %value: index where [range(%value, 16, 1048576)]
+
+// Debug/profiling only: number of transformer layers to execute (default 49).
+config.def @flint.layers = 49 : index
+
+command.program.def public @flint_advance() launch(%weights: buffer, %residual: buffer, %metadata: buffer, %origins: buffer, %arena: buffer, %tokens: buffer, %outputs: buffer) {
+  %t = config.get @flint.tokens : index
+  %spans = config.get @flint.spans : index
+  %context = config.get @flint.context : index
+  %pool = config.get @flint.pool : index
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c4 = index.constant 4 : index
+  %c48 = index.constant 48 : index
+  %c49 = index.constant 49 : index
+  %n512 = index.constant 512 : index
+  %n1024 = index.constant 1024 : index
+  %n2048 = index.constant 2048 : index
+  %n4096 = index.constant 4096 : index
+  %n6144 = index.constant 6144 : index
+  %zero_i32 = scalar.constant 0 : i32
+  %c64 = index.constant 64 : index
+  %gemm = index.cmp uge, %t, %c64 : index
+  %c128g = index.constant 128 : index
+  %big = index.cmp uge, %t, %c128g : index
+  %one_i32 = scalar.constant 1 : i32
+  %row_bytes = index.constant 8192 : offset
+  %wide_bytes = index.constant 16384 : offset
+  %kv_bytes = index.constant 2048 : offset
+  %pair_bytes = index.constant 32 : offset
+  %info_bytes = index.constant 16 : offset
+  %act_bytes = index.constant 12288 : offset
+  %ffn_bytes = index.constant 24576 : offset
+  %partial_bytes = index.constant 9384 : offset
+  %x_size = index.scale %t, %row_bytes : index, offset -> offset
+  %q_size = index.scale %t, %wide_bytes : index, offset -> offset
+  %kv_size = index.scale %t, %kv_bytes : index, offset -> offset
+  %pair_size = index.scale %t, %pair_bytes : index, offset -> offset
+  %info_size = index.scale %t, %info_bytes : index, offset -> offset
+  %act_size = index.scale %t, %act_bytes : index, offset -> offset
+  %ffn_size = index.scale %t, %ffn_bytes : index, offset -> offset
+  %partial_size = index.scale %spans, %partial_bytes : index, offset -> offset
+  %x = buffer.alloca<global> align(256) %x_size : buffer
+  %h = buffer.alloca<global> align(256) %x_size : buffer
+  %q = buffer.alloca<global> align(256) %q_size : buffer
+  %k = buffer.alloca<global> align(256) %kv_size : buffer
+  %v = buffer.alloca<global> align(256) %kv_size : buffer
+  %o = buffer.alloca<global> align(256) %q_size : buffer
+  %ids = buffer.alloca<global> align(256) %pair_size : buffer
+  %wts = buffer.alloca<global> align(256) %pair_size : buffer
+  %info = buffer.alloca<global> align(256) %info_size : buffer
+  %act = buffer.alloca<global> align(256) %act_size : buffer
+  %g = buffer.alloca<global> align(256) %ffn_size : buffer
+  %u = buffer.alloca<global> align(256) %ffn_size : buffer
+  %partials = buffer.alloca<global> align(256) %partial_size : buffer
+  %logit_bytes = index.constant 1024 : offset
+  %logit_size = index.scale %t, %logit_bytes : index, offset -> offset
+  %logits = buffer.alloca<global> align(256) %logit_size : buffer
+  // Split-K decode attention partials (decode path only): 16 splits per head.
+  %t_dec = index.add %t, %c0 : index
+  // 64 splits per head for decode, 16 for the prefill fallback.
+  %pacc_dec = index.constant 1048576 : offset
+  %pacc_pre = index.constant 262144 : offset
+  %pml_dec = index.constant 16384 : offset
+  %pml_pre = index.constant 4096 : offset
+  %pacc_bytes = scf.select %gemm, %pacc_pre, %pacc_dec : offset
+  %pml_bytes = scf.select %gemm, %pml_pre, %pml_dec : offset
+  %pacc_size = index.scale %t_dec, %pacc_bytes : index, offset -> offset
+  %pml_size = index.scale %t_dec, %pml_bytes : index, offset -> offset
+  %pacc = buffer.alloca<global> align(256) %pacc_size : buffer
+  %pml = buffer.alloca<global> align(256) %pml_size : buffer
+  // Prefill MoE bucketing: at most 256 + 6T/R tiles of R padded rows.
+  %c3 = index.constant 3 : index
+  %c16i = index.constant 16 : index
+  %c256i = index.constant 256 : index
+  %moe_r = index.constant 32 : index
+  %c6t = index.constant 6 : index
+  %six_t = index.mul %t, %c6t : index
+  %tile_extra = index.div %six_t, %moe_r : index
+  %max_tiles_full = index.add %c256i, %tile_extra : index
+  %c1i = index.constant 1 : index
+  %max_tiles = scf.select %gemm, %max_tiles_full, %c1i : index
+  %c32i = index.constant 32 : index
+  %max_rows = index.mul %max_tiles, %moe_r : index
+  %moe_k = index.div %moe_r, %c32i : index
+  %max_tiles_v = index.mul %max_tiles, %moe_k : index
+  %info_entry = index.constant 8 : offset
+  %rowmap_entry = index.constant 4 : offset
+  %pos_entry = index.constant 24 : offset
+  %act_entry = index.constant 2048 : offset
+  %ys_entry = index.constant 8192 : offset
+  %tile_info_size = index.scale %max_tiles, %info_entry : index, offset -> offset
+  %rowmap_size = index.scale %max_rows, %rowmap_entry : index, offset -> offset
+  %pos_size = index.scale %t, %pos_entry : index, offset -> offset
+  %act_sorted_size = index.scale %max_rows, %act_entry : index, offset -> offset
+  %ys_size = index.scale %max_rows, %ys_entry : index, offset -> offset
+  %tile_info = buffer.alloca<global> align(256) %tile_info_size : buffer
+  %rowmap = buffer.alloca<global> align(256) %rowmap_size : buffer
+  %pos = buffer.alloca<global> align(256) %pos_size : buffer
+  %act_sorted = buffer.alloca<global> align(256) %act_sorted_size : buffer
+  %y_sorted = buffer.alloca<global> align(256) %ys_size : buffer
+  %scale_entry = index.constant 8 : offset
+  %token_scale_size = index.scale %t, %scale_entry : index, offset -> offset
+  %row_scale_size = index.scale %max_rows, %scale_entry : index, offset -> offset
+  %s_tok = buffer.alloca<global> align(256) %token_scale_size : buffer
+  %s_tok2 = buffer.alloca<global> align(256) %token_scale_size : buffer
+  %s_rows = buffer.alloca<global> align(256) %row_scale_size : buffer
+  %half_row_bytes = index.constant 4096 : offset
+  %h16_size = index.scale %t, %half_row_bytes : index, offset -> offset
+  %h16 = buffer.alloca<global> align(256) %h16_size : buffer
+  %o16_bytes = index.constant 8192 : offset
+  %g16_bytes = index.constant 12288 : offset
+  %o16_size = index.scale %t, %o16_bytes : index, offset -> offset
+  %g16_size = index.scale %t, %g16_bytes : index, offset -> offset
+  %o16 = buffer.alloca<global> align(256) %o16_size : buffer
+  %g16 = buffer.alloca<global> align(256) %g16_size : buffer
+  %n1024i = index.constant 1024 : index
+  %n512i = index.constant 512 : index
+
+  kernel.launch @flint_token_info[%t](%t, %spans, %metadata, %info) : [index](index, index, buffer, buffer)
+  %list_entry = index.constant 4 : offset
+  %list_size = index.scale %t, %list_entry : index, offset -> offset
+  %count_size = index.constant 256 : offset
+  %fallback_list = buffer.alloca<global> align(256) %list_size : buffer
+  %fallback_count = buffer.alloca<global> align(256) %count_size : buffer
+  scf.if %gemm {
+    kernel.launch @flint_attention_fallback_list[%t](%t, %info, %fallback_list, %fallback_count) : [index](index, buffer, buffer, buffer)
+  }
+  %embedding = command.parameter %weights, "token_embd.weight" : view<326713344xi8>
+  kernel.launch @flint_embed[%t](%t, %tokens, %embedding, %x) : [index](index, buffer, view<326713344xi8>, buffer)
+
+  %layer_count = config.get @flint.layers : index
+  scf.for %layer = [%c0 to %layer_count step %c1] unroll {
+    %early = index.cmp ult, %layer, %c2 : index
+    %last = index.cmp eq, %layer, %c48 : index
+    %shifted = index.sub %layer, %c1 : index
+    %phase = index.rem %shifted, %c4 : index
+    %periodic = index.cmp eq, %phase, %c0 : index
+    %full_a = scalar.ori %early, %last : i1
+    %full = scalar.ori %full_a, %periodic : i1
+    %full_i32 = scalar.extui %full : i1 to i32
+    %sliding = scalar.xori %full_i32, %one_i32 : i32
+
+    %attn_norm = command.parameter %weights, "blk.{}.attn_norm.weight"[%layer] : view<2048xf32>
+    %wq = command.parameter %weights, "blk.{}.attn_q.weight"[%layer] : view<8912896xi8>
+    %wk = command.parameter %weights, "blk.{}.attn_k.weight"[%layer] : view<1114112xi8>
+    %wv = command.parameter %weights, "blk.{}.attn_v.weight"[%layer] : view<1114112xi8>
+    %q_norm = command.parameter %weights, "blk.{}.attn_q_norm.weight"[%layer] : view<128xf32>
+    %k_norm = command.parameter %weights, "blk.{}.attn_k_norm.weight"[%layer] : view<128xf32>
+    %sinks = command.parameter %weights, "blk.{}.attn_sinks.weight"[%layer] : view<32xf32>
+    %wo = command.parameter %weights, "blk.{}.attn_output.weight"[%layer] : view<8912896xi8>
+    %ffn_norm = command.parameter %weights, "blk.{}.ffn_norm.weight"[%layer] : view<2048xf32>
+
+    scf.if %gemm {
+      kernel.launch @flint_rmsnorm_f16[%t](%t, %info, %x, %attn_norm, %h, %s_tok, %h16) : [index](index, buffer, buffer, view<2048xf32>, buffer, buffer, buffer)
+      scf.if %big {
+        kernel.launch @flint_gemm_q8_0_store_m128[%t, %n4096](%t, %n2048, %n4096, %h16, %s_tok, %wq, %q) : [index, index](index, index, index, buffer, buffer, view<8912896xi8>, buffer)
+      } else {
+        kernel.launch @flint_gemm_q8_0_store[%t, %n4096](%t, %n2048, %n4096, %h16, %s_tok, %wq, %q) : [index, index](index, index, index, buffer, buffer, view<8912896xi8>, buffer)
+      }
+      scf.if %big {
+        kernel.launch @flint_gemm_q8_0_store_m128[%t, %n512](%t, %n2048, %n512, %h16, %s_tok, %wk, %k) : [index, index](index, index, index, buffer, buffer, view<1114112xi8>, buffer)
+      } else {
+        kernel.launch @flint_gemm_q8_0_store[%t, %n512](%t, %n2048, %n512, %h16, %s_tok, %wk, %k) : [index, index](index, index, index, buffer, buffer, view<1114112xi8>, buffer)
+      }
+      scf.if %big {
+        kernel.launch @flint_gemm_q8_0_store_m128[%t, %n512](%t, %n2048, %n512, %h16, %s_tok, %wv, %v) : [index, index](index, index, index, buffer, buffer, view<1114112xi8>, buffer)
+      } else {
+        kernel.launch @flint_gemm_q8_0_store[%t, %n512](%t, %n2048, %n512, %h16, %s_tok, %wv, %v) : [index, index](index, index, index, buffer, buffer, view<1114112xi8>, buffer)
+      }
+    } else {
+      kernel.launch @flint_rmsnorm[%t](%t, %x, %attn_norm, %h) : [index](index, buffer, view<2048xf32>, buffer)
+      kernel.launch @flint_qkv_q8_0[%t](%t, %h, %wq, %wk, %wv, %q, %k, %v) : [index](index, buffer, view<8912896xi8>, view<1114112xi8>, view<1114112xi8>, buffer, buffer, buffer)
+    }
+    kernel.launch @flint_qk_rope_store2[%t](%t, %layer, %sliding, %context, %pool, %q, %k, %v, %q_norm, %k_norm, %info, %origins, %arena) : [index](index, index, i32, index, index, buffer, buffer, buffer, view<128xf32>, view<128xf32>, buffer, buffer, buffer)
+    scf.if %gemm {
+      kernel.launch @flint_attention_flash2[%t](%t, %layer, %sliding, %context, %pool, %q, %sinks, %info, %origins, %arena, %o) : [index](index, index, i32, index, index, buffer, view<32xf32>, buffer, buffer, buffer, buffer)
+      kernel.launch @flint16_attention_split_listed[%fallback_count](%t, %fallback_list, %layer, %sliding, %context, %pool, %q, %info, %origins, %arena, %pacc, %pml) : [buffer](index, buffer, index, i32, index, index, buffer, buffer, buffer, buffer, buffer, buffer)
+      kernel.launch @flint16_attention_combine_listed[%fallback_count](%t, %fallback_list, %sliding, %sinks, %info, %pacc, %pml, %o) : [buffer](index, buffer, i32, view<32xf32>, buffer, buffer, buffer, buffer)
+    } else {
+      kernel.launch @flint_attention_split[%t](%t, %layer, %sliding, %context, %pool, %q, %info, %origins, %arena, %pacc, %pml) : [index](index, index, i32, index, index, buffer, buffer, buffer, buffer, buffer, buffer)
+      kernel.launch @flint_attention_combine[%t](%t, %sliding, %sinks, %info, %pacc, %pml, %o) : [index](index, i32, view<32xf32>, buffer, buffer, buffer, buffer)
+    }
+    scf.if %gemm {
+      kernel.launch @flint_row_scale_f16k[%t](%t, %n4096, %info, %o, %s_tok, %o16) : [index](index, index, buffer, buffer, buffer, buffer)
+      scf.if %big {
+        kernel.launch @flint_gemm_q8_0_acc_m128[%t, %n2048](%t, %n4096, %n2048, %o16, %s_tok, %wo, %x) : [index, index](index, index, index, buffer, buffer, view<8912896xi8>, buffer)
+      } else {
+        kernel.launch @flint_gemm_q8_0_acc[%t, %n2048](%t, %n4096, %n2048, %o16, %s_tok, %wo, %x) : [index, index](index, index, index, buffer, buffer, view<8912896xi8>, buffer)
+      }
+    } else {
+      kernel.launch @flint_matmul_q8_0[%n2048, %t](%n4096, %n2048, %t, %one_i32, %o, %wo, %x) : [index, index](index, index, index, i32, buffer, view<8912896xi8>, buffer)
+    }
+    scf.if %early {
+      scf.if %gemm {
+        kernel.launch @flint_rmsnorm_f16[%t](%t, %info, %x, %ffn_norm, %h, %s_tok, %h16) : [index](index, buffer, buffer, view<2048xf32>, buffer, buffer, buffer)
+      } else {
+        kernel.launch @flint_rmsnorm[%t](%t, %x, %ffn_norm, %h) : [index](index, buffer, view<2048xf32>, buffer)
+      }
+      %gate = command.parameter %weights, "blk.{}.ffn_gate.weight"[%layer] : view<7077888xi8>
+      %up = command.parameter %weights, "blk.{}.ffn_up.weight"[%layer] : view<7077888xi8>
+      %down = command.parameter %weights, "blk.{}.ffn_down.weight"[%layer] : view<7077888xi8>
+      scf.if %gemm {
+        scf.if %big {
+          kernel.launch @flint_gemm_q4_k_swiglu_m128[%t, %n6144](%t, %n2048, %n6144, %h16, %s_tok, %gate, %up, %g) : [index, index](index, index, index, buffer, buffer, view<7077888xi8>, view<7077888xi8>, buffer)
+        } else {
+          kernel.launch @flint_gemm_q4_k_swiglu[%t, %n6144](%t, %n2048, %n6144, %h16, %s_tok, %gate, %up, %g) : [index, index](index, index, index, buffer, buffer, view<7077888xi8>, view<7077888xi8>, buffer)
+        }
+        kernel.launch @flint_row_scale_f16k[%t](%t, %n6144, %info, %g, %s_tok2, %g16) : [index](index, index, buffer, buffer, buffer, buffer)
+        scf.if %big {
+          kernel.launch @flint_gemm_q4_k_acc_m128[%t, %n2048](%t, %n6144, %n2048, %g16, %s_tok2, %down, %x) : [index, index](index, index, index, buffer, buffer, view<7077888xi8>, buffer)
+        } else {
+          kernel.launch @flint_gemm_q4_k_acc[%t, %n2048](%t, %n6144, %n2048, %g16, %s_tok2, %down, %x) : [index, index](index, index, index, buffer, buffer, view<7077888xi8>, buffer)
+        }
+      } else {
+        kernel.launch @flint_gate_up_q4_k[%n6144, %t](%n6144, %t, %h, %gate, %up, %g) : [index, index](index, index, buffer, view<7077888xi8>, view<7077888xi8>, buffer)
+        kernel.launch @flint_matmul_q4_k[%n2048, %t](%n6144, %n2048, %t, %one_i32, %g, %down, %x) : [index, index](index, index, index, i32, buffer, view<7077888xi8>, buffer)
+      }
+    } else {
+      %router = command.parameter %weights, "blk.{}.ffn_gate_inp.weight"[%layer] : view<524288xf32>
+      %gate_exps = command.parameter %weights, "blk.{}.ffn_gate_exps.weight"[%layer] : view<150994944xi8>
+      %up_exps = command.parameter %weights, "blk.{}.ffn_up_exps.weight"[%layer] : view<150994944xi8>
+      %down_exps = command.parameter %weights, "blk.{}.ffn_down_exps.weight"[%layer] : view<150994944xi8>
+      %gate_sh = command.parameter %weights, "blk.{}.ffn_gate_shexp.weight"[%layer] : view<2228224xi8>
+      %up_sh = command.parameter %weights, "blk.{}.ffn_up_shexp.weight"[%layer] : view<2228224xi8>
+      %down_sh = command.parameter %weights, "blk.{}.ffn_down_shexp.weight"[%layer] : view<2228224xi8>
+      scf.if %gemm {
+        kernel.launch @flint_rmsnorm_f16[%t](%t, %info, %x, %ffn_norm, %h, %s_tok, %h16) : [index](index, buffer, buffer, view<2048xf32>, buffer, buffer, buffer)
+        kernel.launch @flint_router_gemm[%t](%t, %h, %router, %logits) : [index](index, buffer, view<524288xf32>, buffer)
+      } else {
+        kernel.launch @flint_norm_router[%t](%t, %x, %ffn_norm, %router, %h, %logits) : [index](index, buffer, view<2048xf32>, view<524288xf32>, buffer, buffer)
+      }
+      kernel.launch @flint_router_topk[%t](%t, %logits, %ids, %wts) : [index](index, buffer, buffer, buffer)
+      scf.if %gemm {
+        kernel.launch @flint_moe_bucket[%t](%t, %max_tiles, %info, %ids, %tile_info, %rowmap, %pos) : [index](index, index, buffer, buffer, buffer, buffer, buffer)
+        kernel.launch @flint_moe_gate_up_grouped[%max_tiles](%max_tiles, %t, %h16, %s_tok, %tile_info, %rowmap, %gate_exps, %up_exps, %act_sorted) : [index](index, index, buffer, buffer, buffer, buffer, view<150994944xi8>, view<150994944xi8>, buffer)
+        kernel.launch @flint_row_scale[%max_rows](%max_rows, %n512i, %act_sorted, %s_rows) : [index](index, index, buffer, buffer)
+        kernel.launch @flint_moe_down_grouped[%max_tiles_v](%max_tiles_v, %t, %act_sorted, %s_rows, %tile_info, %rowmap, %down_exps, %y_sorted) : [index](index, index, buffer, buffer, buffer, buffer, view<150994944xi8>, buffer)
+        kernel.launch @flint_moe_combine[%t](%t, %max_rows, %info, %wts, %pos, %y_sorted, %x) : [index](index, index, buffer, buffer, buffer, buffer, buffer)
+        scf.if %big {
+          kernel.launch @flint_gemm_q8_0_swiglu_m128[%t, %n1024](%t, %n2048, %n1024, %h16, %s_tok, %gate_sh, %up_sh, %g) : [index, index](index, index, index, buffer, buffer, view<2228224xi8>, view<2228224xi8>, buffer)
+        } else {
+          kernel.launch @flint_gemm_q8_0_swiglu[%t, %n1024](%t, %n2048, %n1024, %h16, %s_tok, %gate_sh, %up_sh, %g) : [index, index](index, index, index, buffer, buffer, view<2228224xi8>, view<2228224xi8>, buffer)
+        }
+        kernel.launch @flint_row_scale_f16k[%t](%t, %n1024i, %info, %g, %s_tok2, %g16) : [index](index, index, buffer, buffer, buffer, buffer)
+        scf.if %big {
+          kernel.launch @flint_gemm_q8_0_acc_m128[%t, %n2048](%t, %n1024, %n2048, %g16, %s_tok2, %down_sh, %x) : [index, index](index, index, index, buffer, buffer, view<2228224xi8>, buffer)
+        } else {
+          kernel.launch @flint_gemm_q8_0_acc[%t, %n2048](%t, %n1024, %n2048, %g16, %s_tok2, %down_sh, %x) : [index, index](index, index, index, buffer, buffer, view<2228224xi8>, buffer)
+        }
+      } else {
+        kernel.launch @flint_moe_gate_up[%t](%t, %h, %ids, %gate_exps, %up_exps, %gate_sh, %up_sh, %act, %g) : [index](index, buffer, buffer, view<150994944xi8>, view<150994944xi8>, view<2228224xi8>, view<2228224xi8>, buffer, buffer)
+        kernel.launch @flint_moe_down[%t](%t, %act, %ids, %wts, %down_exps, %g, %down_sh, %x) : [index](index, buffer, buffer, buffer, view<150994944xi8>, buffer, view<2228224xi8>, buffer)
+      }
+    }
+  }
+
+  %output_norm = command.parameter %weights, "output_norm.weight" : view<2048xf32>
+  %head = command.parameter %weights, "output.weight" : view<326713344xi8>
+  kernel.launch @flint_rmsnorm[%t](%t, %x, %output_norm, %h) : [index](index, buffer, view<2048xf32>, buffer)
+  %one_span = index.cmp eq, %spans, %c1 : index
+  scf.if %one_span {
+    kernel.launch @flint_head_single[%spans](%spans, %t, %metadata, %h, %head, %partials) : [index](index, index, buffer, buffer, view<326713344xi8>, buffer)
+  } else {
+    kernel.launch @flint_head_partial[%spans](%spans, %t, %metadata, %h, %head, %partials) : [index](index, index, buffer, buffer, view<326713344xi8>, buffer)
+  }
+  kernel.launch @flint_head_select[%spans](%spans, %metadata, %partials, %outputs) : [index](index, buffer, buffer, buffer)
+  command.return
+}

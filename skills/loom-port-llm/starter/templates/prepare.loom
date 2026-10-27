@@ -1,0 +1,125 @@
+config.def @llm.card = false : i1
+
+func.decl import("input") @require(%condition: i32, %diagnostic: buffer)
+
+func.decl import("json") @members(%json: buffer) -> (buffer, i32, i64)
+
+func.decl import("prepare") @stage(%root: buffer, %tag: i64) -> (i32)
+
+func.decl import("prepare") @config_i64(%stage: i32, %key: buffer, %value: i64)
+
+func.decl import("prepare") @source(%directory: buffer, %path: buffer) -> (i32)
+
+func.decl import("prepare") @parameter(%stage: i32, %binding: i32, %input: i32, %source: i32, %policy: buffer)
+
+func.decl import("prepare") @source_scope(%scope: buffer) -> (i32)
+
+// "model"
+global.rodata.def @model_scope = bytes("6d6f64656c")
+
+// "llm_advance"
+global.rodata.def @root = bytes("6c6c6d5f616476616e6365")
+
+// "llm.context", "llm.spans", "llm.tokens", "llm.pool"
+global.rodata.def @context_key = bytes("6c6c6d2e636f6e74657874")
+
+global.rodata.def @spans_key = bytes("6c6c6d2e7370616e73")
+
+global.rodata.def @tokens_key = bytes("6c6c6d2e746f6b656e73")
+
+global.rodata.def @pool_key = bytes("6c6c6d2e706f6f6c")
+
+// "weights.loom"
+global.rodata.def @policy = bytes("776569676874732e6c6f6f6d")
+
+// "@@TERMINAL@@" is the service terminal marker.
+global.rodata.def @terminal = bytes("@@HEX_TERMINAL@@")
+
+global.rodata.def @empty = bytes("")
+
+// "llm requires pooled epochs without MTP, at most 128 shapes and a context of at most @@MAX_CONTEXT@@"
+global.rodata.def @unsupported = bytes("@@HEX_UNSUPPORTED@@")
+
+func.decl @llm_storage(%maximum: i64, %span_capacity: i64, %context: i64, %pool: i64, %rows: i64, %pins: i64) -> (buffer, buffer, buffer, buffer, buffer)
+
+// Control state layout: [0, 8) unused, [8, 88) two transfer records,
+// [88, 128) layout recipe, [128, 128 + 4 * shapes) stage per packing shape.
+func.def public @prepare(%prefill: i64, %context: i64, %pool: i64, %rows: i64, %pins: i64, %draft_depth: i32, %shapes: buffer, %shape_count: i64, %weights: buffer, %options: buffer) -> (i64, i32, buffer, buffer, buffer, buffer, buffer, buffer, buffer) {
+  %c0_source = scalar.constant 0 : i32
+  %origin = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c0_i32 = scalar.constant 0 : i32
+  %c0_i64 = scalar.constant 0 : i64
+  %c64_i64 = scalar.constant 128 : i64
+  %c4096_i64 = scalar.constant @@MAX_CONTEXT@@ : i64
+  %pooled = scalar.cmpi ne, %pool, %c0_i64 : i64
+  %packed = scalar.cmpi ne, %shape_count, %c0_i64 : i64
+  %few_shapes = scalar.cmpi ule, %shape_count, %c64_i64 : i64
+  %short_context = scalar.cmpi ule, %context, %c4096_i64 : i64
+  %no_draft = scalar.cmpi eq, %draft_depth, %c0_i32 : i32
+  %has_epochs = scalar.andi %pooled, %packed : i1
+  %mode_ok = scalar.andi %has_epochs, %no_draft : i1
+  %limits_ok = scalar.andi %few_shapes, %short_context : i1
+  %supported = scalar.andi %mode_ok, %limits_ok : i1
+  %supported32 = scalar.extui %supported : i1 to i32
+  %error = global.load @unsupported : buffer
+  func.call @require(%supported32, %error) : (i32, buffer)
+  %empty = global.load @empty : buffer
+  %policy = global.load @policy : buffer
+  %card = config.get @llm.card : i1
+  %checkpoint = scf.if %card -> (i32) {
+    %scope = global.load @model_scope : buffer
+    %scoped = func.call @source_scope(%scope) : (buffer) -> (i32)
+    scf.yield %scoped : i32
+  } else {
+    %direct = func.call @source(%empty, %weights) : (buffer, buffer) -> (i32)
+    scf.yield %direct : i32
+  }
+  %bounded_count = scalar.assume %shape_count [range(%shape_count, 1, 128)] : i64
+  %count = index.cast %bounded_count : i64 to index
+  %c4_off = index.constant 4 : offset
+  %stage_slots = index.constant 128 : index
+  %stage_bytes = index.scale %stage_slots, %c4_off : index, offset -> offset
+  %header_bytes = index.constant 128 : offset
+  %state_bytes = index.add %header_bytes, %stage_bytes : offset
+  %state = buffer.alloca<private> align(8) %state_bytes : buffer
+  buffer.fill %c0_i32, %state[%origin], %state_bytes : i32
+  %stage_view = buffer.view %state[%header_bytes] : buffer -> view<[%count]xi32>
+  %root = global.load @root : buffer
+  %context_key = global.load @context_key : buffer
+  %spans_key = global.load @spans_key : buffer
+  %tokens_key = global.load @tokens_key : buffer
+  %pool_key = global.load @pool_key : buffer
+  %shape_view = buffer.view %shapes[%origin] : buffer -> view<[%count]x2xi64>
+  %maximum, %span_capacity = scf.for %i = [%c0 to %count step %c1](%previous = %c0_i64 : i64, %previous_spans = %c0_i64 : i64) -> (i64, i64) {
+    %tokens = view.load %shape_view[%i, 0] : view<[%count]x2xi64> -> i64
+    %spans = view.load %shape_view[%i, 1] : view<[%count]x2xi64> -> i64
+    %tag = index.cast %i : index to i64
+    %stage = func.call @stage(%root, %tag) : (buffer, i64) -> (i32)
+    func.call @config_i64(%stage, %context_key, %context) : (i32, buffer, i64)
+    func.call @config_i64(%stage, %pool_key, %pool) : (i32, buffer, i64)
+    func.call @config_i64(%stage, %tokens_key, %tokens) : (i32, buffer, i64)
+    func.call @config_i64(%stage, %spans_key, %spans) : (i32, buffer, i64)
+    func.call @parameter(%stage, %c0_i32, %c0_source, %checkpoint, %policy) : (i32, i32, i32, i32, buffer)
+    view.store %stage, %stage_view[%i] : i32, view<[%count]xi32>
+    %larger = scalar.cmpi ugt, %tokens, %previous : i64
+    %next = scf.select %larger, %tokens, %previous : i64
+    %more_spans = scalar.cmpi ugt, %spans, %previous_spans : i64
+    %next_spans = scf.select %more_spans, %spans, %previous_spans : i64
+    scf.yield %next, %next_spans : i64, i64
+  }
+  %smaller = scalar.cmpi ult, %maximum, %prefill : i64
+  %effective = scf.select %smaller, %maximum, %prefill : i64
+  %layout_origin = index.constant 88 : offset
+  %layout = buffer.view %state[%layout_origin] : buffer -> view<5xi64>
+  view.store %maximum, %layout[0] : i64, view<5xi64>
+  view.store %span_capacity, %layout[1] : i64, view<5xi64>
+  view.store %context, %layout[2] : i64, view<5xi64>
+  view.store %pool, %layout[3] : i64, view<5xi64>
+  view.store %pins, %layout[4] : i64, view<5xi64>
+  %stage_count32 = index.cast %count : index to i32
+  %allocations, %views, %origins, %draft, %geometry = func.call @llm_storage(%maximum, %span_capacity, %context, %pool, %rows, %pins) : (i64, i64, i64, i64, i64, i64) -> (buffer, buffer, buffer, buffer, buffer)
+  %terminal = global.load @terminal : buffer
+  func.return %effective, %stage_count32, %state, %terminal, %allocations, %views, %origins, %empty, %geometry : i64, i32, buffer, buffer, buffer, buffer, buffer, buffer, buffer
+}
