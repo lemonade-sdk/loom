@@ -1,6 +1,6 @@
 {
   "name": "loom",
-  "owner": { "name": "Lemonade SDK" },
+  "owner": { "name": "loom-fun" },
   "description": "Claude Code skills for AMD Loom",
   "plugins": [
     {

@@ -19,14 +19,14 @@ The skills were developed and verified on an AMD Ryzen AI Max+ 395 "Strix Halo"
 **As a Claude Code plugin (recommended).** Run these inside Claude Code:
 
 ```
-/plugin marketplace add lemonade-sdk/loom
+/plugin marketplace add loom-fun/loom-skills
 /plugin install loom@loom
 ```
 
 Or from a shell:
 
 ```bash
-claude plugin marketplace add lemonade-sdk/loom
+claude plugin marketplace add loom-fun/loom-skills
 claude plugin install loom@loom
 ```
 
@@ -40,7 +40,7 @@ Then start a new session. To update later, run
 **Or as plain user skills**, by copying them into `~/.claude/skills`:
 
 ```bash
-git clone https://github.com/lemonade-sdk/loom && ./loom/install.sh      # ./install.sh --uninstall to remove
+git clone https://github.com/loom-fun/loom-skills && ./loom-skills/install.sh      # ./install.sh --uninstall to remove
 ```
 
 ## Use
@@ -151,7 +151,7 @@ works both as a plugin and when copied to `~/.claude/skills`.
 
 ## Contributing
 
-To try local changes without installing, run `claude --plugin-dir /path/to/loom`, and
+To try local changes without installing, run `claude --plugin-dir /path/to/loom-skills`, and
 check the manifests with `claude plugin validate .`. When you fix a skill, rerun a
 cold-start test: a fresh subagent follows the skills literally in a new install root
 and reports every wrong or missing instruction. That is how these skills were
