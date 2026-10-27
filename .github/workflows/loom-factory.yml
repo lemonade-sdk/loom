@@ -31,11 +31,13 @@ env:
   # Models that failed this many times in the last ARTIFACT_DAYS are skipped by scheduled runs.
   MAX_ATTEMPTS: 2
   ARTIFACT_DAYS: 30
+  # Models downloaded by a run are kept for reuse unless less than this much disk is free when it ends.
+  MIN_FREE_GB: 150
   ANTHROPIC_FEDERATION_RULE_ID: fdrl_01H4DUTGWQpKxWJo6syehWrW
   ANTHROPIC_ORGANIZATION_ID: 9bdff596-1595-4140-8301-817e43ef8412
   ANTHROPIC_SERVICE_ACCOUNT_ID: svac_01RaWseoyo5MeWhBYqZYEkfr
   ANTHROPIC_WORKSPACE_ID: wrkspc_01DcG9t7asPHNeFbcKtktSu3
-  ANTHROPIC_MODEL: claude-sonnet-4-5
+  ANTHROPIC_MODEL: claude-opus-5-5
 
 jobs:
   select:
@@ -107,9 +109,7 @@ jobs:
         run: |
           set -euo pipefail
           WORK=$HOME/loom-factory/$SLUG
-          mkdir -p "$WORK"
-          # Keep a previous attempt's GGUF download; everything else starts fresh.
-          find "$WORK" -mindepth 1 -maxdepth 1 ! -name gguf -exec rm -rf {} +
+          rm -rf "$WORK"
           mkdir -p "$WORK/serve"
           printf '{"source":"%s","quant":"%s","run":"%s/%s/actions/runs/%s"}\n' \
             "$SOURCE" "$QUANT" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" > "$WORK/attempt.json"
@@ -117,15 +117,43 @@ jobs:
           echo "LOOM_SERVE_STATE=$WORK/serve" >> "$GITHUB_ENV"
           echo "Converting [$SOURCE](https://huggingface.co/$SOURCE) ($QUANT, $GIB GiB) → [$TARGET](https://huggingface.co/$TARGET)" >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Download the GGUF
+      - name: Get the GGUF (reuse a local copy if present)
         env:
           HF_TOKEN: ${{ secrets.HF_LOOM_FACTORY }}
         run: |
           set -euo pipefail
           python3 -m venv "$RUNNER_TEMP/hf"
           "$RUNNER_TEMP/hf/bin/pip" install -q -U huggingface_hub
-          mapfile -t files < <(python3 -c 'import json, os; print("\n".join(json.loads(os.environ["FILES"])))')
-          "$RUNNER_TEMP/hf/bin/hf" download "$SOURCE" "${files[@]}" --local-dir "$WORK/gguf"
+          "$RUNNER_TEMP/hf/bin/python" - <<'EOF'
+          import json, os
+          from huggingface_hub import constants, hf_hub_download, try_to_load_from_cache
+
+          src, work = os.environ["SOURCE"], os.environ["WORK"]
+          dest = os.path.join(work, "gguf")
+          # Repos already in the shared cache belong to someone else; cleanup must leave them alone.
+          cache = constants.HF_HUB_CACHE
+          before = sorted(d for d in os.listdir(cache) if d.startswith("models--")) if os.path.isdir(cache) else []
+          json.dump({"cache": cache, "repos": before}, open(os.path.join(work, "hf-cache-before.json"), "w"))
+          lines, downloaded = [], []
+          for f in json.loads(os.environ["FILES"]):
+              path = os.path.join(dest, f)
+              os.makedirs(os.path.dirname(path), exist_ok=True)
+              cached = try_to_load_from_cache(src, f)
+              if isinstance(cached, str) and os.path.exists(cached):
+                  lines.append(f"- `{f}`: already available locally ({cached}), not downloaded")
+              else:
+                  # Into the cache, so a copy kept after the run is found by the check above next time.
+                  cached = hf_hub_download(src, f)
+                  downloaded.append(cached)
+                  lines.append(f"- `{f}`: not available locally, downloaded "
+                               f"({os.path.getsize(cached) / 2**30:.1f} GiB)")
+              os.symlink(os.path.realpath(cached), path)
+          json.dump(downloaded, open(os.path.join(work, "hf-downloaded.json"), "w"))
+          report = "\n".join(lines)
+          print(report)
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as s:
+              s.write("\n" + report + "\n")
+          EOF
 
       - name: Install Claude Code
         run: |
@@ -167,7 +195,9 @@ jobs:
 
           This is an unattended CI run on the Strix Halo; nobody can answer questions, so never stop to ask.
           - Working directory: $WORK. The GGUF is already downloaded: $files.
-            If it is split into shards, merge them into one GGUF in $WORK/gguf first.
+            If it is split into shards, merge them into one GGUF in $WORK/gguf first. Never modify or
+            delete files outside $WORK; the GGUF may be a symlink into the shared Hugging Face cache.
+            Download any other model into the Hugging Face cache (hf download without --local-dir).
           - Write the finished package to $WORK/pkg (model.json, program/*.loom, weights.loom, tokenizer.json,
             llm_config.json), the benchmark/roofline outputs to $WORK/bench, and the final report to $WORK/REPORT.md.
           - Reuse the Loom install at ~/loom if present (install it with loom-setup otherwise) and the llama.cpp
@@ -216,8 +246,6 @@ jobs:
           "$RUNNER_TEMP/hf/bin/python" .github/scripts/loom_factory.py publish --work "$WORK" \
             --source "$SOURCE" --target "$TARGET" --quant "$QUANT" --files "$FILES"
           echo "Published https://huggingface.co/$TARGET" >> "$GITHUB_STEP_SUMMARY"
-          # The weights are on the hub already; free the disk.
-          rm -rf "$WORK/gguf"
 
       - name: Stop leftover servers
         if: always()
@@ -230,6 +258,46 @@ jobs:
             tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | grep -q llama-server && kill "$pid" || true
             rm -f "$f"
           done
+
+      - name: Delete downloaded models if disk space is low
+        if: always()
+        run: |
+          set -uo pipefail
+          [ -n "${WORK:-}" ] || exit 0
+          # Work-directory copies (links into the cache, merged GGUFs) are never reused; symlinks are
+          # removed without touching their targets.
+          rm -rf "$WORK/gguf"
+          find "$WORK" \( -name '*.gguf' -o -name '*.safetensors' \) \( -type f -o -type l \) -print -delete
+          [ -f "$WORK/hf-cache-before.json" ] || exit 0
+          "$RUNNER_TEMP/hf/bin/python" - <<'EOF'
+          import json, os, shutil
+          work = os.environ["WORK"]
+          s = json.load(open(os.path.join(work, "hf-cache-before.json")))
+          cache, min_free = s["cache"], float(os.environ["MIN_FREE_GB"]) * 1e9
+          downloaded = json.load(open(os.path.join(work, "hf-downloaded.json"))) \
+              if os.path.exists(os.path.join(work, "hf-downloaded.json")) else []
+          # This run's GGUF downloads, plus cache repos that first appeared during the run (e.g. fetched by
+          # the agent). Anything that was in the cache before the run is never deleted.
+          new_repos = sorted(d for d in set(os.listdir(cache)) - set(s["repos"]) if d.startswith("models--")) \
+              if os.path.isdir(cache) else []
+          free = shutil.disk_usage(cache if os.path.isdir(cache) else work).free
+          if free >= min_free:
+              msg = (f"{free / 1e9:.0f} GB free (at least {min_free / 1e9:.0f} GB): kept this run's models in the "
+                     f"Hugging Face cache for reuse.")
+          else:
+              for snap in downloaded:
+                  for p in (os.path.realpath(snap), snap):
+                      if os.path.lexists(p):
+                          os.remove(p)
+              for d in new_repos:
+                  shutil.rmtree(os.path.join(cache, d), ignore_errors=True)
+              after = shutil.disk_usage(cache if os.path.isdir(cache) else work).free
+              msg = (f"{free / 1e9:.0f} GB free (under {min_free / 1e9:.0f} GB): deleted this run's models "
+                     f"({len(downloaded)} downloaded files, {len(new_repos)} new cache repos), now {after / 1e9:.0f} GB free.")
+          print(msg)
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as f:
+              f.write(msg + "\n")
+          EOF
 
       # Scheduled runs count these to stop retrying a model that keeps failing.
       - name: Upload the attempt logs
