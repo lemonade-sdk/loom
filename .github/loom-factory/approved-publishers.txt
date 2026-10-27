@@ -1,0 +1,33 @@
+# Hugging Face organizations whose GGUF repositories loom-factory may convert on a schedule.
+# Each entry is an organization account (not an individual) that is either the original model
+# developer or an established quantization provider. One name per line; matching is case-insensitive.
+# Manually requested checkpoints are not restricted to this list.
+
+# Quantization providers
+unsloth               # Unsloth AI
+ggml-org              # llama.cpp / GGML maintainers
+lmstudio-community    # LM Studio
+
+# Model developers
+Qwen                  # Alibaba Cloud Qwen team
+google
+microsoft
+amd
+nvidia
+meta-llama
+mistralai
+deepseek-ai
+openai
+ibm-granite           # IBM
+Intel
+tencent
+LiquidAI
+allenai               # Allen Institute for AI
+HuggingFaceTB         # Hugging Face
+tiiuae                # Technology Innovation Institute
+CohereLabs
+LGAI-EXAONE           # LG AI Research
+zai-org               # Zhipu AI (GLM)
+openbmb               # OpenBMB / Tsinghua (MiniCPM)
+internlm              # Shanghai AI Laboratory
+JetBrains
