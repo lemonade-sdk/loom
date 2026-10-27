@@ -1,14 +1,36 @@
 name: loom-factory
 
+# Each run ports one GGUF LLM to Loom on the self-hosted Strix Halo and publishes the package to
+# huggingface.co/loom-fun. Without a checkpoint input it takes the highest-trending GGUF chat LLM
+# (of the top 20 that fit) that loom-fun doesn't have yet, and skips if another run is active.
+# Scheduled runs only consider repositories published by the approved organizations listed in
+# PUBLISHERS in .github/scripts/loom_factory.py.
+
 on:
-  push:
+  schedule:
+    - cron: "17 * * * *"
   workflow_dispatch:
+    inputs:
+      checkpoint:
+        description: "HF GGUF repo to convert, as org/repo or org/repo:path/to/file.gguf (empty = next of the top 20)"
+        required: false
+        default: ""
+      optimize_hours:
+        description: "Optimization budget after the port passes the correctness gate (0 = port and validate only)"
+        required: false
+        default: "1"
 
 permissions:
-  id-token: write
   contents: read
 
 env:
+  HF_ORG: loom-fun
+  TOP_N: 20
+  # Strix Halo GPU budget is ~61 GiB GTT; leave room for the KV pool and workspace.
+  MAX_WEIGHTS_GIB: 48
+  # Models that failed this many times in the last ARTIFACT_DAYS are skipped by scheduled runs.
+  MAX_ATTEMPTS: 2
+  ARTIFACT_DAYS: 30
   ANTHROPIC_FEDERATION_RULE_ID: fdrl_01H4DUTGWQpKxWJo6syehWrW
   ANTHROPIC_ORGANIZATION_ID: 9bdff596-1595-4140-8301-817e43ef8412
   ANTHROPIC_SERVICE_ACCOUNT_ID: svac_01RaWseoyo5MeWhBYqZYEkfr
@@ -16,67 +38,213 @@ env:
   ANTHROPIC_MODEL: claude-sonnet-4-5
 
 jobs:
-  call-claude:
+  select:
     runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      found: ${{ steps.pick.outputs.found }}
+      source: ${{ steps.pick.outputs.source }}
+      target: ${{ steps.pick.outputs.target }}
+      slug: ${{ steps.pick.outputs.slug }}
+      quant: ${{ steps.pick.outputs.quant }}
+      files: ${{ steps.pick.outputs.files }}
+      gib: ${{ steps.pick.outputs.gib }}
     steps:
-      - name: Fetch GitHub OIDC token
-        uses: actions/github-script@v8
-        with:
-          script: |
-            const token = await core.getIDToken('https://api.anthropic.com');
-            core.setSecret(token);
-            core.exportVariable('JWT', token);
+      - uses: actions/checkout@v5
 
-      - name: Exchange for an Anthropic access token
+      # An explicitly requested checkpoint never skips; it queues for the runner instead.
+      - name: Skip if an earlier run is still active
+        id: busy
+        if: inputs.checkpoint == ''
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-
-          body=$(jq -n \
-            --arg assertion "$JWT" \
-            --arg rule "$ANTHROPIC_FEDERATION_RULE_ID" \
-            --arg org "$ANTHROPIC_ORGANIZATION_ID" \
-            --arg sa "$ANTHROPIC_SERVICE_ACCOUNT_ID" \
-            --arg ws "$ANTHROPIC_WORKSPACE_ID" \
-            '{
-              grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
-              assertion: $assertion,
-              federation_rule_id: $rule,
-              organization_id: $org,
-              service_account_id: $sa,
-              workspace_id: $ws
-            }')
-
-          response=$(curl -sS --fail-with-body https://api.anthropic.com/v1/oauth/token \
-            -H "content-type: application/json" \
-            --data "$body") || {
-              echo "Token exchange failed:"
-              echo "$response" | jq 'with_entries(if (.key | test("token$")) then .value = "<redacted>" else . end)' || echo "$response"
-              exit 1
-            }
-
-          access_token=$(echo "$response" | jq -r '.access_token // empty')
-          if [ -z "$access_token" ]; then
-            echo "No access_token in response:"
-            echo "$response" | jq 'with_entries(if (.key | test("token$")) then .value = "<redacted>" else . end)'
-            exit 1
+          wf=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" --jq .workflow_id)
+          active=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$wf/runs?per_page=100" --jq \
+            "[.workflow_runs[] | select(.id != $GITHUB_RUN_ID and (.status | IN(\"queued\",\"in_progress\",\"waiting\",\"pending\",\"requested\"))) | .html_url] | join(\" \")")
+          if [ -n "$active" ]; then
+            echo "Skipping: another loom-factory run is active: $active" | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
           fi
 
-          echo "::add-mask::$access_token"
-          echo "ANTHROPIC_ACCESS_TOKEN=$access_token" >> "$GITHUB_ENV"
-          echo "$response" | jq 'with_entries(if (.key | test("token$")) then .value = "<redacted>" else . end)'
-
-      - name: Call Claude
+      - name: Pick the model
+        id: pick
+        if: steps.busy.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HF_TOKEN: ${{ secrets.HF_LOOM_FACTORY }}
+          CHECKPOINT: ${{ inputs.checkpoint }}
         run: |
           set -euo pipefail
+          gh api --paginate "repos/$GITHUB_REPOSITORY/actions/artifacts?per_page=100" \
+            --jq '.artifacts[] | select(.expired | not) | .name' > attempts.txt
+          python3 .github/scripts/loom_factory.py select --org "$HF_ORG" --top "$TOP_N" --max-gib "$MAX_WEIGHTS_GIB" \
+            --max-attempts "$MAX_ATTEMPTS" --attempts-file attempts.txt ${CHECKPOINT:+--checkpoint "$CHECKPOINT"}
 
-          body=$(jq -n --arg model "$ANTHROPIC_MODEL" '{
-            model: $model,
-            max_tokens: 256,
-            messages: [{role: "user", content: "Say hello from GitHub Actions via workload identity federation."}]
-          }')
+  convert:
+    needs: select
+    if: needs.select.outputs.found == 'true'
+    runs-on: [self-hosted, Linux, X64]
+    timeout-minutes: 600
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      SOURCE: ${{ needs.select.outputs.source }}
+      TARGET: ${{ needs.select.outputs.target }}
+      SLUG: ${{ needs.select.outputs.slug }}
+      QUANT: ${{ needs.select.outputs.quant }}
+      FILES: ${{ needs.select.outputs.files }}
+      GIB: ${{ needs.select.outputs.gib }}
+      OPTIMIZE_HOURS: ${{ inputs.optimize_hours || '1' }}
+    steps:
+      - uses: actions/checkout@v5
 
-          curl -sS --fail-with-body https://api.anthropic.com/v1/messages \
-            -H "authorization: Bearer $ANTHROPIC_ACCESS_TOKEN" \
-            -H "anthropic-version: 2023-06-01" \
-            -H "content-type: application/json" \
-            --data "$body" | jq .
+      - name: Prepare the work directory
+        run: |
+          set -euo pipefail
+          WORK=$HOME/loom-factory/$SLUG
+          mkdir -p "$WORK"
+          # Keep a previous attempt's GGUF download; everything else starts fresh.
+          find "$WORK" -mindepth 1 -maxdepth 1 ! -name gguf -exec rm -rf {} +
+          mkdir -p "$WORK/serve"
+          printf '{"source":"%s","quant":"%s","run":"%s/%s/actions/runs/%s"}\n' \
+            "$SOURCE" "$QUANT" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" > "$WORK/attempt.json"
+          echo "WORK=$WORK" >> "$GITHUB_ENV"
+          echo "LOOM_SERVE_STATE=$WORK/serve" >> "$GITHUB_ENV"
+          echo "Converting [$SOURCE](https://huggingface.co/$SOURCE) ($QUANT, $GIB GiB) → [$TARGET](https://huggingface.co/$TARGET)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Download the GGUF
+        env:
+          HF_TOKEN: ${{ secrets.HF_LOOM_FACTORY }}
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RUNNER_TEMP/hf"
+          "$RUNNER_TEMP/hf/bin/pip" install -q -U huggingface_hub
+          mapfile -t files < <(python3 -c 'import json, os; print("\n".join(json.loads(os.environ["FILES"])))')
+          "$RUNNER_TEMP/hf/bin/hf" download "$SOURCE" "${files[@]}" --local-dir "$WORK/gguf"
+
+      - name: Install Claude Code
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.local/bin:$PATH"
+          command -v claude >/dev/null || curl -fsSL https://claude.ai/install.sh | bash
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          claude --version
+
+      - name: Port the model with the Loom skills
+        timeout-minutes: 540
+        run: |
+          set -euo pipefail
+          # Claude Code exchanges this JWT through workload identity federation and re-reads the file at
+          # every refresh. GitHub JWTs live ~5 min and are single-use, so keep rotating it.
+          export ANTHROPIC_IDENTITY_TOKEN_FILE="$RUNNER_TEMP/gha-jwt"
+          fetch_jwt() {
+            curl -sSf -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+              "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=https://api.anthropic.com" \
+              | python3 -c 'import json, sys; print(json.load(sys.stdin)["value"])' > "$ANTHROPIC_IDENTITY_TOKEN_FILE.tmp" \
+              && mv "$ANTHROPIC_IDENTITY_TOKEN_FILE.tmp" "$ANTHROPIC_IDENTITY_TOKEN_FILE"
+          }
+          fetch_jwt
+          ( while sleep 60; do fetch_jwt || echo "JWT refresh failed; retrying"; done ) &
+          refresher=$!
+          trap 'kill $refresher 2>/dev/null' EXIT
+          # A static credential on the runner would shadow federation.
+          unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_OAUTH_TOKEN
+
+          files=$(python3 -c 'import json, os; print(", ".join("gguf/" + f for f in json.loads(os.environ["FILES"])))')
+          if [ "$OPTIMIZE_HOURS" = "0" ]; then
+            goal="Port it, pass the loom-benchmark correctness gate against llama.cpp ROCm, measure the llama.cpp baseline and Loom's performance, and report. Skip optimization."
+          else
+            goal="Get it working on loom-serve, optimize it for $OPTIMIZE_HOURS hour(s), and report the performance relative to llama.cpp ROCm (the full end-to-end pipeline of the loom skill, including roofline, gates and audit)."
+          fi
+          cat > "$WORK/prompt.md" <<EOF
+          Use the Loom skills to port the Hugging Face GGUF checkpoint $SOURCE ($QUANT) to Loom.
+          $goal
+
+          This is an unattended CI run on the Strix Halo; nobody can answer questions, so never stop to ask.
+          - Working directory: $WORK. The GGUF is already downloaded: $files.
+            If it is split into shards, merge them into one GGUF in $WORK/gguf first.
+          - Write the finished package to $WORK/pkg (model.json, program/*.loom, weights.loom, tokenizer.json,
+            llm_config.json), the benchmark/roofline outputs to $WORK/bench, and the final report to $WORK/REPORT.md.
+          - Reuse the Loom install at ~/loom if present (install it with loom-setup otherwise) and the llama.cpp
+            ROCm builds already on this machine. Do not download and run new binaries. If no usable llama.cpp
+            ROCm build exists, fail.
+          - Start loom-serve only through the loom-setup serve.sh script (LOOM_SERVE_STATE is set), and stop
+            every server you started before you finish.
+          - Finish by writing $WORK/result.json:
+            {"status": "ok" or "failed", "reason": "<one line>", "metrics": {<headline numbers from the report>}}
+            Use "ok" only if the package serves and passed the correctness gate.
+          EOF
+          cd "$WORK"
+          claude -p "$(cat prompt.md)" --plugin-dir "$GITHUB_WORKSPACE" --model "$ANTHROPIC_MODEL" \
+            --permission-mode bypassPermissions --output-format stream-json --verbose \
+            | tee claude.jsonl | python3 -c '
+          import json, sys
+          for line in sys.stdin:
+              try: m = json.loads(line)
+              except ValueError: continue
+              for c in (m.get("message") or {}).get("content") or []:
+                  if isinstance(c, dict) and c.get("type") == "text": print(c["text"], flush=True)
+              if m.get("type") == "result": print("== result:", m.get("subtype"), m.get("total_cost_usd"), flush=True)
+          '
+
+      - name: Check the result
+        run: |
+          set -euo pipefail
+          test -f "$WORK/result.json" || { echo "::error::the agent wrote no result.json"; exit 1; }
+          cat "$WORK/result.json"
+          python3 - <<'EOF'
+          import glob, json, os, sys
+          w = os.environ["WORK"]
+          r = json.load(open(f"{w}/result.json"))
+          if r.get("status") != "ok":
+              sys.exit(f"::error::port failed: {r.get('reason')}")
+          if not os.path.isfile(f"{w}/pkg/model.json") or not glob.glob(f"{w}/pkg/**/*.loom", recursive=True):
+              sys.exit("::error::result is ok but pkg/ has no model.json or .loom files")
+          EOF
+          { echo "### Report"; echo; cat "$WORK/REPORT.md" 2>/dev/null || echo "_no REPORT.md_"; } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Publish to Hugging Face
+        env:
+          HF_TOKEN: ${{ secrets.HF_LOOM_FACTORY }}
+        run: |
+          set -euo pipefail
+          "$RUNNER_TEMP/hf/bin/python" .github/scripts/loom_factory.py publish --work "$WORK" \
+            --source "$SOURCE" --target "$TARGET" --quant "$QUANT" --files "$FILES"
+          echo "Published https://huggingface.co/$TARGET" >> "$GITHUB_STEP_SUMMARY"
+          # The weights are on the hub already; free the disk.
+          rm -rf "$WORK/gguf"
+
+      - name: Stop leftover servers
+        if: always()
+        run: |
+          for f in "$WORK"/serve/*.pid; do
+            [ -f "$f" ] && "$GITHUB_WORKSPACE/skills/loom-setup/scripts/stop.sh" "$(basename "$f" .pid)" || true
+          done
+          for f in $(find /tmp -maxdepth 1 -name 'llamacpp-*.pid' -newer "$WORK/attempt.json" 2>/dev/null); do
+            pid=$(cat "$f")
+            tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | grep -q llama-server && kill "$pid" || true
+            rm -f "$f"
+          done
+
+      # Scheduled runs count these to stop retrying a model that keeps failing.
+      - name: Upload the attempt logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: loom-factory-attempt-${{ env.SLUG }}-${{ github.run_id }}
+          retention-days: ${{ env.ARTIFACT_DAYS }}
+          if-no-files-found: ignore
+          path: |
+            ${{ env.WORK }}/attempt.json
+            ${{ env.WORK }}/prompt.md
+            ${{ env.WORK }}/claude.jsonl
+            ${{ env.WORK }}/result.json
+            ${{ env.WORK }}/REPORT.md
+            ${{ env.WORK }}/bench/**/*.json
+            ${{ env.WORK }}/bench/**/*.jsonl
+            ${{ env.WORK }}/bench/**/*.md
