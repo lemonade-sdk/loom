@@ -212,6 +212,10 @@ jobs:
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as s:
               s.write(f"\n- {msg}\n")
           EOF
+
+      - name: Check that the llama.cpp build sees the GPU
+        run: |
+          set -euo pipefail
           cd "$LLAMACPP_LATEST"
           LD_LIBRARY_PATH=$PWD ./llama-server --list-devices 2>&1 | grep ROCm \
             || echo "::warning::llama.cpp ROCm $LLAMACPP_LATEST_TAG at $LLAMACPP_LATEST lists no ROCm device"
