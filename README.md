@@ -45,11 +45,51 @@ git clone https://github.com/lemonade-sdk/loom && ./loom/install.sh      # ./ins
 
 ## Use
 
+### Recommended: port, optimize and report in one prompt
+
+```
+/loom get <hf-org>/<model> working on loom-serve, optimize it, and report the performance relative to llamacpp rocm
+```
+
+Claude runs the whole pipeline without stopping:
+1. reuse or install Loom;
+2. port the GGUF;
+3. pass the token-by-token correctness gate against llama.cpp ROCm;
+4. measure the llama.cpp baseline;
+5. run a **roofline analysis** that sets realistic per-metric targets;
+6. optimize under a rate-of-approach controller;
+7. re-run the gates;
+8. serve the model and report.
+
+It stops to ask only for a gated-model license or approval of a downloaded binary.
+
+Tested on nvidia/NVIDIA-Nemotron-3.5-Bolt-E4B-4GB (Gemma-4 E4B architecture), with a
+fresh agent and this single prompt. The run took 79 minutes. The results, against
+llama.cpp ROCm b1355 on the same GGUF:
+
+| Metric | Margin |
+|---|---|
+| Decode | +14 % |
+| Prefill 1k | +38 % |
+| Prefill 2k | +39 % |
+| 4 streams | +7 % |
+
+Every divergence from llama.cpp's output was a near-tie, up to 32k-token prompts.
+
+**Effort control.** With no target and no time given, the optimization phase gets
+**1 hour**. Add either to the prompt to change it, for example "…optimize it for 3
+hours…" or "…until decode is 50 % faster than llama.cpp…". The roofline step checks
+a stated target against the hardware ceiling and says so up front if it is out of
+reach.
+
+### Other examples
+
 Ask in plain language, for example:
 - "install Loom and serve moonshine";
 - "port Qwen3-4B-Instruct-2507 to loom-serve and validate it against llama.cpp";
 - "benchmark my Loom port";
-- "optimize this model" (runs a roofline analysis, picks the targets, then iterates until they are met).
+- "optimize this model" (roofline → targets → about 1 h of optimization → report);
+- "what's the roofline for this model?" or "is +50 % decode achievable?".
 
 The skill descriptions make Claude pick the right one. You can also invoke a skill by
 name:
@@ -64,11 +104,15 @@ name:
 | `/loom:loom-optimize` | `/loom-optimize` | The measure / ablate / change / verify loop, a kernel A/B helper, a catalog of optimizations that worked (and that didn't), and the sources of a hand-tuned MoE port |
 | `/loom:loom-benchmark` | `/loom-benchmark` | Token-by-token golden comparison against llama.cpp ROCm, a batching-consistency check, throughput workloads, reporting rules |
 
-A full cold-start run takes about 10–25 minutes for a small model. In order:
+A full cold-start port takes about 10–25 minutes for a small dense model, and about
+35 minutes for an architecture the starter kit doesn't cover (Gemma-4 E4B). In
+order:
 1. install (≈15 s);
 2. port a model;
 3. pass the golden check;
-4. measure performance against llama.cpp.
+4. measure performance against llama.cpp;
+5. roofline and targets;
+6. optimize (1 h by default).
 
 ## Requirements
 
