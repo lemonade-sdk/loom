@@ -2,7 +2,7 @@ name: loom-factory
 
 # Each run ports one GGUF LLM to Loom on the self-hosted Strix Halo and publishes the package to
 # huggingface.co/loom-fun. Without a checkpoint input it takes the highest-trending GGUF chat LLM
-# (of the top 20 that fit) that loom-fun doesn't have yet, and skips if another run is active.
+# (of the top 10 that fit) that loom-fun doesn't have yet, and skips if another run is active.
 # Scheduled runs only consider repositories published by the approved organizations listed in
 # PUBLISHERS in .github/scripts/loom_factory.py.
 
@@ -12,7 +12,7 @@ on:
   workflow_dispatch:
     inputs:
       checkpoint:
-        description: "HF GGUF repo to convert, as org/repo or org/repo:path/to/file.gguf (empty = next of the top 20)"
+        description: "HF GGUF repo to convert, as org/repo or org/repo:path/to/file.gguf (empty = next of the top 10)"
         required: false
         default: ""
       optimize_hours:
@@ -25,7 +25,7 @@ permissions:
 
 env:
   HF_ORG: loom-fun
-  TOP_N: 20
+  TOP_N: 10
   # Strix Halo GPU budget is ~61 GiB GTT; leave room for the KV pool and workspace.
   MAX_WEIGHTS_GIB: 48
   # Models that failed this many times in the last ARTIFACT_DAYS are skipped by scheduled runs.
