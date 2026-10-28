@@ -78,22 +78,26 @@ def pick_weights(repo, params, token):
     return None
 
 
-def target_name(source, org):
+def target_name(source, org, bases):
+    """`org/<model>`, or `org/<publisher>-<model>` if another source already has the short name."""
     owner, name = source.split("/")
     name = re.sub(r"[-_.]?gguf$", "", name, flags=re.I)
-    return f"{org}/{owner}-{name}-loom"[: len(org) + 1 + 96]
+    for target in (f"{org}/{name}", f"{org}/{owner}-{name}"):
+        target = target[: len(org) + 1 + 96]
+        if source in bases.get(target, [source]):
+            return target
+    return target
 
 
 def published(org, token):
-    """Repo ids on `org`, plus the source GGUF repo each one declares as base_model."""
-    names, sources, url = set(), set(), f"{HF}/api/models?author={org}&limit=100&expand[]=cardData"
+    """The source GGUF repos each repo on `org` declares as base_model, by repo id."""
+    bases, url = {}, f"{HF}/api/models?author={org}&limit=100&expand[]=cardData"
     while url:
         page, url = get(url, token)
         for m in page:
-            names.add(m["id"])
             base = (m.get("cardData") or {}).get("base_model") or []
-            sources.update([base] if isinstance(base, str) else base)
-    return names, sources
+            bases[m["id"]] = [base] if isinstance(base, str) else base
+    return bases
 
 
 def slug(repo):
@@ -126,14 +130,14 @@ def explicit(a, token):
     if m.get("gated"):
         print(f"warning: {rid} is gated; the HF_LOOM_FACTORY account must have accepted its license")
     approved = rid.split("/")[0].lower() in {p.lower() for p in PUBLISHERS}
-    names, sources = published(a.org, token)
-    target = target_name(rid, a.org)
+    bases = published(a.org, token)
+    target = target_name(rid, a.org, bases)
     note = "" if approved else ", publisher not on the approved list"
     return {"rank": 0, "repo": rid, "trending": m.get("trendingScore"), "downloads": m.get("downloads"),
             "architecture": g.get("architecture"),
             "params_b": round((g.get("total") or 0) / 1e9, 1), "quant": w[0], "files": w[1],
             "gib": round(w[2] / GIB, 1), "target": target,
-            "status": f"todo (requested; already published, will update{note})" if target in names or rid in sources
+            "status": f"todo (requested; already published, will update{note})" if target in bases
             else f"todo (requested{note})"}
 
 
@@ -151,7 +155,8 @@ def cmd_select(a):
             m = re.match(r"loom-factory-attempt-(.+)-\d+$", line.strip())
             if m:
                 attempts[m.group(1)] = attempts.get(m.group(1), 0) + 1
-    names, sources = published(a.org, token)
+    bases = published(a.org, token)
+    sources = {s for b in bases.values() for s in b}
 
     top, skipped = [], []
     for m in ranked_gguf_repos(PUBLISHERS, token, a.per_publisher):
@@ -174,8 +179,8 @@ def cmd_select(a):
         if why:
             skipped.append({"repo": rid, "trending": m.get("trendingScore"), "reason": why})
             continue
-        target = target_name(rid, a.org)
-        done = target in names or rid in sources
+        target = target_name(rid, a.org, bases)
+        done = rid in sources
         tries = attempts.get(slug(rid), 0)
         top.append({"rank": len(top) + 1, "repo": rid, "trending": m.get("trendingScore"),
                     "downloads": m.get("downloads"),
@@ -262,10 +267,11 @@ def cmd_publish(a):
         f.write("\n")
     subprocess.run([a.loom_fetch, card_path, "--update-lock", "--all-variants", "--no-input", "--quiet"],
                    check=True)
-    preset = next(iter(model.get("presets", {})), None)
-    install = model["model"]["id"].split("/")[-1]
-    choice = [f"{HF}/{a.target}/resolve/main/model.json"] + ([f"--preset={preset}"] if preset else [])
-    fetch = " ".join(["loom-fetch", *choice, f"--output={install}", "--no-input"])
+    # loom-fetch picks the only preset by itself; with several, the card names the first.
+    presets = list(model.get("presets", {}))
+    install = min(model["model"]["id"].split("/")[-1], a.target.split("/")[1], key=len)
+    choice = [f"{HF}/{a.target}/resolve/main/model.json"] + ([f"--preset={presets[0]}"] if len(presets) > 1 else [])
+    fetch = " ".join(["loom-fetch", *choice, f"--output={install}"])
 
     card = ModelCard(f"""---
 base_model: {a.source}
