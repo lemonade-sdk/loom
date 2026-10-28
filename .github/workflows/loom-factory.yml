@@ -126,10 +126,13 @@ jobs:
           "$RUNNER_TEMP/hf/bin/pip" install -q -U huggingface_hub
           "$RUNNER_TEMP/hf/bin/python" - <<'EOF'
           import json, os
-          from huggingface_hub import constants, hf_hub_download, try_to_load_from_cache
+          from huggingface_hub import HfApi, constants, hf_hub_download, try_to_load_from_cache
 
           src, work = os.environ["SOURCE"], os.environ["WORK"]
           dest = os.path.join(work, "gguf")
+          # The published model.json pins this revision, so loom-fetch gets the GGUF the port was validated on.
+          rev = HfApi().model_info(src).sha
+          json.dump({"revision": rev}, open(os.path.join(work, "source.json"), "w"))
           # Repos already in the shared cache belong to someone else; cleanup must leave them alone.
           cache = constants.HF_HUB_CACHE
           before = sorted(d for d in os.listdir(cache) if d.startswith("models--")) if os.path.isdir(cache) else []
@@ -138,12 +141,12 @@ jobs:
           for f in json.loads(os.environ["FILES"]):
               path = os.path.join(dest, f)
               os.makedirs(os.path.dirname(path), exist_ok=True)
-              cached = try_to_load_from_cache(src, f)
+              cached = try_to_load_from_cache(src, f, revision=rev)
               if isinstance(cached, str) and os.path.exists(cached):
                   lines.append(f"- `{f}`: already available locally ({cached}), not downloaded")
               else:
                   # Into the cache, so a copy kept after the run is found by the check above next time.
-                  cached = hf_hub_download(src, f)
+                  cached = hf_hub_download(src, f, revision=rev)
                   downloaded.append(cached)
                   lines.append(f"- `{f}`: not available locally, downloaded "
                                f"({os.path.getsize(cached) / 2**30:.1f} GiB)")
@@ -303,7 +306,8 @@ jobs:
         run: |
           set -euo pipefail
           "$RUNNER_TEMP/hf/bin/python" .github/scripts/loom_factory.py publish --work "$WORK" \
-            --source "$SOURCE" --target "$TARGET" --quant "$QUANT" --files "$FILES"
+            --source "$SOURCE" --target "$TARGET" --quant "$QUANT" --files "$FILES" \
+            --loom-fetch "$HOME/loom/.venv/bin/loom-fetch"
           echo "Published https://huggingface.co/$TARGET" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Stop leftover servers
