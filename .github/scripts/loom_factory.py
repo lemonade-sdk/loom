@@ -263,7 +263,7 @@ def cmd_publish(a):
     subprocess.run([a.loom_fetch, card_path, "--update-lock", "--all-variants", "--no-input", "--quiet"],
                    check=True)
     preset = next(iter(model.get("presets", {})), None)
-    install = model["model"]["id"]
+    install = model["model"]["id"].split("/")[-1]
     choice = [f"{HF}/{a.target}/resolve/main/model.json"] + ([f"--preset={preset}"] if preset else [])
     fetch = " ".join(["loom-fetch", *choice, f"--output={install}", "--no-input"])
 
