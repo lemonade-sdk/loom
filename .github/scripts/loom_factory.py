@@ -78,22 +78,30 @@ def pick_weights(repo, params, token):
     return None
 
 
-def target_name(source, org):
+def target_name(source, org, bases):
+    """`org/<publisher>-<model>-loom`, and the different source already published there, if any.
+
+    Different sources can map to one name (`Foo-GGUF` and `Foo`, `a-b/c` and `a/b-c`, truncation).
+    Publishing would overwrite that other package, so callers skip or refuse the model instead.
+    """
     owner, name = source.split("/")
     name = re.sub(r"[-_.]?gguf$", "", name, flags=re.I)
-    return f"{org}/{owner}-{name}-loom"[: len(org) + 1 + 96]
+    target = f"{org}/{owner}-{name}-loom"[: len(org) + 1 + 96]
+    # Hugging Face repo names are case-insensitive.
+    taken = [s for repo, b in bases.items() if repo.lower() == target.lower() for s in b]
+    clash = next((s for s in taken if s.lower() != source.lower()), None)
+    return target, clash
 
 
 def published(org, token):
-    """Repo ids on `org`, plus the source GGUF repo each one declares as base_model."""
-    names, sources, url = set(), set(), f"{HF}/api/models?author={org}&limit=100&expand[]=cardData"
+    """The source GGUF repos each repo on `org` declares as base_model, by repo id."""
+    bases, url = {}, f"{HF}/api/models?author={org}&limit=100&expand[]=cardData"
     while url:
         page, url = get(url, token)
         for m in page:
-            names.add(m["id"])
             base = (m.get("cardData") or {}).get("base_model") or []
-            sources.update([base] if isinstance(base, str) else base)
-    return names, sources
+            bases[m["id"]] = [base] if isinstance(base, str) else base
+    return bases
 
 
 def slug(repo):
@@ -126,14 +134,17 @@ def explicit(a, token):
     if m.get("gated"):
         print(f"warning: {rid} is gated; the HF_LOOM_FACTORY account must have accepted its license")
     approved = rid.split("/")[0].lower() in {p.lower() for p in PUBLISHERS}
-    names, sources = published(a.org, token)
-    target = target_name(rid, a.org)
+    bases = published(a.org, token)
+    target, clash = target_name(rid, a.org, bases)
+    if clash:
+        sys.exit(f"{target} already holds the Loom package of {clash}; publishing {rid} there would replace it")
+    sources = {s.lower() for b in bases.values() for s in b}
     note = "" if approved else ", publisher not on the approved list"
     return {"rank": 0, "repo": rid, "trending": m.get("trendingScore"), "downloads": m.get("downloads"),
             "architecture": g.get("architecture"),
             "params_b": round((g.get("total") or 0) / 1e9, 1), "quant": w[0], "files": w[1],
             "gib": round(w[2] / GIB, 1), "target": target,
-            "status": f"todo (requested; already published, will update{note})" if target in names or rid in sources
+            "status": f"todo (requested; already published, will update{note})" if rid.lower() in sources
             else f"todo (requested{note})"}
 
 
@@ -151,7 +162,8 @@ def cmd_select(a):
             m = re.match(r"loom-factory-attempt-(.+)-\d+$", line.strip())
             if m:
                 attempts[m.group(1)] = attempts.get(m.group(1), 0) + 1
-    names, sources = published(a.org, token)
+    bases = published(a.org, token)
+    sources = {s.lower() for b in bases.values() for s in b}
 
     top, skipped = [], []
     for m in ranked_gguf_repos(PUBLISHERS, token, a.per_publisher):
@@ -171,11 +183,14 @@ def cmd_select(a):
                 why = "no " + "/".join(QUANTS) + " file"
             elif w[2] > a.max_gib * GIB:
                 why = f"{w[0]} is {w[2] / GIB:.1f} GiB > {a.max_gib} GiB"
+        if not why:
+            target, clash = target_name(rid, a.org, bases)
+            if clash:
+                why = f"{target} already holds the Loom package of {clash}"
         if why:
             skipped.append({"repo": rid, "trending": m.get("trendingScore"), "reason": why})
             continue
-        target = target_name(rid, a.org)
-        done = target in names or rid in sources
+        done = rid.lower() in sources
         tries = attempts.get(slug(rid), 0)
         top.append({"rank": len(top) + 1, "repo": rid, "trending": m.get("trendingScore"),
                     "downloads": m.get("downloads"),
@@ -262,10 +277,15 @@ def cmd_publish(a):
         f.write("\n")
     subprocess.run([a.loom_fetch, card_path, "--update-lock", "--all-variants", "--no-input", "--quiet"],
                    check=True)
-    preset = next(iter(model.get("presets", {})), None)
+    # loom-fetch picks the only preset by itself. Shared materialization fails on Windows; copy works everywhere.
+    presets = list(model.get("presets", {}))
     install = model["model"]["id"].split("/")[-1]
-    choice = [f"{HF}/{a.target}/resolve/main/model.json"] + ([f"--preset={preset}"] if preset else [])
-    fetch = " ".join(["loom-fetch", *choice, f"--output={install}", "--no-input"])
+    fetch_args = [f"{HF}/{a.target}/resolve/main/model.json",
+                  *([f"--preset={presets[0]}"] if len(presets) > 1 else []), "--materialize=copy"]
+    # No --memory_bytes: the default elastic pool has no limit, and any fixed value is a guess per machine.
+    serve_args = ["--device=amdgpu"]
+    fetch = " ".join(["loom-fetch", *fetch_args, f"--output={install}"])
+    serve = " ".join(["loom-serve", f"--model={install}/model.json", *serve_args])
 
     card = ModelCard(f"""---
 base_model: {a.source}
@@ -285,8 +305,10 @@ from this repository and the GGUF from [{a.source}]({HF}/{a.source}), checked ag
 
 ```bash
 {fetch}
-loom-serve --model={install}/model.json --device=amdgpu --memory_bytes=... --listen=127.0.0.1:8080
+{serve}
 ```
+
+The server listens on `127.0.0.1:8080` and answers OpenAI-style `/v1/chat/completions` requests.
 """)
     api.create_repo(a.target, repo_type="model", private=a.private, exist_ok=True)
     with open(os.path.join(pkg, "README.md"), "w", encoding="utf-8") as f:
@@ -300,12 +322,63 @@ loom-serve --model={install}/model.json --device=amdgpu --memory_bytes=... --lis
                       delete_patterns=["REPORT.md", "bench/**"],
                       commit_message=f"Loom package for {a.source} ({a.quant})")
     print(f"published {HF}/{a.target}")
-    # Install the published copy the way the card says; the GGUF is already in the local HF cache.
+    # Run the card's commands on the published copy, unmodified apart from paths and the port.
     check = os.path.join(a.work, "fetch-check")
     shutil.rmtree(check, ignore_errors=True)
-    subprocess.run([a.loom_fetch, *choice, f"--output={check}", "--no-input", "--quiet"], check=True)
-    shutil.rmtree(check, ignore_errors=True)
-    print(f"verified: {fetch}")
+    try:
+        subprocess.run([a.loom_fetch, *fetch_args, f"--output={check}", "--no-input", "--quiet"], check=True)
+        print(f"verified: {fetch}")
+        serve_check(a, os.path.join(check, "model.json"), serve_args)
+        print(f"verified: {serve}")
+    finally:
+        shutil.rmtree(check, ignore_errors=True)
+
+
+def serve_check(a, card, serve_args):
+    """Start loom-serve on the card, wait until it is ready, and require one chat completion."""
+    import socket
+    import time
+
+    bindir = os.path.dirname(a.loom_fetch)
+    exe = os.path.join(bindir, "loom-serve") if bindir else "loom-serve"
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    url = f"http://127.0.0.1:{port}"
+    log = open(os.path.join(a.work, "serve-check.log"), "w", encoding="utf-8")
+    proc = subprocess.Popen([exe, f"--model={card}", *serve_args, f"--listen=127.0.0.1:{port}"],
+                            stdout=log, stderr=subprocess.STDOUT)
+    try:
+        deadline, models = time.time() + 1800, None
+        while time.time() < deadline:
+            if proc.poll() is not None:
+                sys.exit(f"loom-serve exited with {proc.returncode}; see serve-check.log")
+            try:
+                data = json.load(urllib.request.urlopen(f"{url}/v1/status", timeout=5))["data"]
+            except OSError:
+                data = []
+            states = [m["loom"]["registration"] for m in data]
+            if any("fail" in s for s in states):
+                sys.exit(f"loom-serve registration failed: {json.dumps(data)[:3000]}")
+            if states and all(s == "ready" for s in states):
+                models = [m["id"] for m in data]
+                break
+            time.sleep(5)
+        if not models:
+            sys.exit("loom-serve did not become ready within 30 minutes")
+        body = json.dumps({"model": models[0], "messages": [{"role": "user", "content": "Say hello."}],
+                           "max_tokens": 16}).encode()
+        req = urllib.request.Request(f"{url}/v1/chat/completions", body, {"Content-Type": "application/json"})
+        reply = json.load(urllib.request.urlopen(req, timeout=1800))
+        msg = reply["choices"][0]["message"]
+        print("chat check:", json.dumps(msg.get("content") or msg.get("reasoning_content"))[:200])
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=60)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        log.close()
 
 
 ap = argparse.ArgumentParser()
@@ -326,6 +399,6 @@ p.add_argument("--target", required=True)
 p.add_argument("--quant", required=True)
 p.add_argument("--files", required=True, help="JSON list of the GGUF file paths in the source repo")
 p.add_argument("--private", action="store_true")
-p.add_argument("--loom-fetch", default="loom-fetch", help="loom-fetch executable that writes model.json.lock")
+p.add_argument("--loom-fetch", default="loom-fetch", help="loom-fetch executable that writes model.json.lock; loom-serve is taken from the same directory")
 a = ap.parse_args()
 {"select": cmd_select, "publish": cmd_publish}[a.cmd](a)

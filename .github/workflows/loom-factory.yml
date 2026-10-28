@@ -376,6 +376,7 @@ jobs:
             ${{ env.WORK }}/claude.jsonl
             ${{ env.WORK }}/result.json
             ${{ env.WORK }}/REPORT.md
+            ${{ env.WORK }}/serve-check.log
             ${{ env.WORK }}/bench/**/*.json
             ${{ env.WORK }}/bench/**/*.jsonl
             ${{ env.WORK }}/bench/**/*.md
