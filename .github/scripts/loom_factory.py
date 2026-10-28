@@ -10,6 +10,8 @@ import argparse
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
 import urllib.parse
 import urllib.request
@@ -227,7 +229,6 @@ def cmd_publish(a):
     src = api.model_info(a.source, expand=["cardData"])
     license_ = (src.card_data or {}).get("license") if src.card_data else None
     files = json.loads(a.files)
-    dl = " ".join(files)
 
     def read(name, parse=False):
         p = os.path.join(a.work, name)
@@ -239,6 +240,33 @@ def cmd_publish(a):
     attempt, result = read("attempt.json", True) or {}, read("result.json", True) or {}
     info = {"source": a.source, "quant": a.quant, "files": files, "run": attempt.get("run"),
             "metrics": result.get("metrics"), "report": read("REPORT.md")}
+
+    # loom-fetch takes the GGUF from the source repo at the revision the port was validated on.
+    revision = (read("source.json", True) or {}).get("revision") or src.sha
+    card_path = os.path.join(pkg, "model.json")
+    with open(card_path, encoding="utf-8") as f:
+        model = json.load(f)
+    by_name = {os.path.basename(f): f for f in files}
+    model["origins"] = {"checkpoint": {"kind": "hf", "repository": a.source, "revision": revision}}
+    for variant in model.get("variants", {}).values():
+        for service in variant.get("services", {}).values():
+            for param in service.get("parameters", {}).values():
+                for entry in param.get("files", []):
+                    upstream = by_name.get(os.path.basename(entry["path"]))
+                    if not upstream:
+                        sys.exit(f"{entry['path']} in model.json is not a file of {a.source}; "
+                                 "loom-fetch could not acquire it")
+                    entry["origin"] = f"@checkpoint/{upstream}"
+    with open(card_path, "w", encoding="utf-8") as f:
+        json.dump(model, f, indent=1)
+        f.write("\n")
+    subprocess.run([a.loom_fetch, card_path, "--update-lock", "--all-variants", "--no-input", "--quiet"],
+                   check=True)
+    preset = next(iter(model.get("presets", {})), None)
+    install = model["model"]["id"]
+    choice = [f"{HF}/{a.target}/resolve/main/model.json"] + ([f"--preset={preset}"] if preset else [])
+    fetch = " ".join(["loom-fetch", *choice, f"--output={install}", "--no-input"])
+
     card = ModelCard(f"""---
 base_model: {a.source}
 {f"license: {license_}" if license_ else ""}
@@ -252,12 +280,12 @@ unmodified GGUF checkpoint [{a.source}]({HF}/{a.source}) (`{a.quant}`), generate
 "Strix Halo" by the [loom-skills](https://github.com/{os.environ.get('GITHUB_REPOSITORY', 'loom-fun/loom-skills')})
 factory workflow.
 
-The weights are not included. Put them in `parameter/` before serving:
+The weights are not included. `loom-fetch` (from the Loom SDK with its `hf` extra) installs the programs
+from this repository and the GGUF from [{a.source}]({HF}/{a.source}), checked against `model.json.lock`:
 
 ```bash
-hf download {a.target} --local-dir pkg
-hf download {a.source} {dl} --local-dir pkg/parameter
-loom-serve --model=pkg/model.json --device=amdgpu --memory_bytes=... --listen=127.0.0.1:8080
+{fetch}
+loom-serve --model={install}/model.json --device=amdgpu --memory_bytes=... --listen=127.0.0.1:8080
 ```
 """)
     api.create_repo(a.target, repo_type="model", private=a.private, exist_ok=True)
@@ -267,10 +295,17 @@ loom-serve --model=pkg/model.json --device=amdgpu --memory_bytes=... --listen=12
     with open(os.path.join(pkg, "info.json"), "w", encoding="utf-8") as f:
         json.dump(info, f, indent=2)
         f.write("\n")
-    api.upload_folder(repo_id=a.target, folder_path=pkg, ignore_patterns=["parameter/*", "*.gguf"],
+    api.upload_folder(repo_id=a.target, folder_path=pkg,
+                      ignore_patterns=["parameter/*", "*.gguf", ".loom-fetch.lock", ".cache/*"],
                       delete_patterns=["REPORT.md", "bench/**"],
                       commit_message=f"Loom package for {a.source} ({a.quant})")
     print(f"published {HF}/{a.target}")
+    # Install the published copy the way the card says; the GGUF is already in the local HF cache.
+    check = os.path.join(a.work, "fetch-check")
+    shutil.rmtree(check, ignore_errors=True)
+    subprocess.run([a.loom_fetch, *choice, f"--output={check}", "--no-input", "--quiet"], check=True)
+    shutil.rmtree(check, ignore_errors=True)
+    print(f"verified: {fetch}")
 
 
 ap = argparse.ArgumentParser()
@@ -291,5 +326,6 @@ p.add_argument("--target", required=True)
 p.add_argument("--quant", required=True)
 p.add_argument("--files", required=True, help="JSON list of the GGUF file paths in the source repo")
 p.add_argument("--private", action="store_true")
+p.add_argument("--loom-fetch", default="loom-fetch", help="loom-fetch executable that writes model.json.lock")
 a = ap.parse_args()
 {"select": cmd_select, "publish": cmd_publish}[a.cmd](a)
