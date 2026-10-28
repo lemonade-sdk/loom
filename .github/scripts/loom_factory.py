@@ -227,9 +227,18 @@ def cmd_publish(a):
     src = api.model_info(a.source, expand=["cardData"])
     license_ = (src.card_data or {}).get("license") if src.card_data else None
     files = json.loads(a.files)
-    report = os.path.join(a.work, "REPORT.md")
-    body = open(report, encoding="utf-8").read() if os.path.exists(report) else "_No report was produced._"
     dl = " ".join(files)
+
+    def read(name, parse=False):
+        p = os.path.join(a.work, name)
+        if not os.path.isfile(p):
+            return None
+        with open(p, encoding="utf-8") as f:
+            return json.load(f) if parse else f.read()
+
+    attempt, result = read("attempt.json", True) or {}, read("result.json", True) or {}
+    info = {"source": a.source, "quant": a.quant, "files": files, "run": attempt.get("run"),
+            "metrics": result.get("metrics"), "report": read("REPORT.md")}
     card = ModelCard(f"""---
 base_model: {a.source}
 {f"license: {license_}" if license_ else ""}
@@ -250,23 +259,17 @@ hf download {a.target} --local-dir pkg
 hf download {a.source} {dl} --local-dir pkg/parameter
 loom-serve --model=pkg/model.json --device=amdgpu --memory_bytes=... --listen=127.0.0.1:8080
 ```
-
-## Port report
-
-{body}
 """)
     api.create_repo(a.target, repo_type="model", private=a.private, exist_ok=True)
     with open(os.path.join(pkg, "README.md"), "w", encoding="utf-8") as f:
         f.write(str(card))
+    # Performance numbers are not claims yet: they live only here, and the card must not mention them.
+    with open(os.path.join(pkg, "info.json"), "w", encoding="utf-8") as f:
+        json.dump(info, f, indent=2)
+        f.write("\n")
     api.upload_folder(repo_id=a.target, folder_path=pkg, ignore_patterns=["parameter/*", "*.gguf"],
+                      delete_patterns=["REPORT.md", "bench/**"],
                       commit_message=f"Loom package for {a.source} ({a.quant})")
-    for extra in ("REPORT.md", "bench"):
-        p = os.path.join(a.work, extra)
-        if os.path.isfile(p):
-            api.upload_file(path_or_fileobj=p, path_in_repo=extra, repo_id=a.target)
-        elif os.path.isdir(p):
-            api.upload_folder(repo_id=a.target, folder_path=p, path_in_repo=extra,
-                              allow_patterns=["*.json", "*.jsonl", "*.md", "*.txt", "*.csv"])
     print(f"published {HF}/{a.target}")
 
 
@@ -282,7 +285,7 @@ s.add_argument("--attempts-file", help="artifact names of previous attempts, one
 s.add_argument("--checkpoint", help="convert this org/repo[:file.gguf] instead of ranking")
 s.add_argument("--out", default="selection.json")
 p = sub.add_parser("publish")
-p.add_argument("--work", required=True, help="directory with pkg/, REPORT.md and bench/")
+p.add_argument("--work", required=True, help="directory with pkg/, attempt.json, result.json and REPORT.md")
 p.add_argument("--source", required=True)
 p.add_argument("--target", required=True)
 p.add_argument("--quant", required=True)
