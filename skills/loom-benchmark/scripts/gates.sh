@@ -1,6 +1,8 @@
 #!/bin/bash
 # All correctness gates for a served package, in one run, with one verdict file.
-# usage: [LOOM_ROOT=~/loom] LLAMACPP_DIR=DIR gates.sh PKG LOOM_URL GGUF BENCH_DIR [LLAMA_PORT=8130]
+# usage: [LOOM_ROOT=~/loom] [QUICK=1] LLAMACPP_DIR=DIR gates.sh PKG LOOM_URL GGUF BENCH_DIR [LLAMA_PORT=8130]
+#   QUICK=1 (before / during optimization): needle at 50 % of the context only, one probe. Run the
+#   full gate (no QUICK) once on the final build: it proves the whole context.
 #   golden.py x2 (two llama.cpp recordings) + compare.py, consistency.py, agent_golden.py,
 #   sampling_check.py and needle.py (50 % and 100 % of context, 2 probes each; llama.cpp joins the
 #   needle comparison only when its slot covers the size, since a 262k llama.cpp prefill takes many
@@ -35,10 +37,12 @@ run consistency "$T" "$S/consistency.py" "$url" --model "$model"
 grep -q "^PASS$" gates_consistency.log || result[consistency]=1
 run agent "$T" "$S/agent_golden.py" "$pkg" "$url" --llama "$L" --out agent_golden.json
 run sampling "$T" "$S/sampling_check.py" "$pkg" "$url" --llama "$L"
+needle_args=(--out needle.json)
+[ "${QUICK:-0}" = 1 ] && needle_args+=(--sizes $(( (ctx - 2048) / 2 )) --probes 1)
 if [ "$ctx" -le 65536 ]; then
-  run needle "$T" "$S/needle.py" "$pkg" "$url" --llama "$L" --out needle.json
+  run needle "$T" "$S/needle.py" "$pkg" "$url" --llama "$L" "${needle_args[@]}"
 else
-  run needle "$T" "$S/needle.py" "$pkg" "$url" --out needle.json
+  run needle "$T" "$S/needle.py" "$pkg" "$url" "${needle_args[@]}"
 fi
 kill "$(cat "$LLAMACPP_STATE/llamacpp-$lport.pid")" 2>/dev/null
 "$T" - "${!result[@]}" -- "${result[@]}" <<'EOF'

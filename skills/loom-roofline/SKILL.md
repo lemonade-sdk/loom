@@ -58,6 +58,14 @@ T=~/loom/.tools/bin/python; R=${CLAUDE_SKILL_DIR}
 $T $R/roofline.py MODEL.gguf --cfg cfg.json --baseline bench/perf_log.jsonl --ctx 1000,2000,16000 --out bench/roofline.json \
    --budget-h 1            # the user's budget (section 0); add --goal decode_tps=70 for a user target
 ```
+**Long-context models (context ≥ 128k):** add the long sizes to `--ctx` (e.g.
+`--ctx 1000,2000,16000,131072`) and measure them (`perf.py --long`), so long prefill
+gets a target. It is quadratic in attention and, for hybrids, sequential in the
+recurrent layers, and it is what makes the full-context gate slow: Qwen3.5-0.8B
+prefilled 2k tokens at ~3,500 tok/s but a 261k prompt at ~400 tok/s before any
+optimization. Levers, cheapest first: a larger prefill chunk (`build.py --prefill 4096`),
+flash2 at head_dim 256 in two 128-wide passes instead of reloading Q, and a chunked
+parallel scan for gated delta-net layers.
 The script prints the bytes read per decode token, broken down by kind, so you can
 see where decode time must go:
 - head;

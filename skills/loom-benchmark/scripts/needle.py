@@ -7,7 +7,8 @@ budget). It also checks that a prompt over the capacity is refused cleanly (HTTP
 and that the server is still healthy afterwards.
 
 usage: needle.py PKG LOOM_URL [--sizes N ...] [--probes 2] [--needles 1|3] [--llama URL] [--max-tokens 1024] [--out FILE]
-  default sizes: 50 % and 100 % of context_capacity (a full-context prefill can take many minutes)
+  default sizes: 50 % (2 probes) and 100 % (1 probe, --top-probes) of context_capacity; a full-context
+  prefill can take many minutes (a 261k prompt: ~11 min for a 0.8B hybrid on a busy Strix Halo)
   --llama also runs the identical prompt ids through llama.cpp /completion for comparison
   (start it with a single slot whose context covers the largest size).
 Each size runs --probes haystacks (different needles and depths). Small models miss needles
@@ -89,6 +90,7 @@ def main():
     ap.add_argument("--max-tokens", type=int, default=1024)
     ap.add_argument("--needles", type=int, default=1, choices=[1, 3])
     ap.add_argument("--probes", type=int, default=2)
+    ap.add_argument("--top-probes", type=int, default=1, help="probes at the largest size (a full-context prefill is the slow part)")
     ap.add_argument("--out", default=None)
     a = ap.parse_args()
     P = Package(a.pkg)
@@ -108,7 +110,7 @@ def main():
     results = []
     loom_total = llama_total = probes_total = 0
     for n in sizes:
-        for probe in range(a.probes):
+        for probe in range(a.top_probes if n == max(sizes) and len(sizes) > 1 else a.probes):
             prompt, needles = haystack(P, ids, n, n * 31 + probe, a.needles)
             rec = {"n": n, "probe": probe}
             r = chat(a.url, P.model_id, prompt, a.max_tokens, extra)

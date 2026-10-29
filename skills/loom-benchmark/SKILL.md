@@ -52,6 +52,11 @@ big Loom model at the same time if together they exceed GPU memory.
 starts llama.cpp with one slot sized for the long goldens, runs everything below in
 order, stops llama.cpp and writes `BENCH_DIR/gates.json` (`verdict` PASS/FAIL per gate,
 logs in `gates_*.log`). Use the individual scripts to rerun or debug one gate.
+**Order:** `QUICK=1 gates.sh …` after the port and after each kept optimization (needle
+at half the context, one probe: ≈7–10 min), and the full `gates.sh` once on the final
+build. The full needle is a full-context prefill, the most expensive step (a 261k prompt
+took ~11 min on a busy GPU, ~40 min for the whole gate run); running it on the slowest
+(unoptimized) build twice wastes the most time.
 
 ```bash
 S=${CLAUDE_SKILL_DIR}/scripts; P=~/work/mymodel/pkg; T=~/loom/.tools/bin/python; mkdir -p ~/work/mymodel/bench && cd ~/work/mymodel/bench   # outputs land here, not in the skill
