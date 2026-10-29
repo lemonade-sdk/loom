@@ -128,14 +128,15 @@ it then must find the needle) or give `--sizes`. A 262k-token prefill takes minu
   reproduces, different seeds vary, and 200 temperature-1 draws of the first token
   match llama.cpp's probabilities on the same ids (total-variation distance within
   sampling noise; Qwen3-0.6B: 0.011).
-- **needle.py** hides an access code in a real-text haystack at 25/50/75/100 % of
-  the package's `context_capacity` and asks for it (thinking off when the template
-  allows), then sends a prompt over the capacity (must be a clean HTTP 400, server
-  still healthy). A size passes when Loom finds the needle, or with `--llama` at
-  least as often as llama.cpp on the same ids: small models miss needles on their
-  own. Divergences from llama.cpp grow slowly with length (gaps 0.4–0.7 nats at
-  30–40k on Qwen3-0.6B, exact matches in between); a step at a power of two (32768,
-  65536) would be a bug.
+- **needle.py** hides access codes in a real-text haystack and asks for them (thinking off
+  when the template allows), then sends a prompt over the capacity (must be a clean HTTP
+  400, server still healthy). **Retrieval is not the gate**: a small model finds or misses a
+  needle on a near-tie first token (Qwen3.5-0.8B at 130k: llama.cpp's top two first tokens
+  0.013 nats apart), so a handful of probes says nothing statistically. Up to `--llama-max`
+  each probe is compared with llama.cpp on the same ids and passes when Loom found the
+  needle, llama.cpp missed it too, or the first divergence is a near-tie (gap ≤ 1 nat, in
+  the top-5: the compare.py rule). The full-context probe (Loom only; llama.cpp would take
+  many minutes) proves the size is served. Found counts are reported as information.
 
 ## 2. Performance
 

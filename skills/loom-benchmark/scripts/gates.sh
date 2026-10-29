@@ -1,12 +1,12 @@
 #!/bin/bash
 # All correctness gates for a served package, in one run, with one verdict file.
 # usage: [LOOM_ROOT=~/loom] [QUICK=1] LLAMACPP_DIR=DIR gates.sh PKG LOOM_URL GGUF BENCH_DIR [LLAMA_PORT=8130]
-#   QUICK=1 (before / during optimization): needle at 50 % of the context only, one probe. Run the
-#   full gate (no QUICK) once on the final build: it proves the whole context.
+#   QUICK=1 (before / during optimization): skips the full-context probe. Run the full gate once on
+#   the final build: it proves the whole context is served.
 #   golden.py x2 (two llama.cpp recordings) + compare.py, consistency.py, agent_golden.py,
-#   sampling_check.py and needle.py (50 % and 100 % of context, 2 probes each; llama.cpp joins the
-#   needle comparison only when its slot covers the size, since a 262k llama.cpp prefill takes many
-#   minutes). llama.cpp runs with one slot sized for the long goldens; it is stopped at the end.
+#   sampling_check.py and needle.py (2 probes at half the context, at most 60k, compared with
+#   llama.cpp by the near-tie rule; 1 Loom-only probe at full context). llama.cpp runs with one
+#   slot sized for the long goldens; it is stopped at the end.
 # Writes BENCH_DIR/gates.json {"verdict": "PASS"|"FAIL", "gates": {name: {"pass": bool, "log": file}}}
 # and BENCH_DIR/gates_*.log. Exit 1 when any gate fails. Runs sequentially: on a shared GPU the
 # gates would otherwise compete with each other.
@@ -37,13 +37,12 @@ run consistency "$T" "$S/consistency.py" "$url" --model "$model"
 grep -q "^PASS$" gates_consistency.log || result[consistency]=1
 run agent "$T" "$S/agent_golden.py" "$pkg" "$url" --llama "$L" --out agent_golden.json
 run sampling "$T" "$S/sampling_check.py" "$pkg" "$url" --llama "$L"
-needle_args=(--out needle.json)
-[ "${QUICK:-0}" = 1 ] && needle_args+=(--sizes $(( (ctx - 2048) / 2 )) --probes 1)
-if [ "$ctx" -le 65536 ]; then
-  run needle "$T" "$S/needle.py" "$pkg" "$url" --llama "$L" "${needle_args[@]}"
-else
-  run needle "$T" "$S/needle.py" "$pkg" "$url" "${needle_args[@]}"
-fi
+# Needle: compared with llama.cpp (near-tie rule) up to the llama.cpp slot; the full-context
+# probe proves the size is served. QUICK=1: one compared size only (half the context, at most 60k).
+cmp=$(( ctx / 2 < 61440 ? ctx / 2 : 61440 ))
+needle_args=(--llama "$L" --llama-max $(( slot - 1024 )) --out needle.json)
+if [ "${QUICK:-0}" = 1 ]; then needle_args+=(--sizes $cmp --probes 2); else needle_args+=(--sizes $cmp $(( ctx - 2048 )) --probes 2 --top-probes 1); fi
+run needle "$T" "$S/needle.py" "$pkg" "$url" "${needle_args[@]}"
 kill "$(cat "$LLAMACPP_STATE/llamacpp-$lport.pid")" 2>/dev/null
 "$T" - "${!result[@]}" -- "${result[@]}" <<'EOF'
 import json, sys

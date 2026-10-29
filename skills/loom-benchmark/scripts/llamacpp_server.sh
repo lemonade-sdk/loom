@@ -8,6 +8,7 @@
 set -e
 state=${LLAMACPP_STATE:-/tmp}; mkdir -p "$state"
 gguf=$1; port=${2:-8130}; np=${3:-4}; per=${4:-8192}
+case "$gguf" in /*|?:*) ;; *) gguf=$PWD/$gguf;; esac   # the server runs from LLAMACPP_DIR
 dir=${LLAMACPP_DIR:?set LLAMACPP_DIR to the unzipped llamacpp-rocm release}
 listeners() { if command -v ss >/dev/null; then ss -ltnp | grep ":$port "; else netstat -ano -p tcp | tr -d '\r' | grep LISTENING | grep ":$port "; fi; }
 if curl -s -m 2 localhost:$port/health >/dev/null 2>&1 || listeners >/dev/null; then
