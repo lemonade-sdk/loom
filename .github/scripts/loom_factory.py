@@ -3,8 +3,9 @@
   select   rank the trending GGUF chat LLMs from the approved publishers that fit a
            Strix Halo, and pick the first one that has no Loom package on the target org yet
   publish  upload a finished Loom package to the target org
+  cards    bring the install instructions on the cards already published on the target org up to date
 
-Only `publish` needs huggingface_hub; `select` uses the HTTP API with the standard library.
+Only `publish` and `cards` need huggingface_hub; `select` uses the HTTP API with the standard library.
 """
 import argparse
 import json
@@ -29,6 +30,10 @@ PUBLISHERS = [
     "ibm-granite", "Intel", "tencent", "LiquidAI", "allenai", "HuggingFaceTB", "tiiuae", "CohereLabs",
     "LGAI-EXAONE", "zai-org", "openbmb", "internlm", "JetBrains",
 ]
+# The first command on every card. loom-fetch needs the hf extra to read from Hugging Face.
+PIP = 'pip install "hrx-loom[hf]"'
+FETCH_NOTE = "`loom-fetch` (from the Loom SDK, installed with its `hf` extra by the first command)"
+OLD_FETCH_NOTES = ["`loom-fetch` (from the Loom SDK with its `hf` extra)"]
 
 
 def get(url, token=None):
@@ -300,10 +305,11 @@ unmodified GGUF checkpoint [{a.source}]({HF}/{a.source}) (`{a.quant}`), generate
 "Strix Halo" by the [loom-skills](https://github.com/{os.environ.get('GITHUB_REPOSITORY', 'loom-fun/loom-skills')})
 factory workflow.
 
-The weights are not included. `loom-fetch` (from the Loom SDK with its `hf` extra) installs the programs
+The weights are not included. {FETCH_NOTE} installs the programs
 from this repository and the GGUF from [{a.source}]({HF}/{a.source}), checked against `model.json.lock`:
 
 ```bash
+{PIP}
 {fetch}
 {serve}
 ```
@@ -381,6 +387,36 @@ def serve_check(a, card, serve_args):
         log.close()
 
 
+def cmd_cards(a):
+    from huggingface_hub import HfApi, hf_hub_download
+    from huggingface_hub.errors import EntryNotFoundError
+
+    api = HfApi(token=os.environ.get("HF_TOKEN") or None)
+    for m in api.list_models(author=a.org):
+        try:
+            with open(hf_hub_download(m.id, "README.md", token=api.token, force_download=True),
+                      encoding="utf-8") as f:
+                old = f.read()
+        except EntryNotFoundError:
+            print(f"{m.id}: no README.md")
+            continue
+        new = old
+        for note in OLD_FETCH_NOTES:
+            new = new.replace(note, FETCH_NOTE)
+        if PIP not in new:
+            new = new.replace("```bash\nloom-fetch ", f"```bash\n{PIP}\nloom-fetch ", 1)
+        if PIP not in new:
+            print(f"{m.id}: no loom-fetch command block, left alone")
+        elif new == old:
+            print(f"{m.id}: up to date")
+        elif a.dry_run:
+            print(f"{m.id}: would update")
+        else:
+            api.upload_file(path_or_fileobj=new.encode("utf-8"), path_in_repo="README.md", repo_id=m.id,
+                            commit_message=f"Card: install the Loom SDK with {PIP}")
+            print(f"{m.id}: updated")
+
+
 ap = argparse.ArgumentParser()
 sub = ap.add_subparsers(dest="cmd", required=True)
 s = sub.add_parser("select")
@@ -400,5 +436,8 @@ p.add_argument("--quant", required=True)
 p.add_argument("--files", required=True, help="JSON list of the GGUF file paths in the source repo")
 p.add_argument("--private", action="store_true")
 p.add_argument("--loom-fetch", default="loom-fetch", help="loom-fetch executable that writes model.json.lock; loom-serve is taken from the same directory")
+c = sub.add_parser("cards")
+c.add_argument("--org", default="loom-fun")
+c.add_argument("--dry-run", action="store_true")
 a = ap.parse_args()
-{"select": cmd_select, "publish": cmd_publish}[a.cmd](a)
+{"select": cmd_select, "publish": cmd_publish, "cards": cmd_cards}[a.cmd](a)
