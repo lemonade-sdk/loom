@@ -29,6 +29,9 @@ PUBLISHERS = [
     "ibm-granite", "Intel", "tencent", "LiquidAI", "allenai", "HuggingFaceTB", "tiiuae", "CohereLabs",
     "LGAI-EXAONE", "zai-org", "openbmb", "internlm", "JetBrains",
 ]
+# The first command on every card. loom-fetch needs the hf extra to read from Hugging Face.
+PIP = 'pip install "hrx-loom[hf]"'
+FETCH_NOTE = "`loom-fetch` (from the Loom SDK, installed with its `hf` extra by the first command)"
 
 
 def get(url, token=None):
@@ -300,10 +303,11 @@ unmodified GGUF checkpoint [{a.source}]({HF}/{a.source}) (`{a.quant}`), generate
 "Strix Halo" by the [loom-skills](https://github.com/{os.environ.get('GITHUB_REPOSITORY', 'loom-fun/loom-skills')})
 factory workflow.
 
-The weights are not included. `loom-fetch` (from the Loom SDK with its `hf` extra) installs the programs
+The weights are not included. {FETCH_NOTE} installs the programs
 from this repository and the GGUF from [{a.source}]({HF}/{a.source}), checked against `model.json.lock`:
 
 ```bash
+{PIP}
 {fetch}
 {serve}
 ```
