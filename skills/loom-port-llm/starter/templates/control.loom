@@ -249,17 +249,112 @@ func.decl import("json") @parse_i64(%source: buffer, %offset: i64, %length: i64)
 
 func.decl import("json") @parse_f64(%source: buffer, %offset: i64, %length: i64) -> (f64)
 
+// Sampling record (16 bytes): temperature f32, top_p f32, top_k i32, seed i32.
+// temperature 0 is greedy (the default); top_k 0 means "up to 64 candidates".
+global.rodata.def @temperature_key = bytes("74656d7065726174757265")
+
+global.rodata.def @top_p_key = bytes("746f705f70")
+
+global.rodata.def @top_k_key = bytes("746f705f6b")
+
+global.rodata.def @seed_key = bytes("73656564")
+
 func.def public @request_defaults(%options: buffer) -> (buffer) {
-  %empty = global.load @empty : buffer
-  func.return %empty : buffer
+  %origin = index.constant 0 : offset
+  %bytes = index.constant 16 : offset
+  %record = buffer.alloca<private> align(4) %bytes : buffer
+  %view = buffer.view %record[%origin] : buffer -> view<4xi32>
+  %c0_i32 = scalar.constant 0 : i32
+  %temperature = scalar.constant @@DEFAULT_TEMPERATURE@@ : f32
+  %top_p = scalar.constant @@DEFAULT_TOP_P@@ : f32
+  %top_k = scalar.constant @@DEFAULT_TOP_K@@ : i32
+  %temperature_bits = scalar.bitcast %temperature : f32 to i32
+  %top_p_bits = scalar.bitcast %top_p : f32 to i32
+  view.store %temperature_bits, %view[0] : i32, view<4xi32>
+  view.store %top_p_bits, %view[1] : i32, view<4xi32>
+  view.store %top_k, %view[2] : i32, view<4xi32>
+  view.store %c0_i32, %view[3] : i32, view<4xi32>
+  func.return %record : buffer
 }
 
-// Generation is greedy; sampling fields are accepted and ignored.
+// OpenAI-style temperature / top_p / top_k / seed (numbers; null keeps the default).
+// Without a seed each request draws from its own nonce.
 func.def public @request_options(%defaults: buffer, %request: buffer, %nonce: i64) -> (buffer) {
-  func.return %defaults : buffer
+  %origin = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %bytes = index.constant 16 : offset
+  %record = buffer.alloca<private> align(4) %bytes : buffer
+  buffer.copy %defaults[%origin], %record[%origin], %bytes
+  %view = buffer.view %record[%origin] : buffer -> view<4xi32>
+  %nonce32 = scalar.trunci %nonce : i64 to i32
+  view.store %nonce32, %view[3] : i32, view<4xi32>
+  %fields, %type, %count = func.call @members(%request) : (buffer) -> (buffer, i32, i64)
+  %bounded_count = scalar.assume %count [range(%count, 0, 2147483647)] : i64
+  %extent = index.cast %bounded_count : i64 to index
+  %records = buffer.view %fields[%origin] : buffer -> view<[%extent]x5xi64>
+  %number = scalar.constant 1 : i64
+  %temperature_key = global.load @temperature_key : buffer
+  %top_p_key = global.load @top_p_key : buffer
+  %top_k_key = global.load @top_k_key : buffer
+  %seed_key = global.load @seed_key : buffer
+  scf.for %i = [%c0 to %extent step %c1] {
+    %key_begin = view.load %records[%i, 0] : view<[%extent]x5xi64> -> i64
+    %key_length = view.load %records[%i, 1] : view<[%extent]x5xi64> -> i64
+    %value_begin = view.load %records[%i, 2] : view<[%extent]x5xi64> -> i64
+    %value_length = view.load %records[%i, 3] : view<[%extent]x5xi64> -> i64
+    %value_type = view.load %records[%i, 4] : view<[%extent]x5xi64> -> i64
+    %is_number = scalar.cmpi eq, %value_type, %number : i64
+    scf.if %is_number {
+      %key = func.call @json_key(%request, %key_begin, %key_length) : (buffer, i64, i64) -> (buffer)
+      %is_temperature = func.call @equal(%key, %temperature_key) : (buffer, buffer) -> (i1)
+      %is_top_p = func.call @equal(%key, %top_p_key) : (buffer, buffer) -> (i1)
+      %is_top_k = func.call @equal(%key, %top_k_key) : (buffer, buffer) -> (i1)
+      %is_seed = func.call @equal(%key, %seed_key) : (buffer, buffer) -> (i1)
+      %is_float = scalar.ori %is_temperature, %is_top_p : i1
+      scf.if %is_float {
+        %value64 = func.call @parse_f64(%request, %value_begin, %value_length) : (buffer, i64, i64) -> (f64)
+        %value = scalar.fptrunc %value64 : f64 to f32
+        %bits = scalar.bitcast %value : f32 to i32
+        scf.if %is_temperature {
+          view.store %bits, %view[0] : i32, view<4xi32>
+        } else {
+          view.store %bits, %view[1] : i32, view<4xi32>
+        }
+      }
+      %is_integer = scalar.ori %is_top_k, %is_seed : i1
+      scf.if %is_integer {
+        %value64 = func.call @parse_i64(%request, %value_begin, %value_length) : (buffer, i64, i64) -> (i64)
+        %value = scalar.trunci %value64 : i64 to i32
+        scf.if %is_top_k {
+          view.store %value, %view[2] : i32, view<4xi32>
+        } else {
+          view.store %value, %view[3] : i32, view<4xi32>
+        }
+      }
+    }
+  }
+  func.return %record : buffer
 }
 
+// Sampling records follow the 640-byte control header, one per resident row.
 func.def public @bind_request(%state: buffer, %row: i32, %options: buffer) {
+  %origin = index.constant 0 : offset
+  %header = index.constant 640 : offset
+  %record_bytes = index.constant 16 : offset
+  %bounded_row = scalar.assume %row [range(%row, 0, 1048575)] : i32
+  %row_index = index.cast %bounded_row : i32 to index
+  %relative = index.scale %row_index, %record_bytes : index, offset -> offset
+  %at = index.add %header, %relative : offset
+  %end = index.add %at, %record_bytes : offset
+  %length = buffer.length %state
+  %fits = index.cmp ule, %end, %length : offset
+  %options_length = buffer.length %options
+  %complete = index.cmp uge, %options_length, %record_bytes : offset
+  %store = scalar.andi %fits, %complete : i1
+  scf.if %store {
+    buffer.copy %options[%origin], %state[%at], %record_bytes
+  }
   func.return
 }
 
@@ -1611,6 +1706,44 @@ func.def public @encode_epoch(%control_state: buffer, %plan: buffer, %inputs: bu
   view.store %c0, %header[2] : i32, view<4xi32>
   view.store %c0, %header[3] : i32, view<4xi32>
   buffer.copy %plan[%origin], %metadata[%header_bytes], %plan_bytes
+  // Device copy only: span fields 2, 5, 7, 8 carry the row's sampling record
+  // (temperature, top_p, top_k, seed); the kernels never read the originals.
+  %state_length = buffer.length %control_state
+  %sampling_header = index.constant 640 : offset
+  %sampling_stride = index.constant 16 : offset
+  %span_stride = index.constant 36 : offset
+  %c0_span = index.constant 0 : index
+  %c1_span = index.constant 1 : index
+  %bounded_first = scalar.assume %first_count [range(%first_count, 0, 8192)] : i32
+  %span_extent = index.cast %bounded_first : i32 to index
+  scf.for %s = [%c0_span to %span_extent step %c1_span] {
+    %span_at = index.scale %s, %span_stride : index, offset -> offset
+    %row_at = index.constant 12 : offset
+    %row_field = index.add %span_at, %row_at : offset
+    %row_view = buffer.view %plan[%row_field] : buffer -> view<1xi32>
+    %row32 = view.load %row_view[0] : view<1xi32> -> i32
+    %row_bound = scalar.assume %row32 [range(%row32, 0, 1048575)] : i32
+    %row_index = index.cast %row_bound : i32 to index
+    %record_rel = index.scale %row_index, %sampling_stride : index, offset -> offset
+    %record_at = index.add %sampling_header, %record_rel : offset
+    %record_end = index.add %record_at, %sampling_stride : offset
+    %has_record = index.cmp ule, %record_end, %state_length : offset
+    %packet_at = index.add %header_bytes, %span_at : offset
+    %packet = buffer.view %metadata[%packet_at] : buffer -> view<9xi32>
+    scf.if %has_record {
+      %record = buffer.view %control_state[%record_at] : buffer -> view<4xi32>
+      %temperature = view.load %record[0] : view<4xi32> -> i32
+      %top_p = view.load %record[1] : view<4xi32> -> i32
+      %top_k = view.load %record[2] : view<4xi32> -> i32
+      %seed = view.load %record[3] : view<4xi32> -> i32
+      view.store %temperature, %packet[2] : i32, view<9xi32>
+      view.store %top_p, %packet[5] : i32, view<9xi32>
+      view.store %top_k, %packet[7] : i32, view<9xi32>
+      view.store %seed, %packet[8] : i32, view<9xi32>
+    } else {
+      view.store %c0, %packet[2] : i32, view<9xi32>
+    }
+  }
   %media_count = scalar.addi %first_media_count, %next_media_count : i32
   %has_media = scalar.cmpi ne, %media_count, %c0 : i32
   %input_count64 = scalar.extui %input_count : i32 to i64
@@ -1723,7 +1856,25 @@ func.def public @epoch(%control_state: buffer, %shape: i32, %proposes: i32, %ver
 
 func.decl @llm_storage(%maximum: i64, %span_capacity: i64, %context: i64, %pool: i64, %rows: i64, %pins: i64) -> (buffer, buffer, buffer, buffer, buffer)
 
-func.def public @resize_state(%state: buffer, %rows: i64) -> (buffer, buffer, buffer, buffer, buffer, buffer) {
+func.def public @resize_state(%old_state: buffer, %rows: i64) -> (buffer, buffer, buffer, buffer, buffer, buffer) {
+  %origin = index.constant 0 : offset
+  %c0_fill = scalar.constant 0 : i32
+  %header = index.constant 640 : offset
+  %record_bytes = index.constant 16 : offset
+  %bounded_rows = scalar.assume %rows [range(%rows, 1, 1048576)] : i64
+  %row_count = index.cast %bounded_rows : i64 to index
+  %table = index.scale %row_count, %record_bytes : index, offset -> offset
+  %wanted = index.add %header, %table : offset
+  %old_length = buffer.length %old_state
+  %grow = index.cmp ugt, %wanted, %old_length : offset
+  %state = scf.if %grow -> (buffer) {
+    %grown = buffer.alloca<private> align(8) %wanted : buffer
+    buffer.fill %c0_fill, %grown[%origin], %wanted : i32
+    buffer.copy %old_state[%origin], %grown[%origin], %old_length
+    scf.yield %grown : buffer
+  } else {
+    scf.yield %old_state : buffer
+  }
   %layout_origin = index.constant 88 : offset
   %layout = buffer.view %state[%layout_origin] : buffer -> view<5xi64>
   %maximum = view.load %layout[0] : view<5xi64> -> i64

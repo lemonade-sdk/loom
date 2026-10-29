@@ -136,9 +136,10 @@ cases.append(f"""check.case public @head_argmax {{
   %w = check.file.read.npy path("hd_w.npy") : {hwt}
   %expect = check.file.read.npy path("hd_out.npy") : tensor<1xi32>
   %partials = check.generate.fill value(0) : tensor<{CH * 2}xi32>
+  %logits = check.generate.fill value(0.0) : tensor<{CH * 128}xf32>
   %out = check.generate.fill value(0) : tensor<1xi32>
-  kernel.launch @g_head_mv[%spans](%spans, %t, %meta, %h, %w, %partials) : [index](index, index, tensor<13xi32>, tensor<{t}x{H}xf32>, {hwt}, tensor<{CH * 2}xi32>)
-  kernel.launch @g_head_select[%spans](%spans, %meta, %partials, %out) : [index](index, tensor<13xi32>, tensor<{CH * 2}xi32>, tensor<1xi32>)
+  kernel.launch @g_head_mv[%spans](%spans, %t, %meta, %h, %w, %partials, %logits) : [index](index, index, tensor<13xi32>, tensor<{t}x{H}xf32>, {hwt}, tensor<{CH * 2}xi32>, tensor<{CH * 128}xf32>)
+  kernel.launch @g_head_select[%spans](%spans, %meta, %partials, %logits, %out) : [index](index, tensor<13xi32>, tensor<{CH * 2}xi32>, tensor<{CH * 128}xf32>, tensor<1xi32>)
   check.expect.equal actual(%out) expected(%expect) : tensor<1xi32>
   check.return
 }}

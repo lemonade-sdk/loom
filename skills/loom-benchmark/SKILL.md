@@ -56,6 +56,7 @@ $T $S/compare.py $P golden.json --alt golden2.json --url http://127.0.0.1:8160  
 $T $S/consistency.py http://127.0.0.1:8160 --model <model id>         # concurrent == sequential
 $T $S/agent_golden.py $P http://127.0.0.1:8160 --llama http://127.0.0.1:8130   # tool loop: rendering, reuse, calls, golden per turn
 $T $S/needle.py $P http://127.0.0.1:8160 --llama http://127.0.0.1:8130         # retrieval at 25-100% of context_capacity + over-limit 400
+$T $S/sampling_check.py $P http://127.0.0.1:8160 --llama http://127.0.0.1:8130 # temperature/top_k/top_p/seed semantics + first-token distribution
 ```
 For `needle.py` sizes above the llama.cpp slot's context, drop `--llama` (Loom-only:
 it then must find the needle) or give `--sizes`. A 262k-token prefill takes minutes.
@@ -113,6 +114,10 @@ it then must find the needle) or give `--sizes`. A 262k-token prefill takes minu
   "The model ended inside its reasoning" notes are a greedy-decoding behavior of
   small thinking models, confirmed when llama.cpp's own distribution at that
   point prefers EOS; not a Loom bug by itself.
+- **sampling_check.py**: temperature 0 and `top_k` 1 equal greedy, a fixed seed
+  reproduces, different seeds vary, and 200 temperature-1 draws of the first token
+  match llama.cpp's probabilities on the same ids (total-variation distance within
+  sampling noise; Qwen3-0.6B: 0.011).
 - **needle.py** hides an access code in a real-text haystack at 25/50/75/100 % of
   the package's `context_capacity` and asks for it (thinking off when the template
   allows), then sends a prompt over the capacity (must be a clean HTTP 400, server

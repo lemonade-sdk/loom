@@ -90,9 +90,13 @@ Kernel inventory:
 - head_dim 128 or 256 (attention); gated delta-net head dims multiples of 32;
 - K-quant / Q8_0 weights (add dequant helpers for other formats); f32 norms and conv weights;
 - hidden ≤ 8192; context ≤ 262,144 (kernel bounds; raise the `range(..., 262144)` facts for 1M-context models);
-- **greedy decoding only**: `temperature`/`top_p`/`top_k`/`seed` are accepted and ignored. Thinking
-  models can then end their reasoning with EOS or loop (Qwen advises against greedy decoding for
-  thinking mode); `agent_golden.py` flags it. Say so when you report.
+- **sampling**: `temperature`, `top_p`, `top_k` and `seed` per request. Temperature 0 (the default
+  unless `build.py --temperature/--top-p/--top-k` set other defaults) is exact greedy. Otherwise the
+  head draws from the top-k candidates (k ≤ 64; `top_k` 0 = 64) after temperature softmax and top-p,
+  with a counter-based RNG keyed by (seed, position): a fixed `seed` reproduces a completion, and a
+  request without one draws from its own nonce. Thinking models want sampling (Qwen: temperature
+  0.6, top_p 0.95, top_k 20 for thinking; 0.7/0.8/20 without); greedy can end reasoning with EOS or
+  loop, which `agent_golden.py` flags. Gates and goldens always send temperature 0.
 - text only (image content parts are rejected; text parts are joined).
 
 **Chat policy facts (control.loom):**

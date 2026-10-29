@@ -28,6 +28,9 @@ ap.add_argument("--memory-gib", type=float, default=56.0, help="device memory bu
 ap.add_argument("--prefill", type=int, default=1024, help="prefill chunk (prefill_capacity); 1024-4096")
 ap.add_argument("--rows", type=int, default=4, help="initial resident rows (grows on demand); c4 benchmarks need >= 4")
 ap.add_argument("--max-tokens", type=int, default=4096, help="default completion length when a request sets none")
+ap.add_argument("--temperature", type=float, default=0.0, help="default sampling temperature when a request sets none (0 = greedy)")
+ap.add_argument("--top-p", type=float, default=1.0, help="default top_p when a request sets none")
+ap.add_argument("--top-k", type=int, default=0, help="default top_k when a request sets none (0 = up to 64 candidates)")
 ap.add_argument("--model-id", default=None, help="model id clients send (visible ASCII, no spaces); default: slug of cfg name")
 a = ap.parse_args()
 
@@ -96,6 +99,7 @@ subs = {
     "@@HEX_TOOL_ITEM_SUFFIX@@": hx(chat["tool_item_suffix"]), "@@HEX_TOOL_TURN_SUFFIX@@": hx(chat["tool_turn_suffix"]),
     "@@HEX_CONTENT_CALL_SEPARATOR@@": hx(chat["content_call_separator"]), "@@HEX_CALL_SEPARATOR@@": hx(chat["call_separator"]),
     "@@HEX_CALL_MARKER@@": hx(chat.get("call_marker", "<tool_call>")),
+    "@@DEFAULT_TEMPERATURE@@": repr(float(a.temperature)), "@@DEFAULT_TOP_P@@": repr(float(a.top_p)), "@@DEFAULT_TOP_K@@": str(a.top_k),
     "@@CALL_FORMAT@@": str({"hermes": 1, "qwen_xml": 2, "glm": 3}[chat["call_format"]]),
     "@@TOOLS_AFTER_SYSTEM@@": B(chat["tools_after_system"]), "@@TOOLS_FUNCTION_ONLY@@": B(chat["tools_function_only"]),
     "@@TRIM_CONTENT@@": B(chat["trim_content"]),

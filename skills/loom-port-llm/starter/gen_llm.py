@@ -1607,57 +1607,197 @@ def eos_text():
 
 
 def head():
-    """Final argmax over the per-chunk (max logit, argmax) partials of each
-    selected span; extra end-of-turn ids map to the service terminal."""
+    """Token selection per selected span: greedy argmax over the per-chunk
+    (max logit, argmax) partials when the span's temperature is 0; otherwise
+    top-k (k <= 64) candidates from the logits, temperature softmax, top-p,
+    and a counter-based draw keyed by (seed, position). Extra end-of-turn ids
+    map to the service terminal. Sampling parameters ride in span fields
+    2 (temperature f32), 5 (top_p f32), 7 (top_k), 8 (seed) of the metadata."""
     return f"""
 kernel.def export("g_head_select") @g_head_select(%spans: index) {{
   %c1 = index.constant 1 : index
   %c256 = index.constant 256 : index
   kernel.launch.config workgroups(%spans, %c1, %c1) workgroup_size(%c256, %c1, %c1) : index
-}} launch(%spans_arg: index, %metadata: buffer, %partials: buffer, %outputs: buffer) {{
+}} launch(%spans_arg: index, %metadata: buffer, %partials: buffer, %logits: buffer, %outputs: buffer) {{
   %spans = index.assume %spans_arg [range(%spans_arg, 1, 8192)] : index
   %span_id = kernel.workgroup.id<x> : index
   %span = index.assume %span_id [lt(%span_id, %spans)] : index
-  %lane = kernel.workitem.id<x> : index
+  %lane_id = kernel.workitem.id<x> : index
+  %lane = index.assume %lane_id [range(%lane_id, 0, 255)] : index
   %zero = index.constant 0 : offset
   %c16 = index.constant 16 : offset
   %c0 = index.constant 0 : index
   %c1 = index.constant 1 : index
   %c256 = index.constant 256 : index
   %chunks = index.constant {CHUNKS} : index
+  %vocab = index.constant {V} : index
   %c0_i32 = scalar.constant 0 : i32
   %c1_i32 = scalar.constant 1 : i32
+  %zero_f = scalar.constant 0.0 : f32
+  %neg_inf = scalar.constant -3.0e38 : f32
+  %pos_inf = scalar.constant 3.0e38 : f32
+  %big = scalar.constant 2147483647 : i32
   %header = buffer.view %metadata[%zero] : buffer -> view<4xi32>
   %count32 = view.load %header[0] : view<4xi32> -> i32
   %count_bound = scalar.assume %count32 [range(%count32, 0, 8192)] : i32
   %count = index.cast %count_bound : i32 to index
   %live_span = index.cmp ult, %span, %count : index
+  %cand_bytes = index.constant 512 : offset
+  %cand = buffer.alloca<workgroup> align(16) %cand_bytes : buffer
+  %cand_v = buffer.view %cand[%zero] : buffer -> view<64xf32>
+  %c256o = index.constant 256 : offset
+  %cand_i = buffer.view %cand[%c256o] : buffer -> view<64xi32>
   scf.if %live_span {{
     %packets = buffer.view %metadata[%c16] : buffer -> view<[%spans]x9xi32>
     %flags = view.load %packets[%span, 6] : view<[%spans]x9xi32> -> i32
     %bits = scalar.andi %flags, %c1_i32 : i32
     %selected = scalar.cmpi ne, %bits, %c0_i32 : i32
     scf.if %selected {{
-      %partial_view = buffer.view %partials[%zero] : buffer -> view<[%spans]x{CHUNKS}x2xi32>
-      %neg_inf = scalar.constant -3.0e38 : f32
-      %big = scalar.constant 2147483647 : i32
-      %bv, %bi = scf.for %c = [%lane to %chunks step %c256](%v = %neg_inf : f32, %i = %big : i32) -> (f32, i32) {{
-        %bounded_c = index.assume %c [range(%c, 0, {CHUNKS - 1})] : index
-        %bits_value = view.load %partial_view[%span, %bounded_c, %c0] : view<[%spans]x{CHUNKS}x2xi32> -> i32
-        %id = view.load %partial_view[%span, %bounded_c, %c1] : view<[%spans]x{CHUNKS}x2xi32> -> i32
-        %value = scalar.bitcast %bits_value : i32 to f32
-        %better = scalar.cmpf ogt, %value, %v : f32
-        %nv = scf.select %better, %value, %v : f32
-        %ni = scf.select %better, %id, %i : i32
-        scf.yield %nv, %ni : f32, i32
-      }}
-      %best = kernel.workgroup.reduce<maxnumf> %bv : f32
-      %is_best = scalar.cmpf oeq, %bv, %best : f32
-      %candidate = scf.select %is_best, %bi, %big : i32
-      %winner = kernel.workgroup.reduce<minsi> %candidate : i32
+      %temperature_bits = view.load %packets[%span, 2] : view<[%spans]x9xi32> -> i32
+      %temperature = scalar.bitcast %temperature_bits : i32 to f32
+      %greedy = scalar.cmpf ole, %temperature, %zero_f : f32
       %first = index.cmp eq, %lane, %c0 : index
+      %chosen_token = scf.if %greedy -> (i32) {{
+        %partial_view = buffer.view %partials[%zero] : buffer -> view<[%spans]x{CHUNKS}x2xi32>
+        %bv, %bi = scf.for %c = [%lane to %chunks step %c256](%v = %neg_inf : f32, %i = %big : i32) -> (f32, i32) {{
+          %bounded_c = index.assume %c [range(%c, 0, {CHUNKS - 1})] : index
+          %bits_value = view.load %partial_view[%span, %bounded_c, %c0] : view<[%spans]x{CHUNKS}x2xi32> -> i32
+          %id = view.load %partial_view[%span, %bounded_c, %c1] : view<[%spans]x{CHUNKS}x2xi32> -> i32
+          %value = scalar.bitcast %bits_value : i32 to f32
+          %better = scalar.cmpf ogt, %value, %v : f32
+          %nv = scf.select %better, %value, %v : f32
+          %ni = scf.select %better, %id, %i : i32
+          scf.yield %nv, %ni : f32, i32
+        }}
+        %best = kernel.workgroup.reduce<maxnumf> %bv : f32
+        %is_best = scalar.cmpf oeq, %bv, %best : f32
+        %candidate = scf.select %is_best, %bi, %big : i32
+        %winner = kernel.workgroup.reduce<minsi> %candidate : i32
+        scf.yield %winner : i32
+      }} else {{
+        %top_p_bits = view.load %packets[%span, 5] : view<[%spans]x9xi32> -> i32
+        %top_p_raw = scalar.bitcast %top_p_bits : i32 to f32
+        %top_k_raw = view.load %packets[%span, 7] : view<[%spans]x9xi32> -> i32
+        %seed = view.load %packets[%span, 8] : view<[%spans]x9xi32> -> i32
+        %c64_i32 = scalar.constant 64 : i32
+        %k_set = scalar.cmpi sgt, %top_k_raw, %c0_i32 : i32
+        %k_small = scalar.minsi %top_k_raw, %c64_i32 : i32
+        %k32 = scf.select %k_set, %k_small, %c64_i32 : i32
+        %k_bound = scalar.assume %k32 [range(%k32, 1, 64)] : i32
+        %k = index.cast %k_bound : i32 to index
+        %logit_view = buffer.view %logits[%zero] : buffer -> view<[%spans]x{CHUNKS * 128}xf32>
+        // k rounds: the largest logit strictly after the previous pick in (value desc, index asc) order.
+        %last_v, %last_i = scf.for %r = [%c0 to %k step %c1](%pv = %pos_inf : f32, %pi = %c0_i32 : i32) -> (f32, i32) {{
+          %minus_one = scalar.constant -1 : i32
+          %prev_i = scalar.addi %pi, %c0_i32 : i32
+          %first_round = index.cmp eq, %r, %c0 : index
+          %floor_i = scf.select %first_round, %minus_one, %prev_i : i32
+          %lv, %li = scf.for %v = [%lane to %vocab step %c256](%bv = %neg_inf : f32, %bi = %big : i32) -> (f32, i32) {{
+            %bounded_v = index.assume %v [range(%v, 0, {V - 1})] : index
+            %x = view.load %logit_view[%span, %bounded_v] : view<[%spans]x{CHUNKS * 128}xf32> -> f32
+            %v32 = index.cast %bounded_v : index to i32
+            %below = scalar.cmpf olt, %x, %pv : f32
+            %tie = scalar.cmpf oeq, %x, %pv : f32
+            %after = scalar.cmpi sgt, %v32, %floor_i : i32
+            %tie_after = scalar.andi %tie, %after : i1
+            %eligible = scalar.ori %below, %tie_after : i1
+            %greater = scalar.cmpf ogt, %x, %bv : f32
+            %take = scalar.andi %eligible, %greater : i1
+            %nv = scf.select %take, %x, %bv : f32
+            %ni = scf.select %take, %v32, %bi : i32
+            scf.yield %nv, %ni : f32, i32
+          }}
+          %best = kernel.workgroup.reduce<maxnumf> %lv : f32
+          %is_best = scalar.cmpf oeq, %lv, %best : f32
+          %cand_id = scf.select %is_best, %li, %big : i32
+          %winner = kernel.workgroup.reduce<minsi> %cand_id : i32
+          scf.if %first {{
+            %rr = index.assume %r [range(%r, 0, 63)] : index
+            view.store %best, %cand_v[%rr] : f32, view<64xf32>
+            view.store %winner, %cand_i[%rr] : i32, view<64xi32>
+          }}
+          scf.yield %best, %winner : f32, i32
+        }}
+        kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+        // One lane: softmax(l / T) over the k candidates, keep the top-p prefix, draw.
+        %one_f = scalar.constant 1.0 : f32
+        %p_ok = scalar.cmpf ogt, %top_p_raw, %zero_f : f32
+        %p_low = scalar.minnumf %top_p_raw, %one_f : f32
+        %top_p = scf.select %p_ok, %p_low, %one_f : f32
+        %inv_t = scalar.divf %one_f, %temperature : f32
+        %m = view.load %cand_v[0] : view<64xf32> -> f32
+        %total = scf.for %r = [%c0 to %k step %c1](%acc = %zero_f : f32) -> (f32) {{
+          %rr = index.assume %r [range(%r, 0, 63)] : index
+          %l = view.load %cand_v[%rr] : view<64xf32> -> f32
+          %d = scalar.subf %l, %m : f32
+          %ds = scalar.mulf %d, %inv_t : f32
+          %w = scalar.expf<afn> %ds : f32
+          %next = scalar.addf %acc, %w : f32
+          scf.yield %next : f32
+        }}
+        %mass = scalar.mulf %top_p, %total : f32
+        // Candidates kept: the shortest prefix whose weight reaches top_p of the total.
+        %kept_total, %kept_done = scf.for %r = [%c0 to %k step %c1](%acc = %zero_f : f32, %done = %greedy : i1) -> (f32, i1) {{
+          %rr = index.assume %r [range(%r, 0, 63)] : index
+          %l = view.load %cand_v[%rr] : view<64xf32> -> f32
+          %d = scalar.subf %l, %m : f32
+          %ds = scalar.mulf %d, %inv_t : f32
+          %w = scalar.expf<afn> %ds : f32
+          %added = scalar.addf %acc, %w : f32
+          %next = scf.select %done, %acc, %added : f32
+          %reached = scalar.cmpf oge, %next, %mass : f32
+          %now_done = scalar.ori %done, %reached : i1
+          scf.yield %next, %now_done : f32, i1
+        }}
+        // Counter-based uniform in [0, 1) from (seed, position of the drawn token).
+        %start32 = view.load %packets[%span, 1] : view<[%spans]x9xi32> -> i32
+        %length32 = view.load %packets[%span, 0] : view<[%spans]x9xi32> -> i32
+        %position = scalar.addi %start32, %length32 : i32
+        %golden = scalar.constant -1640531527 : i32
+        %mix_a = scalar.constant -2048144789 : i32
+        %mix_b = scalar.constant 2146121005 : i32
+        %mix_c = scalar.constant -2073254261 : i32
+        %c15_i32 = scalar.constant 15 : i32
+        %c16_i32 = scalar.constant 16 : i32
+        %c8_i32 = scalar.constant 8 : i32
+        %h0 = scalar.muli %seed, %golden : i32
+        %p0 = scalar.muli %position, %mix_a : i32
+        %h1 = scalar.xori %h0, %p0 : i32
+        %s1 = scalar.shrui %h1, %c16_i32 : i32
+        %h2 = scalar.xori %h1, %s1 : i32
+        %h3 = scalar.muli %h2, %mix_b : i32
+        %s2 = scalar.shrui %h3, %c15_i32 : i32
+        %h4 = scalar.xori %h3, %s2 : i32
+        %h5 = scalar.muli %h4, %mix_c : i32
+        %s3 = scalar.shrui %h5, %c16_i32 : i32
+        %h6 = scalar.xori %h5, %s3 : i32
+        %u24 = scalar.shrui %h6, %c8_i32 : i32
+        %uf = scalar.uitofp %u24 : i32 to f32
+        %scale24 = scalar.constant 5.9604644775390625e-08 : f32
+        %u = scalar.mulf %uf, %scale24 : f32
+        %target = scalar.mulf %u, %kept_total : f32
+        %chosen, %picked = scf.for %r = [%c0 to %k step %c1](%acc = %zero_f : f32, %pick = %big : i32) -> (f32, i32) {{
+          %rr = index.assume %r [range(%r, 0, 63)] : index
+          %l = view.load %cand_v[%rr] : view<64xf32> -> f32
+          %id = view.load %cand_i[%rr] : view<64xi32> -> i32
+          %d = scalar.subf %l, %m : f32
+          %ds = scalar.mulf %d, %inv_t : f32
+          %w = scalar.expf<afn> %ds : f32
+          %next = scalar.addf %acc, %w : f32
+          %unset = scalar.cmpi eq, %pick, %big : i32
+          %hit = scalar.cmpf ogt, %next, %target : f32
+          %take = scalar.andi %unset, %hit : i1
+          %np = scf.select %take, %id, %pick : i32
+          scf.yield %next, %np : f32, i32
+        }}
+        %fallback = view.load %cand_i[0] : view<64xi32> -> i32
+        %unset_final = scalar.cmpi eq, %picked, %big : i32
+        %sampled = scf.select %unset_final, %fallback, %picked : i32
+        scf.yield %sampled : i32
+      }}
       scf.if %first {{
         // Other end-of-turn ids also end the turn: report the service terminal.
+        %winner = scalar.addi %chosen_token, %c0_i32 : i32
         %eos = view.load %header[1] : view<4xi32> -> i32
 {eos_text()}
         %result = buffer.view %outputs[%zero] : buffer -> view<[%spans]xi32>
@@ -1719,7 +1859,7 @@ kernel.def export("{name}") @{name}(%spans: index) {{
   %padded = index.add %spans, %tg_less : index
   %span_groups = index.div %padded, %tg : index
   kernel.launch.config workgroups(%span_groups, %chunks, %c1) workgroup_size(%lanes, %c1, %c1) : index
-}} launch(%spans_arg: index, %tokens_arg: index, %metadata: buffer, %h: buffer, %w: buffer, %partials: buffer) {{
+}} launch(%spans_arg: index, %tokens_arg: index, %metadata: buffer, %h: buffer, %w: buffer, %partials: buffer, %logits: buffer) {{
   %spans = index.assume %spans_arg [range(%spans_arg, 1, 8192)] : index
   %tokens = index.assume %tokens_arg [range(%tokens_arg, 1, 8192)] : index
   %chunk_id = kernel.workgroup.id<y> : index
@@ -1825,6 +1965,7 @@ kernel.def export("{name}") @{name}(%spans: index) {{
     L.append("  }")
     L.append("  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
     L.append(f"  %partial_view = buffer.view %partials[%zero] : buffer -> view<[%spans]x{CHUNKS}x2xi32>")
+    L.append(f"  %logit_view = buffer.view %logits[%zero] : buffer -> view<[%spans]x{CHUNKS * 128}xf32>")
     for j in range(TG):
         L.append(f"""  %writer{j} = index.cmp eq, %workitem, %sj{j} : index
   %store{j} = scalar.andi %writer{j}, %live{j} : i1
@@ -1840,6 +1981,10 @@ kernel.def export("{name}") @{name}(%spans: index) {{
       }}
       %row_value = index.add %first_row, %r : index
       %in_vocab = index.cmp ult, %row_value, %vocab : index
+      %ls = index.assume %span{j}_raw [lt(%span{j}_raw, %spans)] : index
+      %lrow = index.assume %row_value [range(%row_value, 0, {CHUNKS * 128 - 1})] : index
+      %stored = scf.select %in_vocab, %total, %neg_inf : f32
+      view.store %stored, %logit_view[%ls, %lrow] : f32, view<[%spans]x{CHUNKS * 128}xf32>
       %greater = scalar.cmpf ogt, %total, %bv : f32
       %better = scalar.andi %greater, %in_vocab : i1
       %row32 = index.cast %row_value : index to i32
@@ -1949,6 +2094,9 @@ command.program.def public @llm_advance() launch(%weights: buffer, %residual: bu
   %info_size = index.scale %t, %info_bytes : index, offset -> offset
   %ffn_size = index.scale %t, %ffn_bytes : index, offset -> offset
   %partial_size = index.scale %spans, %partial_bytes : index, offset -> offset
+  %logit_bytes = index.constant {CHUNKS * 128 * 4} : offset
+  %logit_size = index.scale %spans, %logit_bytes : index, offset -> offset
+  %logits = buffer.alloca<global> align(256) %logit_size : buffer
   %x = buffer.alloca<global> align(256) %x_size : buffer
   %h = buffer.alloca<global> align(256) %x_size : buffer
   %y = buffer.alloca<global> align(256) %x_size : buffer
@@ -2096,11 +2244,11 @@ command.program.def public @llm_advance() launch(%weights: buffer, %residual: bu
   %head = command.parameter %weights, "{head_name}" : view<{hsize}xi8>
   %one_span = index.cmp eq, %spans, %c1 : index
   scf.if %one_span {{
-    kernel.launch @g_head_mv[%spans](%spans, %t, %metadata, %h, %head, %partials) : [index](index, index, buffer, buffer, view<{hsize}xi8>, buffer)
+    kernel.launch @g_head_mv[%spans](%spans, %t, %metadata, %h, %head, %partials, %logits) : [index](index, index, buffer, buffer, view<{hsize}xi8>, buffer, buffer)
   }} else {{
-    kernel.launch @g_head_mv_t4[%spans](%spans, %t, %metadata, %h, %head, %partials) : [index](index, index, buffer, buffer, view<{hsize}xi8>, buffer)
+    kernel.launch @g_head_mv_t4[%spans](%spans, %t, %metadata, %h, %head, %partials, %logits) : [index](index, index, buffer, buffer, view<{hsize}xi8>, buffer, buffer)
   }}
-  kernel.launch @g_head_select[%spans](%spans, %metadata, %partials, %outputs) : [index](index, buffer, buffer, buffer)
+  kernel.launch @g_head_select[%spans](%spans, %metadata, %partials, %logits, %outputs) : [index](index, buffer, buffer, buffer, buffer)
   command.return
 }}
 """)

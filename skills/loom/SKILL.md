@@ -119,6 +119,10 @@ Read it from there if it isn't in your skill list.
   `requests` with an empty `Expect:` header breaks the connection.)
 - The first request after startup triggers lazy weight loading (seconds to a
   minute); don't time it.
+- **GPU queues run out before memory does.** Each loom-serve, loom-test and
+  llama-server process takes GPU user queues; with about six alive (other users'
+  jobs count) a new one fails with `RESOURCE_EXHAUSTED ... user_queue_create(SDMA)`.
+  Stop servers you no longer need before kernel tests or a new server.
 - Stop servers by PID file (`loom-setup/scripts/stop.sh`). `pkill -f "...port..."`
   can match and kill your own shell.
 - After a rebuild, make sure the old server is really gone. `serve.sh` refuses a

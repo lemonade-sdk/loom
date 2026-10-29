@@ -43,7 +43,8 @@ global.rodata.def @unsupported = bytes("@@HEX_UNSUPPORTED@@")
 func.decl @llm_storage(%maximum: i64, %span_capacity: i64, %context: i64, %pool: i64, %rows: i64, %pins: i64) -> (buffer, buffer, buffer, buffer, buffer)
 
 // Control state layout: [0, 8) unused, [8, 88) two transfer records,
-// [88, 128) layout recipe, [128, 128 + 4 * shapes) stage per packing shape.
+// [88, 128) layout recipe, [128, 640) stage per packing shape, then a 16-byte
+// sampling record per resident row.
 func.def public @prepare(%prefill: i64, %context: i64, %pool: i64, %rows: i64, %pins: i64, %draft_depth: i32, %shapes: buffer, %shape_count: i64, %weights: buffer, %options: buffer) -> (i64, i32, buffer, buffer, buffer, buffer, buffer, buffer, buffer) {
   %c0_source = scalar.constant 0 : i32
   %origin = index.constant 0 : offset
@@ -82,7 +83,13 @@ func.def public @prepare(%prefill: i64, %context: i64, %pool: i64, %rows: i64, %
   %stage_slots = index.constant 128 : index
   %stage_bytes = index.scale %stage_slots, %c4_off : index, offset -> offset
   %header_bytes = index.constant 128 : offset
-  %state_bytes = index.add %header_bytes, %stage_bytes : offset
+  %control_bytes = index.add %header_bytes, %stage_bytes : offset
+  // Then one 16-byte sampling record per resident row (control.loom @bind_request).
+  %bounded_rows = scalar.assume %rows [range(%rows, 1, 1048576)] : i64
+  %row_count = index.cast %bounded_rows : i64 to index
+  %record_bytes = index.constant 16 : offset
+  %sampling_bytes = index.scale %row_count, %record_bytes : index, offset -> offset
+  %state_bytes = index.add %control_bytes, %sampling_bytes : offset
   %state = buffer.alloca<private> align(8) %state_bytes : buffer
   buffer.fill %c0_i32, %state[%origin], %state_bytes : i32
   %stage_view = buffer.view %state[%header_bytes] : buffer -> view<[%count]xi32>
