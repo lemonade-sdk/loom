@@ -1833,9 +1833,9 @@ def linear(fmt, x, s, w, wsize, y, k, n, kval, mode="store"):
       }}
     }} else {{
       scf.if %single {{
-        kernel.launch @{base}[{n}, %t]{mv_args}
+        kernel.launch @{mv_name(fmt, kval, mode == "swiglu", n, 1)}[{n}, %t]{mv_args}
       }} else {{
-        kernel.launch @{base}_t4[{n}, %t]{mv_args}
+        kernel.launch @{mv_name(fmt, kval, mode == "swiglu", n, 4)}[{n}, %t]{mv_args}
       }}
     }}"""
 
@@ -2002,6 +2002,42 @@ kernel.def export("{name}") @{name}(%spans: index) {{
 
 
 USED_MV = set()      # (fmt, K, swiglu) decode matrix-vector kernels the model launches
+USED_MV_R = set()    # (fmt, K, swiglu, R, TG) adaptive-row variants
+NVAL = {"%nH": H, "%nFF": FF, "%nKV": KVH * D, "%nQ": QH * D, "%nQ2": 2 * QH * D}
+if GDN:
+    NVAL.update({"%nC": GDN["C"], "%nVD": GDN["VD"], "%nHV": GDN["HV"]})
+ADAPT = os.environ.get("MV_ADAPT", "1") not in ("", "0")
+WG1 = int(os.environ.get("MV_WG1", "4096")); WG4 = int(os.environ.get("MV_WG4", "128"))
+
+
+# The 1- and 4-token variants of a projection must use the same R: R changes the
+# summation order, so different R makes a request's output depend on whether it was
+# decoded alone or batched (consistency.py fails). MV_WG4 opts into a separate 4-token
+# target anyway (more c4 throughput, batch-dependent output: record it in the report).
+SAME_R = "MV_WG4" not in os.environ
+
+
+def pick_r(n, K, TG):
+    """Catalog lever: halve rows/workgroup while the grid is under-filled."""
+    if not ADAPT or n is None:
+        return 16
+    if SAME_R:
+        TG = 1
+    target = (640 if K >= 8192 else WG1) if TG == 1 else WG4
+    R = 16
+    while R > 1 and n // R < target and n % (R // 2) == 0:
+        R //= 2
+    return R
+
+
+def mv_name(fmt, kval, sw, n, TG):
+    nv = NVAL.get(n, None) if isinstance(n, str) else n
+    R = pick_r(nv, kval, TG)
+    base = f"g_mv_{fmt}_k{kval}" + ("_swiglu" if sw else "") + (f"_t{TG}" if TG > 1 else "")
+    if R == 16:
+        return base
+    USED_MV_R.add((fmt, kval, sw, R, TG))
+    return base + f"_r{R}"
 USED_GEMM = {}       # fmt -> set of GEMM modes
 
 
@@ -2017,9 +2053,9 @@ def lin_mv(fmt, x, w, wsize, y, n, kval):
     base = f"g_mv_{fmt}_k{kval}"
     a = f"({n}, %t, %zero_i32, {x}, {w}, {y}) : [index, index](index, index, i32, buffer, view<{wsize}xi8>, buffer)"
     return f"""scf.if %single {{
-    kernel.launch @{base}[{n}, %t]{a}
+    kernel.launch @{mv_name(fmt, kval, False, n, 1)}[{n}, %t]{a}
   }} else {{
-    kernel.launch @{base}_t4[{n}, %t]{a}
+    kernel.launch @{mv_name(fmt, kval, False, n, 4)}[{n}, %t]{a}
   }}"""
 
 
@@ -2267,6 +2303,8 @@ if __name__ == "__main__":
     for TG in (1, 4):
         for fmt, K, sw in sorted(USED_MV):
             parts.append(mv(fmt, K, TG=TG, swiglu=sw))
+    for fmt, K, sw, R, TG in sorted(USED_MV_R):
+        parts.append(mv(fmt, K, R=R, TG=TG, swiglu=sw, suffix=f"_r{R}"))
     parts += [NORMS, ROW_SCALE, qk_rope(), attention(), head(), head_mv(1, head_fmt), head_mv(4, head_fmt)]
     if FUSED_Q:
         parts.append(split_qgate(QH, D))

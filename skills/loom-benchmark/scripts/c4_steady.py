@@ -17,7 +17,9 @@ ap.add_argument("url")
 ap.add_argument("n", type=int, nargs="?", default=4)
 ap.add_argument("--model", default=None)
 ap.add_argument("--max-tokens", type=int, default=400)
-ap.add_argument("--label", help="build label: logs c4_steady to targets.jsonl (Loom only, needs roofline.json)")
+ap.add_argument("--label", help="build label: Loom runs log c4_steady to targets.jsonl (needs roofline.json); "
+                                 "llama.cpp runs (no --model) append a kind=llama row to --log for roofline.py --baseline")
+ap.add_argument("--log", default="perf_log.jsonl")
 ap.add_argument("--reverted", action="store_true")
 a = ap.parse_args()
 events = [[] for _ in range(a.n)]
@@ -53,3 +55,6 @@ print(json.dumps({"streams": a.n, "window_s": round(end - start, 2), "agg_tps": 
 if a.label and a.model:  # Loom run: track it in the optimization campaign
     from campaign import log_metrics
     log_metrics({"c4_steady": round(count / (end - start), 1)}, a.label, a.reverted)
+elif a.label:  # llama.cpp run: record it as baseline data next to perf.py's rows
+    with open(a.log, "a") as f:
+        f.write(json.dumps({"kind": "llama", "label": a.label, "c4_steady": round(count / (end - start), 1)}) + "\n")

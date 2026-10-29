@@ -24,7 +24,24 @@ Prerequisites:
 - The llama.cpp ROCm reference is available (`loom-benchmark`), for the golden
   comparison.
 
-## Workflow (Qwen3-0.6B and Qwen3.5-0.8B each take ~10 min of commands)
+## Fast path: one command (≈40 s for a 0.6–0.8B model)
+
+```bash
+LOOM_ROOT=~/loom ${CLAUDE_SKILL_DIR}/port.sh <org>/<repo-GGUF>[:file.gguf] ~/work/mymodel [PORT=8160] [MEMORY_GIB=56] [MODEL_ID]
+# then the gates (loom-benchmark), with the same package:
+LLAMACPP_DIR=<llama.cpp ROCm dir> ${CLAUDE_SKILL_DIR}/../loom-benchmark/scripts/gates.sh \
+  ~/work/mymodel/pkg http://127.0.0.1:8160 ~/work/mymodel/gguf/<file.gguf> ~/work/mymodel/bench [LLAMA_PORT=8130]
+```
+`port.sh` runs steps 1–6 below deterministically: it downloads the GGUF (Q4_K_M, else
+Q8_0) and the base model's tokenizer, inspects, stops if the chat block isn't verified,
+builds at the native context, serves (state in `WORKDIR/state`), runs the kernel tests and
+a smoke test (chat + a tool call), and prints `PORT_RESULT {...}`. Its exit code says
+where it stopped (2 download, 3 chat template, 4 build/serve, 5 kernel tests, 6 smoke);
+only then do you need the manual steps below for that stage. `gates.sh` writes
+`bench/gates.json` with one verdict (see `loom-benchmark`). Verified on Qwen3-0.6B
+(Q8_0) and Qwen3.5-0.8B (Q4_K_M).
+
+## Workflow, step by step (what port.sh does; use it to debug a stage)
 
 ```bash
 K=${CLAUDE_SKILL_DIR}/starter; T=~/loom/.tools/bin/python

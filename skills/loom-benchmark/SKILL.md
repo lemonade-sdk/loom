@@ -41,12 +41,17 @@ Halo). Then:
 ```bash
 LLAMACPP_DIR=<dir> $S/llamacpp_server.sh MODEL.gguf 8130 1 34000   # goldens / long context (1 slot, 34k)
 LLAMACPP_DIR=<dir> $S/llamacpp_server.sh MODEL.gguf 8130 4 8192    # perf incl. 4 streams
-kill $(cat /tmp/llamacpp-8130.pid)
+kill $(cat ${LLAMACPP_STATE:-/tmp}/llamacpp-8130.pid)
 ```
 Always use the **same GGUF file** as the Loom package. Never run llama.cpp and a
 big Loom model at the same time if together they exceed GPU memory.
 
 ## 1. Correctness gates (before any performance claim)
+
+**One command:** `gates.sh PKG LOOM_URL GGUF BENCH_DIR [LLAMA_PORT]` (needs `LLAMACPP_DIR`)
+starts llama.cpp with one slot sized for the long goldens, runs everything below in
+order, stops llama.cpp and writes `BENCH_DIR/gates.json` (`verdict` PASS/FAIL per gate,
+logs in `gates_*.log`). Use the individual scripts to rerun or debug one gate.
 
 ```bash
 S=${CLAUDE_SKILL_DIR}/scripts; P=~/work/mymodel/pkg; T=~/loom/.tools/bin/python; mkdir -p ~/work/mymodel/bench && cd ~/work/mymodel/bench   # outputs land here, not in the skill

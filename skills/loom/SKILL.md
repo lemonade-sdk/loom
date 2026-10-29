@@ -25,8 +25,12 @@ and exposes OpenAI-style HTTP endpoints.
 
 All paths in these skills assume the install root `~/loom` (SDK venv `~/loom/.venv`,
 tools venv `~/loom/.tools`). Substitute your own root consistently. The scripts take overrides:
-`VENV=` (serve.sh, run_kernel_tests.sh), `UI_VENV=` or the 2nd argument (start_ui.sh),
-and `LOOM_SERVE_STATE=` (the serve.sh PID/log dir).
+`LOOM_ROOT=` (install root for port.sh, gates.sh, pick_llamacpp.sh), `VENV=` (serve.sh,
+run_kernel_tests.sh), `PY=` (pick_llamacpp.sh's python), `UI_VENV=` or the 2nd argument
+(start_ui.sh), `LOOM_SERVE_STATE=` (serve.sh PID/log dir) and `LLAMACPP_STATE=`
+(llamacpp_server.sh PID/log dir). On a shared machine set the state dirs inside your work
+dir and give `pick_llamacpp.sh` a SEARCH_ROOT (3rd argument) so it only sees builds the
+user approved.
 
 ## Windows
 
@@ -77,8 +81,10 @@ Report met or short for each metric, with the approach curve.
 "Get X working, optimize it and report" is a single job. Run the whole pipeline
 without stopping:
 1. reuse the install;
-2. port (native context, tools: see `loom-port-llm`);
-3. pass the gates: kernel tests, golden, `agent_golden.py` (tool loop) and `needle.py` (full context);
+2. port: `loom-port-llm/port.sh REPO WORKDIR` (native context, tools, kernel tests,
+   smoke test; ≈40 s for a small model). Hand-work only where it stops;
+3. pass the gates: `loom-benchmark/scripts/gates.sh` (golden ×2 + compare,
+   consistency, tool-calling agent loop, sampling, full-context needle) → `bench/gates.json`;
 4. measure the llama.cpp baseline;
 5. run `loom-roofline` to set targets and a budget. This is **not optional**: the
    report must contain the roofline table (`bench/roofline.json`) and the approach

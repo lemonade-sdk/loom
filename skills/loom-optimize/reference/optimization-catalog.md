@@ -2,7 +2,8 @@
 
 Numbers come from the Flint (40B MoE) and Muse Glimmer (30B dense) ports on Strix
 Halo, measured against llama.cpp ROCm (lemonade-sdk/llamacpp-rocm b1355) on the
-same GGUF. All the kernels named here exist in `loom-port-llm/starter/gen_llm.py`
+same GGUF. The kernels named here are in `loom-port-llm/starter/gen_llm.py` unless a
+lever says otherwise
 (dense) or `flint-moe-example/` (MoE).
 
 ## Decode
@@ -35,6 +36,18 @@ same GGUF. All the kernels named here exist in `loom-port-llm/starter/gen_llm.py
 - **Result.** On Nemotron-3.5-Bolt-E4B (Gemma-4 E4B, Q4_K_M), decode went from
   54.2 to 59.9 tok/s, half of the gap to the roofline in one change. Check c4
   afterwards: it regressed until the 4-token target was lowered to 128.
+- **In the starter, on by default** (`pick_r()` in gen_llm.py; `MV_ADAPT=0` turns it off,
+  `MV_WG1` / `MV_WG4` set the targets; `make_kernel_tests.py` tests the `_r{R}` variants
+  the model launches). Hidden-1024 models gain the most: in fresh-agent trials decode went
+  from 92 to 144 tok/s (Qwen3.5-0.8B) and from 124 to 157 tok/s (Qwen3-0.6B, where
+  `MV_WG4=512` also beat 128 on 4 streams).
+- **Keep 1- and 4-token R equal (the default).** R changes the summation order, so
+  different R for the two variants makes a request's tokens depend on whether it was
+  decoded alone or batched: `consistency.py` failed on Qwen3-0.6B. With one R per
+  projection (the 1-token rule) decode keeps the whole gain and 4 streams most of it
+  (interleaved medians: fixed R=16 118 / 249 tok/s, same R 131 / 368, separate R 131 / 514
+  for decode / 4 streams). Setting `MV_WG4` opts into separate 4-token R; then the
+  consistency gate fails by design, so state the batch dependence in the report.
 
 ### Fused 1-token QKV and paired-row gated FFN
 - **Fused QKV.** For a single decode token, one launch computes the q, k and v rows

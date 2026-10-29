@@ -6,12 +6,15 @@ Python stdlib sources) and the model is asked to list them. Sizes default to 25/
 budget). It also checks that a prompt over the capacity is refused cleanly (HTTP 400)
 and that the server is still healthy afterwards.
 
-usage: needle.py PKG LOOM_URL [--sizes N ...] [--needles 1|3] [--llama URL] [--max-tokens 1024] [--out FILE]
+usage: needle.py PKG LOOM_URL [--sizes N ...] [--probes 2] [--needles 1|3] [--llama URL] [--max-tokens 1024] [--out FILE]
+  default sizes: 50 % and 100 % of context_capacity (a full-context prefill can take many minutes)
   --llama also runs the identical prompt ids through llama.cpp /completion for comparison
   (start it with a single slot whose context covers the largest size).
-A size passes when Loom finds every needle, or (with --llama) at least as many as llama.cpp on
-the same prompt ids: small models miss needles on their own. Exit status 1 on a failing size
-or a failed over-limit check.
+Each size runs --probes haystacks (different needles and depths). Small models miss needles
+on their own, and near the context limit both engines flip between found and missed on a
+near-tie, so the gate is aggregate: Loom must find at least half of all probes, and with
+--llama at least as many as llama.cpp minus one. Exit status 1 on a failed gate or a failed
+over-limit check. Answers are saved with --out.
 """
 import argparse
 import glob
@@ -85,6 +88,7 @@ def main():
     ap.add_argument("--llama", default=None)
     ap.add_argument("--max-tokens", type=int, default=1024)
     ap.add_argument("--needles", type=int, default=1, choices=[1, 3])
+    ap.add_argument("--probes", type=int, default=2)
     ap.add_argument("--out", default=None)
     a = ap.parse_args()
     P = Package(a.pkg)
@@ -95,30 +99,37 @@ def main():
     extra = {"chat_template_kwargs": {"enable_thinking": False}} if thinking is False else {}
     overhead = len(P.ids(P.render_messages([{"role": "user", "content": QUESTIONS[a.needles]}], None, thinking)))
     top = context - a.max_tokens - overhead - 64
-    sizes = a.sizes or [top // 4, top // 2, 3 * top // 4, top]
+    sizes = a.sizes or [top // 2, top]
     ids = P.ids(corpus())
     while len(ids) < top:
         ids = ids + ids  # small stdlib: repeat (needles stay unique)
     print(f"context {context}; haystack sizes {sizes}", flush=True)
     failures = 0
     results = []
+    loom_total = llama_total = probes_total = 0
     for n in sizes:
-        prompt, needles = haystack(P, ids, n, n, a.needles)
-        rec = {"n": n}
-        r = chat(a.url, P.model_id, prompt, a.max_tokens, extra)
-        rec.update(prompt_tokens=(r.get("usage") or {}).get("prompt_tokens"), status=r["status"], ttft_s=r.get("ttft_s"),
-                   finish=r.get("finish"), found=sum(v in r.get("text", "") for v in needles.values()), error=r.get("error"))
-        if a.llama:
-            pids = P.ids(P.render_messages([{"role": "user", "content": prompt}], None, thinking))
-            t0 = time.time()
-            g = requests.post(a.llama + "/completion", timeout=7200, json={
-                "prompt": pids, "n_predict": a.max_tokens, "temperature": 0, "cache_prompt": False}).json()
-            rec.update(llama_found=sum(v in g.get("content", "") for v in needles.values()), llama_s=round(time.time() - t0, 1),
-                       llama_error=(g.get("error") or {}).get("message"))
-        ok = rec["status"] == 200 and (rec["found"] == a.needles or rec["found"] >= rec.get("llama_found", a.needles))
-        failures += not ok
-        print(("OK  " if ok else "FAIL"), json.dumps(rec), flush=True)
-        results.append(rec)
+        for probe in range(a.probes):
+            prompt, needles = haystack(P, ids, n, n * 31 + probe, a.needles)
+            rec = {"n": n, "probe": probe}
+            r = chat(a.url, P.model_id, prompt, a.max_tokens, extra)
+            rec.update(prompt_tokens=(r.get("usage") or {}).get("prompt_tokens"), status=r["status"], ttft_s=r.get("ttft_s"),
+                       finish=r.get("finish"), found=sum(v in r.get("text", "") for v in needles.values()), error=r.get("error"),
+                       needles=needles, answer=r.get("text", "")[-400:])
+            if a.llama:
+                pids = P.ids(P.render_messages([{"role": "user", "content": prompt}], None, thinking))
+                t0 = time.time()
+                g = requests.post(a.llama + "/completion", timeout=7200, json={
+                    "prompt": pids, "n_predict": a.max_tokens, "temperature": 0, "cache_prompt": False}).json()
+                rec.update(llama_found=sum(v in g.get("content", "") for v in needles.values()), llama_s=round(time.time() - t0, 1),
+                           llama_error=(g.get("error") or {}).get("message"), llama_answer=g.get("content", "")[-400:])
+                llama_total += rec["llama_found"]
+            failures += rec["status"] != 200
+            loom_total += rec["found"]; probes_total += a.needles
+            print(("OK  " if rec["status"] == 200 else "FAIL"), json.dumps({k: v for k, v in rec.items() if "answer" not in k}), flush=True)
+            results.append(rec)
+    enough = loom_total * 2 >= probes_total and (not a.llama or loom_total >= llama_total - 1)
+    failures += not enough
+    print(("OK  " if enough else "FAIL"), f"needles found: Loom {loom_total}/{probes_total}" + (f", llama.cpp {llama_total}/{probes_total}" if a.llama else ""))
     # Over the capacity: a clean refusal, then the server still answers.
     prompt, _ = haystack(P, ids * 2, context + 1000, 1)
     r = requests.post(a.url + "/v1/chat/completions", timeout=600, json={

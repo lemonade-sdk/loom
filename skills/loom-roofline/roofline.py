@@ -115,7 +115,9 @@ def weight_bytes(tensors, geo):
 def attn_layers(tensors, L):
     """Layers that attend: those with a q projection. Hybrids (LFM2 short-conv, Mamba,
     delta-net) have attention in only some blocks; KV-shared layers still have q."""
-    found = {i for i in range(L) if any(f"blk.{i}.attn_q{s}.weight" in tensors for s in ("", "kv"))}
+    # Gated delta-net layers (qwen35/qwen3next) have a fused attn_qkv but no attention: they carry ssm_* tensors.
+    recurrent = {i for i in range(L) if f"blk.{i}.ssm_a" in tensors or f"blk.{i}.ssm_conv1d.weight" in tensors}
+    found = {i for i in range(L) if i not in recurrent and any(f"blk.{i}.attn_q{s}.weight" in tensors for s in ("", "kv"))}
     return found or set(range(L))
 
 
@@ -188,7 +190,7 @@ def main():
             r = json.loads(l)
             if r.get("kind") != "llama":
                 continue
-            for k in ("decode_tps", "decode_tps_1k", "decode_tps_2k", "decode_tps_32k"):
+            for k in ("decode_tps", "decode_tps_1k", "decode_tps_2k", "decode_tps_32k", "c4_steady"):
                 if k in r:
                     base[k] = r[k]
             for p in r.get("prefill", []) + r.get("prefill_long", []):
