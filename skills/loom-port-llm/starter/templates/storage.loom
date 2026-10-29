@@ -1,4 +1,5 @@
-// KV geometry: @@PLANES@@ planes (K and V per layer) of pool x @@POS_BYTES@@ bytes (F16 KV heads x 128 dims).
+// KV geometry: @@PLANES@@ planes (K and V per attention layer) of pool x @@POS_BYTES@@ bytes (F16 KV heads x head_dim).
+// Recurrent slots: @@RECURRENT_BYTES@@ bytes each (gated delta-net state of every recurrent layer; 4 = none).
 func.def @allocation(%records: buffer, %slot: index, %bytes: i64, %clear: i64) {
   %origin = index.constant 0 : offset
   %bounded = index.assume %slot [range(%slot, 0, 10)] : index
@@ -29,7 +30,11 @@ func.def public @llm_storage(%maximum: i64, %span_capacity: i64, %context: i64, 
   %padded_token_bytes = scalar.muli %token_slots, %slot_stride : i64
   %progress_offset = scalar.addi %slot_stride, %padded_token_bytes : i64
   %recurrent_offset = scalar.addi %progress_offset, %slot_stride : i64
-  %row_stride = scalar.addi %recurrent_offset, %slot_stride : i64
+  %recurrent_bytes = scalar.constant @@RECURRENT_BYTES@@ : i64
+  %recurrent_padded = scalar.addi %recurrent_bytes, %alignment_bias : i64
+  %recurrent_pages = scalar.divui %recurrent_padded, %slot_stride : i64
+  %recurrent_region = scalar.muli %recurrent_pages, %slot_stride : i64
+  %row_stride = scalar.addi %recurrent_offset, %recurrent_region : i64
   %pinned = scalar.cmpi ne, %pins, %c0_i64 : i64
   %twice_rows = scalar.addi %rows, %rows : i64
   %fork_slots = scalar.addi %twice_rows, %pins : i64
@@ -115,7 +120,7 @@ func.def public @llm_storage(%maximum: i64, %span_capacity: i64, %context: i64, 
   view.store %c4_i64, %geometry_view[3] : i64, view<13xi64>
   view.store %recurrent_origin, %geometry_view[4] : i64, view<13xi64>
   view.store %row_stride, %geometry_view[5] : i64, view<13xi64>
-  view.store %c4_i64, %geometry_view[6] : i64, view<13xi64>
+  view.store %recurrent_bytes, %geometry_view[6] : i64, view<13xi64>
   view.store %slots, %geometry_view[7] : i64, view<13xi64>
   view.store %c1_i64, %geometry_view[8] : i64, view<13xi64>
   view.store %c0_i64, %geometry_view[9] : i64, view<13xi64>

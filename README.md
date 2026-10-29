@@ -97,12 +97,12 @@ name:
 | Plugin install | Copy install | What it does |
 |---|---|---|
 | `/loom:loom` | `/loom` | Start here: overview, hard safety rules, which skill to use |
-| `/loom:loom-setup` | `/loom-setup` | Install the SDK wheel and the model library, `loom-fetch`, start/stop/inspect `loom-serve` (GPU and NPU) |
+| `/loom:loom-setup` | `/loom-setup` | Install the SDK (`hrx-loom` from PyPI) and the matching model library, `loom-fetch`, start/stop/inspect `loom-serve` (GPU and NPU) |
 | `/loom:loom-demo-ui` | `/loom-demo-ui` | Web playground: chat, transcribe, speak, image, embed. It finds models from the servers' `/v1/status` |
-| `/loom:loom-port-llm` | `/loom-port-llm` | Config-driven starter kit that turns a dense GGUF LLM into a Loom package: inspect → generate kernels → build → kernel unit tests → golden check |
+| `/loom:loom-port-llm` | `/loom-port-llm` | Config-driven starter kit that turns a GGUF LLM (dense, or a Qwen3.5-style gated delta-net hybrid) into a Loom package at its native context length, with tool calling, reasoning and history reuse derived from the model's own chat template: inspect → generate kernels → build → kernel unit tests → golden, agent and full-context gates |
 | `/loom:loom-roofline` | `/loom-roofline` | Roofline for decode/prefill/c4 from the GGUF, calibrated against achieved Loom efficiency; picks per-metric targets vs llama.cpp and a time budget (default 1 h); a rate-of-approach controller decides continue / pivot / stop |
 | `/loom:loom-optimize` | `/loom-optimize` | The measure / ablate / change / verify loop, a kernel A/B helper, a catalog of optimizations that worked (and that didn't), and the sources of a hand-tuned MoE port |
-| `/loom:loom-benchmark` | `/loom-benchmark` | Token-by-token golden comparison against llama.cpp ROCm, a batching-consistency check, throughput workloads, reporting rules |
+| `/loom:loom-benchmark` | `/loom-benchmark` | Token-by-token golden comparison against llama.cpp ROCm, a multi-turn tool-calling gate, a full-context needle gate, a batching-consistency check, throughput workloads, reporting rules |
 
 A full cold-start port takes about 10–25 minutes for a small dense model, and about
 35 minutes for an architecture the starter kit doesn't cover (Gemma-4 E4B). In
@@ -120,9 +120,9 @@ order:
   Windows was verified end to end on Strix Halo with Qwen3-0.6B; see the `loom` skill's
   Windows section. The NPU path needs an
   XDNA device.
-- `gh`, authenticated: the Loom SDK wheel is a GitHub Actions artifact of
-  ROCm/hrx-system, not a PyPI package.
-- Python ≥ 3.12 with `venv`, plus `git` and `unzip`.
+- Python ≥ 3.12 with `venv`, and `git`. The SDK comes from PyPI
+  ([`hrx-loom`](https://pypi.org/project/hrx-loom/), Linux glibc ≥ 2.39 or Windows 11).
+  `gh` is only needed for development wheels from CI (`install_loom.sh ROOT ci-latest`).
 - For the golden reference: a llama.cpp ROCm build from
   [lemonade-sdk/llamacpp-rocm](https://github.com/lemonade-sdk/llamacpp-rocm). The
   skill asks before running any downloaded binary.

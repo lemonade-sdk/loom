@@ -78,6 +78,18 @@ func.def public @text_bind_request_v1(%state: buffer, %row: i32, %options: buffe
   func.return
 }
 
+func.decl @chat_reasoning() -> (i32, i32, i32)
+
+func.def public @text_chat_reasoning() -> (i32, i32, i32) {
+  %enabled, %efforts, %default = func.call @chat_reasoning() : () -> (i32, i32, i32)
+  func.return %enabled, %efforts, %default : i32, i32, i32
+}
+
+func.def public @text_chat_reasoning_v1() -> (i32, i32, i32) {
+  %enabled, %efforts, %default = func.call @chat_reasoning() : () -> (i32, i32, i32)
+  func.return %enabled, %efforts, %default : i32, i32, i32
+}
+
 func.decl @chat_image_limits() -> (i64, i64, i64, i64, i64)
 
 func.def public @text_chat_image_limits() -> (i64, i64, i64, i64, i64) {
@@ -102,16 +114,16 @@ func.def public @text_chat_begin_v1(%request: buffer, %tools: buffer) -> (buffer
   func.return %result_0, %result_1 : buffer, i64
 }
 
-func.decl @chat_message(%raw: buffer, %role: buffer, %content: buffer, %parts: buffer, %reasoning: buffer, %calls: buffer, %state: i64, %ordinal: i64, %fields: i64, %part_count: i64) -> (buffer, i64, buffer)
+func.decl @chat_message(%raw: buffer, %role: buffer, %content: buffer, %parts: buffer, %frames: buffer, %reasoning: buffer, %calls: buffer, %state: i64, %ordinal: i64, %fields: i64, %part_count: i64) -> (buffer, i64, buffer, i64)
 
-func.def public @text_chat_message(%raw: buffer, %role: buffer, %content: buffer, %parts: buffer, %reasoning: buffer, %calls: buffer, %state: i64, %ordinal: i64, %fields: i64, %part_count: i64) -> (buffer, i64, buffer) {
-  %result_0, %result_1, %result_2 = func.call @chat_message(%raw, %role, %content, %parts, %reasoning, %calls, %state, %ordinal, %fields, %part_count) : (buffer, buffer, buffer, buffer, buffer, buffer, i64, i64, i64, i64) -> (buffer, i64, buffer)
-  func.return %result_0, %result_1, %result_2 : buffer, i64, buffer
+func.def public @text_chat_message(%raw: buffer, %role: buffer, %content: buffer, %parts: buffer, %frames: buffer, %reasoning: buffer, %calls: buffer, %state: i64, %ordinal: i64, %fields: i64, %part_count: i64) -> (buffer, i64, buffer, i64) {
+  %result_0, %result_1, %result_2, %result_3 = func.call @chat_message(%raw, %role, %content, %parts, %frames, %reasoning, %calls, %state, %ordinal, %fields, %part_count) : (buffer, buffer, buffer, buffer, buffer, buffer, buffer, i64, i64, i64, i64) -> (buffer, i64, buffer, i64)
+  func.return %result_0, %result_1, %result_2, %result_3 : buffer, i64, buffer, i64
 }
 
-func.def public @text_chat_message_v1(%raw: buffer, %role: buffer, %content: buffer, %parts: buffer, %reasoning: buffer, %calls: buffer, %state: i64, %ordinal: i64, %fields: i64, %part_count: i64) -> (buffer, i64, buffer) {
-  %result_0, %result_1, %result_2 = func.call @chat_message(%raw, %role, %content, %parts, %reasoning, %calls, %state, %ordinal, %fields, %part_count) : (buffer, buffer, buffer, buffer, buffer, buffer, i64, i64, i64, i64) -> (buffer, i64, buffer)
-  func.return %result_0, %result_1, %result_2 : buffer, i64, buffer
+func.def public @text_chat_message_v1(%raw: buffer, %role: buffer, %content: buffer, %parts: buffer, %frames: buffer, %reasoning: buffer, %calls: buffer, %state: i64, %ordinal: i64, %fields: i64, %part_count: i64) -> (buffer, i64, buffer, i64) {
+  %result_0, %result_1, %result_2, %result_3 = func.call @chat_message(%raw, %role, %content, %parts, %frames, %reasoning, %calls, %state, %ordinal, %fields, %part_count) : (buffer, buffer, buffer, buffer, buffer, buffer, buffer, i64, i64, i64, i64) -> (buffer, i64, buffer, i64)
+  func.return %result_0, %result_1, %result_2, %result_3 : buffer, i64, buffer, i64
 }
 
 func.decl @chat_end(%state: i64) -> (buffer, i64)
@@ -138,15 +150,15 @@ func.def public @text_render_tool_v1(%name: buffer, %arguments: buffer, %ordinal
   func.return %result_0, %result_1 : buffer, i64
 }
 
-func.decl @parse_tools(%schemas: buffer, %response: buffer) -> (buffer)
+func.decl @parse_tools(%schemas: buffer, %response: buffer, %truncated: i64) -> (buffer)
 
-func.def public @text_parse_tools(%schemas: buffer, %response: buffer) -> (buffer) {
-  %result_0 = func.call @parse_tools(%schemas, %response) : (buffer, buffer) -> (buffer)
+func.def public @text_parse_tools(%schemas: buffer, %response: buffer, %truncated: i64) -> (buffer) {
+  %result_0 = func.call @parse_tools(%schemas, %response, %truncated) : (buffer, buffer, i64) -> (buffer)
   func.return %result_0 : buffer
 }
 
-func.def public @text_parse_tools_v1(%schemas: buffer, %response: buffer) -> (buffer) {
-  %result_0 = func.call @parse_tools(%schemas, %response) : (buffer, buffer) -> (buffer)
+func.def public @text_parse_tools_v1(%schemas: buffer, %response: buffer, %truncated: i64) -> (buffer) {
+  %result_0 = func.call @parse_tools(%schemas, %response, %truncated) : (buffer, buffer, i64) -> (buffer)
   func.return %result_0 : buffer
 }
 

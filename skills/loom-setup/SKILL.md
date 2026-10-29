@@ -8,35 +8,36 @@ description: Install AMD Loom (hrx-loom wheel from ROCm/hrx-system CI) and the h
 Read the `loom` umbrella skill's hard rules first (memory limits, `--memory_bytes`,
 binary approval).
 
-## 1. Install (≈15 s with a warm pip cache, a few minutes cold)
+## 1. Install (≈30 s with a warm pip cache, a few minutes cold)
 
 ```bash
-bash ${CLAUDE_SKILL_DIR}/scripts/install_loom.sh ~/loom            # wheel pinned by the library (sha256-checked)
-bash ${CLAUDE_SKILL_DIR}/scripts/install_loom.sh ~/loom latest     # or newest main CI build
+bash ${CLAUDE_SKILL_DIR}/scripts/install_loom.sh ~/loom            # hrx-loom 0.1.0 from PyPI (what the port templates target)
+bash ${CLAUDE_SKILL_DIR}/scripts/install_loom.sh ~/loom latest     # newest PyPI release
+bash ${CLAUDE_SKILL_DIR}/scripts/install_loom.sh ~/loom ci-latest  # newest main CI wheel (needs gh)
 ```
 The script:
-- clones `ROCm/hrx-loom-library` to `~/loom/library`;
-- downloads the `loom-sdk-wheel-linux-Release` CI artifact with `gh api .../artifacts/<id>/zip`
-  (`gh run download` fails with a path-traversal error on these zips);
-- creates `~/loom/.venv` with `pip install 'hrx_loom-…whl[hf]'`, which provides loom-serve,
-  loom-fetch, loom-test, loom-run, loom-compile, loom-benchmark, loom-opt, loom-format, etc.;
-- creates `~/loom/.tools`, a venv with gguf, numpy, tokenizers, requests, fastapi, uvicorn
-  and httpx for the port, benchmark and UI scripts.
+- creates `~/loom/.venv` with `pip install 'hrx-loom[hf]==0.1.0'`, which provides loom-serve,
+  loom-fetch, loom-test, loom-run, loom-compile, loom-benchmark, loom-opt, loom-format, etc.
+  (Linux x86-64 glibc ≥ 2.39 and Windows 11 x86-64 wheels; no ROCm SDK needed);
+- clones `ROCm/hrx-loom-library` to `~/loom/library` and checks out the **catalog revision the
+  SDK names** in `hrx_loom-*.dist-info/loom.json`, so catalog cards and SDK agree;
+- creates `~/loom/.tools`, a venv with gguf, numpy, tokenizers, requests, jinja2, fastapi,
+  uvicorn and httpx for the port, benchmark and UI scripts.
 
 Facts:
-- **Windows:** run the script from Git Bash. It installs the `loom-sdk-wheel-windows`
-  artifact; there is no pinned Windows wheel, so `pinned` falls back to `latest`.
-  Venvs use `Scripts/`. See the `loom` skill's Windows section.
-- There is no PyPI release. CI artifacts expire after about 90 days. If the pinned one is
-  gone, use `latest` and note which commit you got (`gh api repos/ROCm/hrx-system/actions/artifacts/<id>`).
-- You need `gh auth status` to be logged in. `python3 -m venv` needs Python ≥ 3.12.
-- The library pins its SDK in `library/build_tools/ci/sdk.json` (revision, run_id,
-  artifact_id, sha256). A wheel newer than the pin usually works; an older one may
-  not compile newer library programs.
-- **NPU:** the Qwen3-Embedding NPU program compiled only with the wheel from
-  hrx-system PR 2259's CI (artifact 12623044407 at the time). Install it separately:
-  `VENV_NAME=.venv-npu install_loom.sh ~/loom 12623044407`. If that artifact has
-  expired, look for a newer PR/main build whose NPU path compiles.
+- **Pin the version.** The `loom-port-llm` templates target the 0.1.0 text ABI (`text_*_v1`
+  exports). A newer release can change it; then registration fails with a "root symbol … was
+  not found" error and the templates need the diff of the upstream tiny-text fixture between
+  the two tags (see `loom-port-llm`).
+- `loom-fetch --list` shows the release's compatible catalog.
+- **Windows:** run the script from Git Bash; venvs use `Scripts/`. See the `loom` skill's
+  Windows section.
+- `ci-latest` / `ci:ARTIFACT_ID` install development wheels from ROCm/hrx-system GitHub
+  Actions artifacts (needs `gh auth status`; artifacts expire after about 90 days; `gh run
+  download` fails on these zips, so the script uses `gh api .../artifacts/<id>/zip`).
+- **NPU:** the Qwen3-Embedding NPU program compiled only with the wheel from hrx-system PR
+  2259's CI (artifact 12623044407 at the time): `VENV_NAME=.venv-npu install_loom.sh ~/loom
+  ci:12623044407`. If that artifact has expired, look for a newer build whose NPU path compiles.
 
 ## 2. Fetch a catalog model
 
@@ -79,7 +80,7 @@ $S/stop.sh asr
 ```
 `serve.sh` waits until `/v1/status` reports every model `registration: ready` and
 checks that its PID owns the port. If it reports `failed`, it prints the compile
-diagnostics. Logs, PIDs and ports go in `~/.cache/loom-serve/NAME.{log,pid,port}`.
+diagnostics and stops the server. Logs, PIDs and ports go in `~/.cache/loom-serve/NAME.{log,pid,port}`.
 Use unique NAMEs. `stop.sh` refuses to kill a PID that is not a loom-serve.
 
 Raw form: `loom-serve --device=amdgpu --listen=127.0.0.1:PORT --model=pkg/model.json

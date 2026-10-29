@@ -5,7 +5,7 @@ description: Entry point for AMD Loom work (hrx-loom SDK, loom-serve, loom-fetch
 
 # Loom (umbrella)
 
-Loom = AMD's JIT compiler + runtime + model server (`hrx-loom` wheel; source at
+Loom = AMD's JIT compiler + runtime + model server (`hrx-loom` on PyPI, 0.1.0 pinned by these skills; source at
 github.com/ROCm/hrx-system, models at github.com/ROCm/hrx-loom-library). Models
 ship as **Loom IR source** (`.loom` kernels + command/control programs) plus a
 package card (`model.json`) that points at unmodified checkpoints (GGUF or
@@ -35,10 +35,9 @@ Windows 11 on Strix Halo. Run the scripts from **Git Bash**. Differences:
 - Venv executables are in `Scripts/`, not `bin/`. Read every `~/loom/.venv/bin/X`
   and `~/loom/.tools/bin/python` in these skills as `~/loom/.venv/Scripts/X` and
   `~/loom/.tools/Scripts/python`. The scripts detect this themselves.
-- The SDK is the `loom-sdk-wheel-windows` artifact, which only `Loom / SDK`
-  (`build_loom_sdk.yml`) runs and release tags produce. The library pins a Linux
-  wheel only, so `install_loom.sh` takes the latest Windows wheel. `--device=amdgpu`
-  reports `driver: amd, backend: libamdf` in `/v1/status`.
+- The SDK is the same PyPI release (`hrx_loom-0.1.0-py3-none-win_amd64.whl`); it needs the
+  Microsoft Visual C++ v14 x64 redistributable. `--device=amdgpu` reports `driver: amd,
+  backend: libamdf` in `/v1/status`.
 - Python: `install_loom.sh` uses `py -3` (override with `PYTHON=`). On Python < 3.15,
   text files default to cp1252, so open text files with `encoding="utf-8"`.
 - `ss`, `pgrep` and `/sys` don't exist. Use these instead:
@@ -78,8 +77,8 @@ Report met or short for each metric, with the approach curve.
 "Get X working, optimize it and report" is a single job. Run the whole pipeline
 without stopping:
 1. reuse the install;
-2. port;
-3. pass the gates;
+2. port (native context, tools: see `loom-port-llm`);
+3. pass the gates: kernel tests, golden, `agent_golden.py` (tool loop) and `needle.py` (full context);
 4. measure the llama.cpp baseline;
 5. run `loom-roofline` to set targets and a budget. This is **not optional**: the
    report must contain the roofline table (`bench/roofline.json`) and the approach
@@ -113,7 +112,7 @@ Read it from there if it isn't in your skill list.
   workspace). Too small → HTTP 503 "retained state leaves insufficient completion
   capacity". Several models can share one budget with `--parameter_idle_ms=60000`.
 - **Freshly downloaded binaries need explicit user approval before running**
-  (e.g. llama.cpp release zips). The Loom wheel is installed via pip.
+  (e.g. llama.cpp release zips). Loom itself is installed from PyPI with pip.
 - Gated Hugging Face models: give the user the exact model page URL so they can
   accept the license; don't try to work around the gate.
 - Every chat/completions POST needs `Content-Type: application/json`. (Python

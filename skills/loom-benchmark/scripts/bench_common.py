@@ -7,12 +7,16 @@ token ids) and Loom (fed chat messages) see byte-identical prompts.
 """
 import json
 import os
+import sys
 import time
 
 import requests
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(os.path.dirname(HERE), "data")
+# chat_probe.simulate() is the Python model of the starter's control.loom rendering.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(HERE)), "loom-port-llm", "starter"))
+import chat_probe  # noqa: E402
 
 PROMPTS = [
     "What is the capital of France? Answer in one word.",
@@ -54,26 +58,33 @@ class Package:
 
     def render(self, user):
         """Exactly what control.loom renders for one user message + generation prompt."""
-        c = self.chat
-        bos = self.tok.id_to_token(self.cfg["bos_id"]) if self.cfg.get("bos_id") is not None else ""
-        return bos + c.get("default_system", "") + c["user_prefix"] + user + c["suffix"] + c["generation_prompt"]
+        return self.render_messages([{"role": "user", "content": user}])
+
+    def render_messages(self, messages, tools=None, enable_thinking=None):
+        """control.loom's rendering of a conversation (chat_begin + messages + chat_end)."""
+        return chat_probe.simulate(self.chat, messages, tools, gen=True, enable_thinking=enable_thinking)
 
     def ids(self, text):
         return self.tok.encode(text, add_special_tokens=False).ids
 
-    def raw_from_chat(self, message, finished):
+    def raw_from_chat(self, message, finished, thinking=None):
         """Rebuild the model's raw output text from Loom's parsed channels so it can be
-        re-tokenized and compared token-by-token with the golden ids."""
+        re-tokenized and compared token-by-token with the golden ids. `thinking` is the
+        request's thinking selection (default: the template default)."""
         c = self.chat
+        on = c.get("thinking_default", c.get("starts_in_reasoning")) if thinking is None else thinking
         reasoning = message.get("reasoning_content")
         content = message.get("content") or ""
-        if not c.get("starts_in_reasoning"):
-            return content
+        calls = "".join((c["call_separator"] if i else "") + chat_probe.render_call(c, t["function"])
+                        for i, t in enumerate(message.get("tool_calls") or []))
+        answer = content + (c["content_call_separator"] if content and calls else "") + calls
+        if not (c.get("starts_in_reasoning") and on):
+            return answer
         end = c.get("think_end", "</think>")
         after = c["think_close"].split(end, 1)[1] if end in c["think_close"] else ""
         text = reasoning or ""
-        if content or finished:
-            text += end + after + content
+        if answer or finished:
+            text += end + after + answer
         return text
 
 

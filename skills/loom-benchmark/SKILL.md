@@ -1,6 +1,6 @@
 ---
 name: loom-benchmark
-description: Correctness and performance methodology for Loom models vs llama.cpp ROCm — golden token-by-token comparison with log-prob near-tie analysis, batching consistency, decode/prefill/long-context/concurrency throughput on real-text workloads, and how to report results honestly (tables, executive artifact). Use for "benchmark", "compare with llama.cpp", "is the port correct", "performance report".
+description: Correctness and performance methodology for Loom models vs llama.cpp ROCm — golden token-by-token comparison with log-prob near-tie analysis, a multi-turn tool-calling (agent) gate, a full-context needle gate, batching consistency, decode/prefill/long-context/concurrency throughput on real-text workloads, and how to report results honestly (tables, executive artifact). Use for "benchmark", "compare with llama.cpp", "is the port correct", "performance report".
 ---
 
 # Benchmark and verify Loom models
@@ -54,7 +54,11 @@ $T $S/golden.py $P golden.json --llama http://127.0.0.1:8130 --long 1000,2000,16
 $T $S/golden.py $P golden2.json --llama http://127.0.0.1:8130 --long 1000,2000,16000,32000   # 2nd recording: llama.cpp is not run-to-run deterministic
 $T $S/compare.py $P golden.json --alt golden2.json --url http://127.0.0.1:8160   # -> per-prompt lines + {"verdict": "PASS"|"FAIL", ...}
 $T $S/consistency.py http://127.0.0.1:8160 --model <model id>         # concurrent == sequential
+$T $S/agent_golden.py $P http://127.0.0.1:8160 --llama http://127.0.0.1:8130   # tool loop: rendering, reuse, calls, golden per turn
+$T $S/needle.py $P http://127.0.0.1:8160 --llama http://127.0.0.1:8130         # retrieval at 25-100% of context_capacity + over-limit 400
 ```
+For `needle.py` sizes above the llama.cpp slot's context, drop `--llama` (Loom-only:
+it then must find the needle) or give `--sizes`. A 262k-token prefill takes minutes.
 - **How golden.py works.** It renders each prompt with the package's chat block
   and sends the *token ids* to llama.cpp `/completion` (greedy, `n_probs: 5`). Both
   engines therefore see identical prompts: 20 short prompts × 96 tokens, plus 2
@@ -96,6 +100,27 @@ $T $S/consistency.py http://127.0.0.1:8160 --model <model id>         # concurre
   Anything else is a bug.
 - 503 errors on long prompts mean `--memory_bytes` is too small for the KV pool,
   not a model bug.
+- **agent_golden.py** runs three tool-using tasks (weather lookups, a calculator)
+  with deterministic tool results, greedy, and checks every assistant turn:
+  - `render_ok`: Loom's `/v1/chat/completions/input_tokens` equals the token count
+    of the template-exact rendering (`chat_probe.simulate`, verified against the
+    Jinja template). A mismatch is a control-program bug.
+  - `reuse_ok`: inside a tool loop, `cached_tokens` covers ≥ 80 % of the previous
+    prompt + completion (history reuse works, including recurrent state).
+  - `calls_ok`: tool calls name a declared function with JSON arguments.
+  - golden: Loom's turn vs llama.cpp `/completion` on the same prompt ids; a
+    divergence must be a near-tie (gap < 0.5).
+  "The model ended inside its reasoning" notes are a greedy-decoding behavior of
+  small thinking models, confirmed when llama.cpp's own distribution at that
+  point prefers EOS; not a Loom bug by itself.
+- **needle.py** hides an access code in a real-text haystack at 25/50/75/100 % of
+  the package's `context_capacity` and asks for it (thinking off when the template
+  allows), then sends a prompt over the capacity (must be a clean HTTP 400, server
+  still healthy). A size passes when Loom finds the needle, or with `--llama` at
+  least as often as llama.cpp on the same ids: small models miss needles on their
+  own. Divergences from llama.cpp grow slowly with length (gaps 0.4–0.7 nats at
+  30–40k on Qwen3-0.6B, exact matches in between); a step at a power of two (32768,
+  65536) would be a bug.
 
 ## 2. Performance
 
