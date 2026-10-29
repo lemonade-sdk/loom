@@ -22,6 +22,33 @@ library examples live in `hrx-loom-library/program/text/qwen3_8/`.
     this value, and the chunk equals prefill_capacity;
   - `max_tokens`: default completion length.
 
+## hrx-loom 0.1.0 (PyPI) text ABI
+
+The service calls `text_*_v1` exports (service.loom maps them to the control
+functions). New in 0.1.0 versus the earlier CI wheels:
+- `chat_reasoning() -> (supported, efforts bitmap, default effort)`: efforts none=0 …
+  high=4; a toggleable thinking model advertises none|high (bitmap 17).
+- `chat_message` takes a `frames` buffer after `parts` and returns a 4th result (the
+  image projection count; 0 for text).
+- `parse_tools(schemas, response, truncated)` and `tools.parse_xml(schemas, text,
+  truncated)` take `truncated` (1 when generation hit `max_tokens`). Records are
+  `[{"type":"function","function":{"name":…,"arguments":"<JSON string>"}}]`.
+- Model ids must be visible ASCII without spaces (`--model-id`).
+- `check.expect.close` for floats is now `check.expect.approximate … : T, T`.
+
+## Recurrent state (hybrid models)
+
+`storage.loom`'s geometry record declares recurrent **slots** in the arena: words
+4–7 are origin, stride, length (bytes per slot) and capacity. The runtime assigns
+each resident row a reader slot and a writer slot and records them, with the fork
+position, in the row's origins entry (`encode_state`): words 0 (reader byte offset),
+1 (writer byte offset) and 3 (fork position). A span that starts at the fork
+position continues the reader's state (e.g. a reused prefix or a retained agent
+turn); any later span continues the row's own writer; a span at position 0 starts
+from zeros. Every span publishes its final state to the writer. Prefix reuse for
+hybrids happens only at retained frontiers (the end of a previous turn), which is
+exactly what agent loops need. `gen_gdn.py` implements this protocol.
+
 ## Lifecycle
 
 1. **prepare** (`@prepare`) runs once at load. It receives the packing shapes,

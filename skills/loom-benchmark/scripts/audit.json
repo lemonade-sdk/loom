@@ -1,0 +1,30 @@
+{
+ "checks": [
+  {
+   "check": "baseline: picker ran",
+   "result": "FAIL",
+   "detail": "llamacpp_pick.json missing: run pick_llamacpp.sh MODEL.gguf from bench/"
+  },
+  {
+   "check": "roofline: ran with a baseline",
+   "result": "FAIL",
+   "detail": "roofline.json missing or without --baseline: run loom-roofline"
+  },
+  {
+   "check": "tracking: progress logged",
+   "result": "FAIL",
+   "detail": "0 decode_tps rows in targets.jsonl; perf.py logs them once roofline.json exists"
+  },
+  {
+   "check": "gates: compare PASS",
+   "result": "FAIL",
+   "detail": "latest compare: None"
+  },
+  {
+   "check": "gates: consistency",
+   "result": "FAIL",
+   "detail": "latest consistency: FAIL (a near-tie with a known cause needs consistency_note.md)"
+  }
+ ],
+ "headline": []
+}

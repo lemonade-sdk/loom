@@ -1,6 +1,6 @@
 ---
 name: loom-benchmark
-description: Correctness and performance methodology for Loom models vs llama.cpp ROCm — golden token-by-token comparison with log-prob near-tie analysis, batching consistency, decode/prefill/long-context/concurrency throughput on real-text workloads, and how to report results honestly (tables, executive artifact). Use for "benchmark", "compare with llama.cpp", "is the port correct", "performance report".
+description: Correctness and performance methodology for Loom models vs llama.cpp ROCm — golden token-by-token comparison with log-prob near-tie analysis, a multi-turn tool-calling (agent) gate, a full-context needle gate, batching consistency, decode/prefill/long-context/concurrency throughput on real-text workloads, and how to report results honestly (tables, executive artifact). Use for "benchmark", "compare with llama.cpp", "is the port correct", "performance report".
 ---
 
 # Benchmark and verify Loom models
@@ -41,12 +41,22 @@ Halo). Then:
 ```bash
 LLAMACPP_DIR=<dir> $S/llamacpp_server.sh MODEL.gguf 8130 1 34000   # goldens / long context (1 slot, 34k)
 LLAMACPP_DIR=<dir> $S/llamacpp_server.sh MODEL.gguf 8130 4 8192    # perf incl. 4 streams
-kill $(cat /tmp/llamacpp-8130.pid)
+kill $(cat ${LLAMACPP_STATE:-/tmp}/llamacpp-8130.pid)
 ```
 Always use the **same GGUF file** as the Loom package. Never run llama.cpp and a
 big Loom model at the same time if together they exceed GPU memory.
 
 ## 1. Correctness gates (before any performance claim)
+
+**One command:** `gates.sh PKG LOOM_URL GGUF BENCH_DIR [LLAMA_PORT]` (needs `LLAMACPP_DIR`)
+starts llama.cpp with one slot sized for the long goldens, runs everything below in
+order, stops llama.cpp and writes `BENCH_DIR/gates.json` (`verdict` PASS/FAIL per gate,
+logs in `gates_*.log`). Use the individual scripts to rerun or debug one gate.
+**Order:** `QUICK=1 gates.sh …` after the port and after each kept optimization (needle
+at half the context, one probe: ≈7–10 min), and the full `gates.sh` once on the final
+build. The full needle is a full-context prefill, the most expensive step (a 261k prompt
+took ~11 min on a busy GPU, ~40 min for the whole gate run); running it on the slowest
+(unoptimized) build twice wastes the most time.
 
 ```bash
 S=${CLAUDE_SKILL_DIR}/scripts; P=~/work/mymodel/pkg; T=~/loom/.tools/bin/python; mkdir -p ~/work/mymodel/bench && cd ~/work/mymodel/bench   # outputs land here, not in the skill
@@ -54,7 +64,12 @@ $T $S/golden.py $P golden.json --llama http://127.0.0.1:8130 --long 1000,2000,16
 $T $S/golden.py $P golden2.json --llama http://127.0.0.1:8130 --long 1000,2000,16000,32000   # 2nd recording: llama.cpp is not run-to-run deterministic
 $T $S/compare.py $P golden.json --alt golden2.json --url http://127.0.0.1:8160   # -> per-prompt lines + {"verdict": "PASS"|"FAIL", ...}
 $T $S/consistency.py http://127.0.0.1:8160 --model <model id>         # concurrent == sequential
+$T $S/agent_golden.py $P http://127.0.0.1:8160 --llama http://127.0.0.1:8130   # tool loop: rendering, reuse, calls, golden per turn
+$T $S/needle.py $P http://127.0.0.1:8160 --llama http://127.0.0.1:8130         # retrieval at 25-100% of context_capacity + over-limit 400
+$T $S/sampling_check.py $P http://127.0.0.1:8160 --llama http://127.0.0.1:8130 # temperature/top_k/top_p/seed semantics + first-token distribution
 ```
+For `needle.py` sizes above the llama.cpp slot's context, drop `--llama` (Loom-only:
+it then must find the needle) or give `--sizes`. A 262k-token prefill takes minutes.
 - **How golden.py works.** It renders each prompt with the package's chat block
   and sends the *token ids* to llama.cpp `/completion` (greedy, `n_probs: 5`). Both
   engines therefore see identical prompts: 20 short prompts × 96 tokens, plus 2
@@ -96,6 +111,32 @@ $T $S/consistency.py http://127.0.0.1:8160 --model <model id>         # concurre
   Anything else is a bug.
 - 503 errors on long prompts mean `--memory_bytes` is too small for the KV pool,
   not a model bug.
+- **agent_golden.py** runs three tool-using tasks (weather lookups, a calculator)
+  with deterministic tool results, greedy, and checks every assistant turn:
+  - `render_ok`: Loom's `/v1/chat/completions/input_tokens` equals the token count
+    of the template-exact rendering (`chat_probe.simulate`, verified against the
+    Jinja template). A mismatch is a control-program bug.
+  - `reuse_ok`: inside a tool loop, `cached_tokens` covers ≥ 80 % of the previous
+    prompt + completion (history reuse works, including recurrent state).
+  - `calls_ok`: tool calls name a declared function with JSON arguments.
+  - golden: Loom's turn vs llama.cpp `/completion` on the same prompt ids; a
+    divergence must be a near-tie (gap < 0.5).
+  "The model ended inside its reasoning" notes are a greedy-decoding behavior of
+  small thinking models, confirmed when llama.cpp's own distribution at that
+  point prefers EOS; not a Loom bug by itself.
+- **sampling_check.py**: temperature 0 and `top_k` 1 equal greedy, a fixed seed
+  reproduces, different seeds vary, and 200 temperature-1 draws of the first token
+  match llama.cpp's probabilities on the same ids (total-variation distance within
+  sampling noise; Qwen3-0.6B: 0.011).
+- **needle.py** hides access codes in a real-text haystack and asks for them (thinking off
+  when the template allows), then sends a prompt over the capacity (must be a clean HTTP
+  400, server still healthy). **Retrieval is not the gate**: a small model finds or misses a
+  needle on a near-tie first token (Qwen3.5-0.8B at 130k: llama.cpp's top two first tokens
+  0.013 nats apart), so a handful of probes says nothing statistically. Up to `--llama-max`
+  each probe is compared with llama.cpp on the same ids and passes when Loom found the
+  needle, llama.cpp missed it too, or the first divergence is a near-tie (gap ≤ 1 nat, in
+  the top-5: the compare.py rule). The full-context probe (Loom only; llama.cpp would take
+  many minutes) proves the size is served. Found counts are reported as information.
 
 ## 2. Performance
 

@@ -5,7 +5,7 @@ description: Entry point for AMD Loom work (hrx-loom SDK, loom-serve, loom-fetch
 
 # Loom (umbrella)
 
-Loom = AMD's JIT compiler + runtime + model server (`hrx-loom` wheel; source at
+Loom = AMD's JIT compiler + runtime + model server (`hrx-loom` on PyPI, 0.1.0 pinned by these skills; source at
 github.com/ROCm/hrx-system, models at github.com/ROCm/hrx-loom-library). Models
 ship as **Loom IR source** (`.loom` kernels + command/control programs) plus a
 package card (`model.json`) that points at unmodified checkpoints (GGUF or
@@ -25,8 +25,12 @@ and exposes OpenAI-style HTTP endpoints.
 
 All paths in these skills assume the install root `~/loom` (SDK venv `~/loom/.venv`,
 tools venv `~/loom/.tools`). Substitute your own root consistently. The scripts take overrides:
-`VENV=` (serve.sh, run_kernel_tests.sh), `UI_VENV=` or the 2nd argument (start_ui.sh),
-and `LOOM_SERVE_STATE=` (the serve.sh PID/log dir).
+`LOOM_ROOT=` (install root for port.sh, gates.sh, pick_llamacpp.sh), `VENV=` (serve.sh,
+run_kernel_tests.sh), `PY=` (pick_llamacpp.sh's python), `UI_VENV=` or the 2nd argument
+(start_ui.sh), `LOOM_SERVE_STATE=` (serve.sh PID/log dir) and `LLAMACPP_STATE=`
+(llamacpp_server.sh PID/log dir). On a shared machine set the state dirs inside your work
+dir and give `pick_llamacpp.sh` a SEARCH_ROOT (3rd argument) so it only sees builds the
+user approved.
 
 ## Windows
 
@@ -35,10 +39,9 @@ Windows 11 on Strix Halo. Run the scripts from **Git Bash**. Differences:
 - Venv executables are in `Scripts/`, not `bin/`. Read every `~/loom/.venv/bin/X`
   and `~/loom/.tools/bin/python` in these skills as `~/loom/.venv/Scripts/X` and
   `~/loom/.tools/Scripts/python`. The scripts detect this themselves.
-- The SDK is the `loom-sdk-wheel-windows` artifact, which only `Loom / SDK`
-  (`build_loom_sdk.yml`) runs and release tags produce. The library pins a Linux
-  wheel only, so `install_loom.sh` takes the latest Windows wheel. `--device=amdgpu`
-  reports `driver: amd, backend: libamdf` in `/v1/status`.
+- The SDK is the same PyPI release (`hrx_loom-0.1.0-py3-none-win_amd64.whl`); it needs the
+  Microsoft Visual C++ v14 x64 redistributable. `--device=amdgpu` reports `driver: amd,
+  backend: libamdf` in `/v1/status`.
 - Python: `install_loom.sh` uses `py -3` (override with `PYTHON=`). On Python < 3.15,
   text files default to cp1252, so open text files with `encoding="utf-8"`.
 - `ss`, `pgrep` and `/sys` don't exist. Use these instead:
@@ -78,8 +81,10 @@ Report met or short for each metric, with the approach curve.
 "Get X working, optimize it and report" is a single job. Run the whole pipeline
 without stopping:
 1. reuse the install;
-2. port;
-3. pass the gates;
+2. port: `loom-port-llm/port.sh REPO WORKDIR` (native context, tools, kernel tests,
+   smoke test; ≈40 s for a small model). Hand-work only where it stops;
+3. pass the gates: `loom-benchmark/scripts/gates.sh` (golden ×2 + compare,
+   consistency, tool-calling agent loop, sampling, full-context needle) → `bench/gates.json`;
 4. measure the llama.cpp baseline;
 5. run `loom-roofline` to set targets and a budget. This is **not optional**: the
    report must contain the roofline table (`bench/roofline.json`) and the approach
@@ -113,13 +118,17 @@ Read it from there if it isn't in your skill list.
   workspace). Too small → HTTP 503 "retained state leaves insufficient completion
   capacity". Several models can share one budget with `--parameter_idle_ms=60000`.
 - **Freshly downloaded binaries need explicit user approval before running**
-  (e.g. llama.cpp release zips). The Loom wheel is installed via pip.
+  (e.g. llama.cpp release zips). Loom itself is installed from PyPI with pip.
 - Gated Hugging Face models: give the user the exact model page URL so they can
   accept the license; don't try to work around the gate.
 - Every chat/completions POST needs `Content-Type: application/json`. (Python
   `requests` with an empty `Expect:` header breaks the connection.)
 - The first request after startup triggers lazy weight loading (seconds to a
   minute); don't time it.
+- **GPU queues run out before memory does.** Each loom-serve, loom-test and
+  llama-server process takes GPU user queues; with about six alive (other users'
+  jobs count) a new one fails with `RESOURCE_EXHAUSTED ... user_queue_create(SDMA)`.
+  Stop servers you no longer need before kernel tests or a new server.
 - Stop servers by PID file (`loom-setup/scripts/stop.sh`). `pkill -f "...port..."`
   can match and kill your own shell.
 - After a rebuild, make sure the old server is really gone. `serve.sh` refuses a

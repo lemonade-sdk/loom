@@ -17,6 +17,7 @@ FMT = {
     "q4_1": dict(block_bytes=20, block_values=32),
     "q8_0": dict(block_bytes=34, block_values=32),
     "q4_k": dict(block_bytes=144, block_values=256),
+    "q5_k": dict(block_bytes=176, block_values=256),
     "q6_k": dict(block_bytes=210, block_values=256),
 }
 
@@ -138,6 +139,58 @@ def dequant16(fmt, w, view_name, out):
       %{out}_scales = vector.splat %{out}_scale : vector<16xf32>
       %{out}_scaled = vector.mulf %{out}_centered, %{out}_scales : vector<16xf32>
       %{out} = vector.fptrunc %{out}_scaled : vector<16xf32> to vector<16xf16>'''
+    if fmt == "q5_k":
+        # Q5_K: 176-byte superblocks = Q4_K's 16-byte header (d, dmin, 6-bit scales/mins),
+        # qh[32] (bit g of qh[l] is value l of group g's fifth bit), then qs[128] as in Q4_K.
+        return f'''
+      %{out}_super = index.div %w_col, %c256 : index
+      %{out}_within = index.rem %w_col, %c256 : index
+      %{out}_group_value = index.div %{out}_within, %c32 : index
+      %{out}_group = index.assume %{out}_group_value [range(%{out}_group_value, 0, 7)] : index
+      %{out}_in_group = index.rem %{out}_within, %c32 : index
+      %{out}_half = index.div %{out}_in_group, %c16 : index
+      %{out}_block_add = index.scale %{out}_super, %block_bytes : index, offset -> offset
+      %{out}_block_origin = index.add %w_row_origin, %{out}_block_add : offset
+      %{out}_header_view = buffer.view %{w}[%{out}_block_origin] : buffer -> view<4xi32>
+      %{out}_header = vector.load %{out}_header_view[0] : view<4xi32> -> vector<4xi32>
+      %{out}_scale, %{out}_minimum = func.call {META}(%{out}_header, %{out}_group) : (vector<4xi32>, index) -> (f32, f32)
+      %{out}_page = index.div %{out}_group, %c2 : index
+      %{out}_nibble = index.rem %{out}_group, %c2 : index
+      %{out}_word_page = index.mul %{out}_page, %c8 : index
+      %{out}_word_half = index.mul %{out}_half, %c4 : index
+      %{out}_word = index.add %{out}_word_page, %{out}_word_half : index
+      %{out}_qs_bytes = index.constant 48 : offset
+      %{out}_payload = index.add %{out}_block_origin, %{out}_qs_bytes : offset
+      %{out}_words = buffer.view %{w}[%{out}_payload] : buffer -> view<32xi32>
+      %{out}_packed = vector.load %{out}_words[%{out}_word] : view<32xi32> -> vector<4xi32>
+      %{out}_shift_bits = index.mul %{out}_nibble, %c4 : index
+      %{out}_shift_i32 = index.cast %{out}_shift_bits : index to i32
+      %{out}_shift = vector.splat %{out}_shift_i32 : vector<4xi32>
+      %{out}_shifted = vector.shrui %{out}_packed, %{out}_shift : vector<4xi32>
+      %{out}_masked = vector.andi %{out}_shifted, %nibble_mask : vector<4xi32>
+      %{out}_low = vector.bitcast %{out}_masked : vector<4xi32> to vector<16xi8>
+      %{out}_qh_half = index.mul %{out}_half, %c16 : index
+      %{out}_qh_half_bytes = index.cast %{out}_qh_half : index to offset
+      %{out}_qh_origin = index.add %{out}_block_origin, %sixteen : offset
+      %{out}_qh_at = index.add %{out}_qh_origin, %{out}_qh_half_bytes : offset
+      %{out}_qh_view = buffer.view %{w}[%{out}_qh_at] : buffer -> view<16xi8>
+      %{out}_qh = vector.load %{out}_qh_view[0] : view<16xi8> -> vector<16xi8>
+      %{out}_g32 = index.cast %{out}_group : index to i32
+      %{out}_g8 = scalar.trunci %{out}_g32 : i32 to i8
+      %{out}_gv = vector.splat %{out}_g8 : vector<16xi8>
+      %{out}_one = vector.constant 1 : vector<16xi8>
+      %{out}_four = vector.constant 4 : vector<16xi8>
+      %{out}_hb_s = vector.shrui %{out}_qh, %{out}_gv : vector<16xi8>
+      %{out}_hb = vector.andi %{out}_hb_s, %{out}_one : vector<16xi8>
+      %{out}_hi = vector.shli %{out}_hb, %{out}_four : vector<16xi8>
+      %{out}_bytes = vector.ori %{out}_low, %{out}_hi : vector<16xi8>
+      %{out}_codes = vector.uitofp %{out}_bytes : vector<16xi8> to vector<16xf16>
+      %{out}_scale_h = scalar.fptrunc %{out}_scale : f32 to f16
+      %{out}_neg_min = scalar.negf %{out}_minimum : f32
+      %{out}_neg_min_h = scalar.fptrunc %{out}_neg_min : f32 to f16
+      %{out}_scales = vector.splat %{out}_scale_h : vector<16xf16>
+      %{out}_minima = vector.splat %{out}_neg_min_h : vector<16xf16>
+      %{out} = vector.fmaf %{out}_codes, %{out}_scales, %{out}_minima : vector<16xf16>'''
     # Q4_K: 256-value superblocks of 144 bytes; 8 groups of 32 with 6-bit scale/min.
     return f'''
       %{out}_super = index.div %w_col, %c256 : index
@@ -181,7 +234,7 @@ def gemm(fmt, mode):
     wargs = "%w: buffer, %w2: buffer" if two_w else "%w: buffer"
     accs = ["g0", "g1", "u0", "u1"] if two_w else ["a0", "a1"]
     stages = ["w_stage", "w2_stage"] if two_w else ["w_stage"]
-    k_min = 256 if fmt in ("q4_k", "q6_k") else 64
+    k_min = 256 if fmt in ("q4_k", "q5_k", "q6_k") else 64
     lines = []
     lines.append(f'''kernel.def export("{name}") @{name}(%rows: index, %n: index) {{
   %c1 = index.constant 1 : index
@@ -339,7 +392,7 @@ def gemm_big(fmt, mode, tn=None, suffix=""):
     cfr = wave_cols // 16
     name = f"{PREFIX}_gemm_{fmt}_{mode}_m128" + suffix
     weights = ["w", "w2"] if two_w else ["w"]
-    k_min = 256 if fmt in ("q4_k", "q6_k") else 64
+    k_min = 256 if fmt in ("q4_k", "q5_k", "q6_k") else 64
     L = []
     L.append(f'''kernel.def export("{name}") @{name}(%rows: index, %n: index) {{
   %c1 = index.constant 1 : index

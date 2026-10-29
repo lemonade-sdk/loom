@@ -8,7 +8,8 @@
 set -u
 gguf=$1; port=${2:-8139}; root=${3:-$HOME}
 here=$(cd "$(dirname "$0")" && pwd)
-py=${PY:-$HOME/loom/.tools/bin/python}; [ -x "$py" ] || py=$HOME/loom/.tools/Scripts/python   # Windows venvs use Scripts/
+root_loom=${LOOM_ROOT:-$HOME/loom}
+py=${PY:-$root_loom/.tools/bin/python}; [ -x "$py" ] || py=$root_loom/.tools/Scripts/python   # Windows venvs use Scripts/
 doc=$here/../data/doc_1000.txt
 # HIP builds: libggml-hip.so (Linux) or ggml-hip.dll (Windows) next to llama-server[.exe].
 mapfile -t dirs < <(find "$root" -maxdepth 7 \( -name llama-server -o -name llama-server.exe \) -type f 2>/dev/null \
@@ -32,7 +33,7 @@ p = requests.post(u, json={"prompt": "nonce 7\n" + doc + "\nSummarize.", "n_pred
 print(f"{d['predicted_per_second']:.1f} {p['prompt_per_second']:.0f}")
 E
 )
-  kill "$(cat /tmp/llamacpp-$port.pid)" 2>/dev/null; sleep 2
+  kill "$(cat ${LLAMACPP_STATE:-/tmp}/llamacpp-$port.pid)" 2>/dev/null; sleep 2
   echo "  decode ${line% *} tok/s  prefill-1k ${line#* } tok/s  $d"
   res+=("$line $d")
 done

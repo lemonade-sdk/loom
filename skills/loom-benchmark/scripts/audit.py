@@ -48,6 +48,8 @@ if pick and pick.get("ranked") and roof:
     # chat vs raw /completion and different prompts: allow 8 % on decode, 25 % on prefill
     ok = (base is not None and base >= top["decode_tps"] * 0.92
           and (pbase is None or pbase >= top["prefill_1k_tps"] * 0.75))
+    # With a single candidate build the baseline is that build: a lower number is load noise.
+    ok = ok or len(pick["ranked"]) == 1
     check("baseline: fastest build used", ok,
           f"roofline baseline decode {base} / prefill-1k {pbase} vs fastest build "
           f"{top['decode_tps']} / {top['prefill_1k_tps']} ({top['dir']}): re-measure with that build")

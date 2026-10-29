@@ -23,7 +23,9 @@ echo $! > $state/$name.pid; echo $port > $state/$name.port; start=$(date +%s)
 while kill -0 $(cat $state/$name.pid) 2>/dev/null; do
   st=$(curl -s -m 2 http://127.0.0.1:$port/v1/status | "$py" -c 'import sys,json; d=json.load(sys.stdin)["data"]; print(",".join(x["loom"]["registration"] for x in d) if d else "none")' 2>/dev/null)
   case "$st" in
-    *failed*) echo "FAILED $name"; curl -s http://127.0.0.1:$port/v1/status | "$py" -c 'import sys,json; [print(x["id"], json.dumps(x["loom"].get("error") or x["loom"].get("compilation",{}).get("diagnostics"))[:3000]) for x in json.load(sys.stdin)["data"]]'; exit 2;;
+    *failed*) echo "FAILED $name"; curl -s http://127.0.0.1:$port/v1/status | "$py" -c 'import sys,json; [print(x["id"], json.dumps(x["loom"].get("error") or x["loom"].get("compilation",{}).get("diagnostics"))[:3000]) for x in json.load(sys.stdin)["data"]]'
+      # A failed registration keeps the process (and the port); stop it so a rebuild can retry.
+      kill $(cat $state/$name.pid) 2>/dev/null; rm -f $state/$name.pid; exit 2;;
   esac
   if [ -n "$st" ] && [ "$st" != none ] && ! echo "$st" | tr ',' '\n' | grep -qv '^ready$'; then
     pid=$(cat $state/$name.pid)

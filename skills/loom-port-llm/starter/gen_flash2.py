@@ -12,25 +12,31 @@ staging lives in workgroup memory. The output is scaled by sigmoid(gate).
 Masks: causal, and on sliding layers keys > position - 2048.
 """
 import json
+import math
 import os
 T = os.environ.get("FLASH2_TARGET", "llm")
 if T == "llm":  # gen_llm.py: geometry from the LLM_CONFIG json (see inspect_gguf.py)
     _c = json.load(open(os.environ["LLM_CONFIG"]))
     CFG = dict(prefix="g", kvh=_c["kv_heads"], group=_c["heads"] // _c["kv_heads"], sinks=False,
-               window=_c.get("sliding_window") or 262144, kv_f32=False, gate=_c.get("attn_gate", False), layers=_c["layers"] - 1)
+               window=_c.get("sliding_window") or 262144, kv_f32=False, gate=_c.get("attn_gate", False), layers=_c["layers"] - 1,
+               dim=_c["head_dim"])
 else:
     CFG = {
         "glimmer": dict(prefix="g", kvh=2, group=16, sinks=False, window=2048, kv_f32=False, gate=True, layers=51),
         "flint": dict(prefix="flint", kvh=4, group=8, sinks=True, window=513, kv_f32=False, gate=False, layers=48),
     }[T]
 P, KVH, G = CFG["prefix"], CFG["kvh"], CFG["group"]
+D = CFG.get("dim", 128)          # head_dim: 128 or 256
+NF = D // 16                     # 16-dim MMA fragments per head
+DP8 = D + 8                      # padded K-tile row (f16 elements)
 QH = KVH * G
 LANES = 32 * G
-DPT = 128 * 32 // LANES          # staged dims per thread per key tile
-TPK = 128 // DPT                 # threads per key
+DPT = D * 32 // LANES            # staged dims per thread per key tile
+TPK = D // DPT                   # threads per key
+assert D in (128, 256) and DPT >= 1 and TPK * DPT == D
 KT = int(os.environ.get("FLASH2_KT", "32"))   # keys per tile
 KB = KT // 16
-VTC, KBYTES, VTBYTES, KT_LESS = KT + 8, KT * 136 * 2, 128 * (KT + 8) * 2, KT - 1
+VTC, KBYTES, VTBYTES, KT_LESS = KT + 8, KT * (D + 8) * 2, D * (KT + 8) * 2, KT - 1
 
 U = []
 A = U.append
@@ -104,25 +110,29 @@ A('''kernel.def export("{P}_attention_flash2") @{P}_attention_flash2(%tokens: in
   // K [32 keys x 128 dims] and V^T [128 dims x 32 keys] tiles (F16, padded rows).
   %k_bytes = index.constant {KBYTES} : offset
   %k_tile = buffer.alloca<workgroup> align(16) %k_bytes : buffer
-  %k_view = buffer.view %k_tile[%origin] : buffer -> view<{KT}x136xf16>
+  %k_view = buffer.view %k_tile[%origin] : buffer -> view<{KT}x{DP8}xf16>
   %vt_bytes = index.constant {VTBYTES} : offset
   %vt_tile = buffer.alloca<workgroup> align(16) %vt_bytes : buffer
-  %vt_view = buffer.view %vt_tile[%origin] : buffer -> view<128x{VTC}xf16>
+  %vt_view = buffer.view %vt_tile[%origin] : buffer -> view<{D}x{VTC}xf16>
 
   // Q^T as MMA rhs: lane column = token lane%16, 16 dims per fragment.
-  %q_view = buffer.view %q[%origin] : buffer -> view<[%tokens]x{QH}x8x16xf32>
+  %q_view = buffer.view %q[%origin] : buffer -> view<[%tokens]x{QH}x{NF}x16xf32>
   %q_token_value = index.add %first_token, %lane_col : index
   %q_token = index.assume %q_token_value [lt(%q_token_value, %tokens)] : index''')
-for c in range(8):
-    A(f'''  %qc{c} = index.constant {c} : index
-  %qraw{c} = vector.load %q_view[%q_token, %head, %qc{c}, %c0] : view<[%tokens]x{QH}x8x16xf32> -> vector<16xf32>
+# Q^T fragments: held in registers for D = 128; for D = 256 they would not fit next to the
+# 16 output accumulators (VGPR budget 256), so they are reloaded (L2-resident) per key tile.
+Q_IN_LOOP = D > 128
+QLOAD = "\n".join(f'''  %qc{c} = index.constant {c} : index
+  %qraw{c} = vector.load %q_view[%q_token, %head, %qc{c}, %c0] : view<[%tokens]x{QH}x{NF}x16xf32> -> vector<16xf32>
   %qh{c} = vector.fptrunc %qraw{c} : vector<16xf32> to vector<16xf16>
-  %qf{c} = vector.fragment<rhs> %qh{c} shape [%c16, %c16] : vector<16xf16>''')
+  %qf{c} = vector.fragment<rhs> %qh{c} shape [%c16, %c16] : vector<16xf16>''' for c in range(NF))
+if not Q_IN_LOOP:
+    A(QLOAD)
 A('''  %zero8 = vector.constant 0.0 : vector<8xf32>
   %init = vector.fragment<init> %zero8 shape [%c16, %c16] : vector<8xf32>
   %zero_f = scalar.constant 0.0 : f32
   %neg_big = scalar.constant -3.0e38 : f32
-  %scale = scalar.constant 0.08838834764831845 : f32
+  %scale = scalar.constant {SCALE} : f32
   %scale_v = vector.splat %scale : vector<8xf32>
   %neg_v = vector.splat %neg_big : vector<8xf32>
   %zero_v8 = vector.constant 0.0 : vector<8xf32>
@@ -150,22 +160,22 @@ A('''  %zero8 = vector.constant 0.0 : vector<8xf32>
   %st_key = index.assume %st_key_value [range(%st_key_value, 0, 31)] : index
   %st_seg = index.rem %workitem, %ctpk : index
   %st_dim_value = index.mul %st_seg, %cdpt : index
-  %st_dim = index.assume %st_dim_value [range(%st_dim_value, 0, {128 - DPT})] : index
+  %st_dim = index.assume %st_dim_value [range(%st_dim_value, 0, {D - DPT})] : index
   %kz = vector.constant 0.0 : vector<{DPT}xf16>
 ''')
-acc = ", ".join(f"%a{d} = %init : vector<8xf32>" for d in range(8))
+acc = ", ".join(f"%a{d} = %init : vector<8xf32>" for d in range(NF))
 if CFG["kv_f32"]:
-    KV_LOAD = f"""      %k_cache = buffer.view %arena[%k_offset] : buffer -> view<{KVH}x128xf32>
-      %v_cache = buffer.view %arena[%v_offset] : buffer -> view<{KVH}x128xf32>
-      %kf = vector.load %k_cache[%kv, %st_dim] : view<{KVH}x128xf32> -> vector<{DPT}xf32>
-      %vf = vector.load %v_cache[%kv, %st_dim] : view<{KVH}x128xf32> -> vector<{DPT}xf32>
+    KV_LOAD = f"""      %k_cache = buffer.view %arena[%k_offset] : buffer -> view<{KVH}x{D}xf32>
+      %v_cache = buffer.view %arena[%v_offset] : buffer -> view<{KVH}x{D}xf32>
+      %kf = vector.load %k_cache[%kv, %st_dim] : view<{KVH}x{D}xf32> -> vector<{DPT}xf32>
+      %vf = vector.load %v_cache[%kv, %st_dim] : view<{KVH}x{D}xf32> -> vector<{DPT}xf32>
       %kh = vector.fptrunc %kf : vector<{DPT}xf32> to vector<{DPT}xf16>
       %vh = vector.fptrunc %vf : vector<{DPT}xf32> to vector<{DPT}xf16>"""
 else:
-    KV_LOAD = f"""      %k_cache = buffer.view %arena[%k_offset] : buffer -> view<{KVH}x128xf16>
-      %v_cache = buffer.view %arena[%v_offset] : buffer -> view<{KVH}x128xf16>
-      %kh = vector.load %k_cache[%kv, %st_dim] : view<{KVH}x128xf16> -> vector<{DPT}xf16>
-      %vh = vector.load %v_cache[%kv, %st_dim] : view<{KVH}x128xf16> -> vector<{DPT}xf16>"""
+    KV_LOAD = f"""      %k_cache = buffer.view %arena[%k_offset] : buffer -> view<{KVH}x{D}xf16>
+      %v_cache = buffer.view %arena[%v_offset] : buffer -> view<{KVH}x{D}xf16>
+      %kh = vector.load %k_cache[%kv, %st_dim] : view<{KVH}x{D}xf16> -> vector<{DPT}xf16>
+      %vh = vector.load %v_cache[%kv, %st_dim] : view<{KVH}x{D}xf16> -> vector<{DPT}xf16>"""
 M_INIT, L_INIT = ("%sink", "%one_init") if CFG["sinks"] else ("%neg_big", "%zero_f")
 if CFG["sinks"]:
     A('''  %sinks_view = buffer.view %sinks[%origin] : buffer -> view<32xf32>
@@ -184,15 +194,15 @@ STAGE = f"""    %key_pos = index.add %tile_first, %st_key : index
     }} else {{
       scf.yield %kz, %kz : vector<{DPT}xf16>, vector<{DPT}xf16>
     }}
-    vector.store %kvals, %k_view[%st_key, %st_dim] : vector<{DPT}xf16>, view<{KT}x136xf16>
+    vector.store %kvals, %k_view[%st_key, %st_dim] : vector<{DPT}xf16>, view<{KT}x{DP8}xf16>
     scf.for %j = [%c0 to %cdpt step %c1] unroll {{
       %vj = vector.extract %vvals[%j] : vector<{DPT}xf16> -> f16
       %vt_row_value = index.add %st_dim, %j : index
-      %vt_row = index.assume %vt_row_value [range(%vt_row_value, 0, 127)] : index
-      view.store %vj, %vt_view[%vt_row, %st_key] : f16, view<128x{VTC}xf16>
+      %vt_row = index.assume %vt_row_value [range(%vt_row_value, 0, {D - 1})] : index
+      view.store %vj, %vt_view[%vt_row, %st_key] : f16, view<{D}x{VTC}xf16>
     }}
 """
-A(f'''  %m_final, %l_final, {", ".join(f"%o{d}" for d in range(8))} = scf.for %kt = [%c0 to %key_tiles step %c1](%m = {M_INIT} : f32, %l = {L_INIT} : f32, {acc}) -> (f32, f32, {", ".join(["vector<8xf32>"] * 8)}) {{
+A(f'''  %m_final, %l_final, {", ".join(f"%o{d}" for d in range(NF))} = scf.for %kt = [%c0 to %key_tiles step %c1](%m = {M_INIT} : f32, %l = {L_INIT} : f32, {acc}) -> (f32, f32, {", ".join(["vector<8xf32>"] * NF)}) {{
     %tile_first = index.madd %kt, %ckt, %key_low : index
 ''')
 for sp in range(KT // 32):
@@ -201,13 +211,15 @@ for sp in range(KT // 32):
 ''' + STAGE.replace("%st_key", f"%st_key{sp}").replace("%key_pos", f"%key_pos{sp}").replace("%key_valid", f"%key_valid{sp}").replace("%kvals", f"%kvals{sp}").replace("%vvals", f"%vvals{sp}").replace("%kp ", f"%kp{sp} ").replace("%kp,", f"%kp{sp},").replace("%k_offset", f"%k_offset{sp}").replace("%v_offset", f"%v_offset{sp}").replace("%k_cache", f"%k_cache{sp}").replace("%v_cache", f"%v_cache{sp}").replace("%kh", f"%kh{sp}").replace("%vh", f"%vh{sp}").replace("%kf", f"%kf{sp}").replace("%vf", f"%vf{sp}").replace("%vj", f"%vj{sp}").replace("%vt_row", f"%vt_row{sp}").replace("%j ", f"%j{sp} ").replace("%j]", f"%j{sp}]").replace("%j :", f"%j{sp} :"))
 A(f'''    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
     %tf32 = index.cast %tile_first : index to i32''')
+if Q_IN_LOOP:
+    A("\n".join("  " + line for line in QLOAD.split("\n")))
 for kb in range(KB):
     acc_name = "%init"
-    for c in range(8):
-        A(f'''    %kl{kb}_{c} = vector.fragment.load<lhs> %k_view[%kb{kb}_row, %d{c}] shape [%c16, %c16] : view<{KT}x136xf16> -> vector<16xf16>
+    for c in range(NF):
+        A(f'''    %kl{kb}_{c} = vector.fragment.load<lhs> %k_view[%kb{kb}_row, %d{c}] shape [%c16, %c16] : view<{KT}x{DP8}xf16> -> vector<16xf16>
     %s{kb}_{c} = vector.mma %kl{kb}_{c}, %qf{c}, {acc_name} : vector<16xf16>, vector<16xf16>, vector<8xf32>''')
         acc_name = f"%s{kb}_{c}"
-    A(f'''    %sc{kb} = vector.mulf %s{kb}_7, %scale_v : vector<8xf32>
+    A(f'''    %sc{kb} = vector.mulf %s{kb}_{NF - 1}, %scale_v : vector<8xf32>
     %base{kb} = scalar.addi %tf32, %kbo{kb} : i32
     %base{kb}_v = vector.splat %base{kb} : vector<8xi32>
     %kpos{kb} = vector.addi %base{kb}_v, %row_off : vector<8xi32>
@@ -245,48 +257,50 @@ A(LSUM + '''
     %l_scaled = scalar.mulf %l, %alpha : f32
     %l_new = scalar.addf %l_scaled, %tsum : f32
     %alpha_v = vector.splat %alpha : vector<8xf32>''')
-for d in range(8):
+for d in range(NF):
     A(f"    %os{d} = vector.mulf %a{d}, %alpha_v : vector<8xf32>")
     prev = f"%os{d}"
     for kb in range(KB):
         name = f"%on{d}" if kb == KB - 1 else f"%on{d}_{kb}"
-        A(f"""    %vl{d}_{kb} = vector.fragment.load<lhs> %vt_view[%d{d * 16 if d else 0}r, %kb{kb}_row] shape [%c16, %c16] : view<128x{{VTC}}xf16> -> vector<16xf16>
+        A(f"""    %vl{d}_{kb} = vector.fragment.load<lhs> %vt_view[%d{d * 16 if d else 0}r, %kb{kb}_row] shape [%c16, %c16] : view<{D}x{{VTC}}xf16> -> vector<16xf16>
     {name} = vector.mma %vl{d}_{kb}, %pt{kb}, {prev} : vector<16xf16>, vector<16xf16>, vector<8xf32>""")
         prev = name
 A('''    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
-    scf.yield %m_new, %l_new, ''' + ", ".join(f"%on{d}" for d in range(8)) + " : f32, f32, " + ", ".join(["vector<8xf32>"] * 8) + '''
+    scf.yield %m_new, %l_new, ''' + ", ".join(f"%on{d}" for d in range(NF)) + " : f32, f32, " + ", ".join(["vector<8xf32>"] * NF) + '''
   }
   // O^T / l (lane-uniform), gate, and store through a transposed strided view:
   // element (dim row, token column) -> out[first_token + col, head*128 + row].
   %one_f = scalar.constant 1.0 : f32
   %inv_l = scalar.divf %one_f, %l_final : f32
   %inv_v = vector.splat %inv_l : vector<8xf32>
-  %c4096 = index.constant {QH * 128} : index
+  %c4096 = index.constant {QH * D} : index
   %out_layout = encoding.layout.strided [%c1, %c4096] : encoding<layout>
   %out_first_a = index.mul %first_token, %c4096 : index
-  %head_col = index.mul %head, %c128 : index
+  %cdim = index.constant {D} : index
+  %head_col = index.mul %head, %cdim : index
   %out_first = index.add %out_first_a, %head_col : index
   %four = index.constant 4 : offset
   %out_offset = index.scale %out_first, %four : index, offset -> offset
-  %out_view = buffer.view %out[%out_offset] : buffer -> view<128x16xf32, %out_layout>''' + ("\n  %gate_view = buffer.view %gate[%out_offset] : buffer -> view<128x16xf32, %out_layout>" if CFG["gate"] else ""))
-for d in range(8):
+  %out_view = buffer.view %out[%out_offset] : buffer -> view<{D}x16xf32, %out_layout>''' + ("\n  %gate_view = buffer.view %gate[%out_offset] : buffer -> view<{D}x16xf32, %out_layout>" if CFG["gate"] else ""))
+for d in range(NF):
     r = f"%d{d * 16 if d else 0}r"
     gate_txt = f"""
-  %gf{d} = vector.fragment.load<result> %gate_view[{r}, %c0] shape [%c16, %c16] : view<128x16xf32, %out_layout> -> vector<8xf32>
+  %gf{d} = vector.fragment.load<result> %gate_view[{r}, %c0] shape [%c16, %c16] : view<{D}x16xf32, %out_layout> -> vector<8xf32>
   %gs{d} = vector.logisticf<afn> %gf{d} : vector<8xf32>
   %of{d} = vector.mulf %ou{d}, %gs{d} : vector<8xf32>""" if CFG["gate"] else f"""
   %of{d} = vector.addf %ou{d}, %zero_v8 : vector<8xf32>"""
     A(f'''  %ou{d} = vector.mulf %o{d}, %inv_v : vector<8xf32>{gate_txt}
-  vector.fragment.store<result> %of{d}, %out_view[{r}, %c0] shape [%c16, %c16] : vector<8xf32>, view<128x16xf32, %out_layout>''')
+  vector.fragment.store<result> %of{d}, %out_view[{r}, %c0] shape [%c16, %c16] : vector<8xf32>, view<{D}x16xf32, %out_layout>''')
 A("  }\n  kernel.return\n}\n")
 text = "\n".join(U)
 # constants used above
-consts = "".join(f"  %d{c} = index.constant {c * 16} : index\n" for c in range(8))
-consts += "".join(f"  %d{d * 16 if d else 0}r = index.constant {d * 16} : index\n" for d in range(8))
+consts = "".join(f"  %d{c} = index.constant {c * 16} : index\n" for c in range(NF))
+consts += "".join(f"  %d{d * 16 if d else 0}r = index.constant {d * 16} : index\n" for d in range(NF))
 consts += "".join(f"  %d{i}i = index.constant {i} : index\n" for i in range(8))
 consts += "".join(f"  %kb{kb}_row = index.constant {kb * 16} : index\n  %kbo{kb} = scalar.constant {kb * 16} : i32\n" for kb in range(KB))
 text = text.replace("  %tile_count = index.div %tokens, %c16 : index\n", consts + "  %tile_count = index.div %tokens, %c16 : index\n", 1)
-for key, value in {"{KT_LESS}": KT - 1, "{KT}": KT, "{KBYTES}": KT * 136 * 2, "{VTBYTES}": 128 * (KT + 8) * 2, "{VTC}": KT + 8, "{P}": P, "{KVH}": KVH, "{LANES}": LANES, "{G}": G, "{TPK}": TPK, "{DPT}": DPT,
+for key, value in {"{KT_LESS}": KT - 1, "{KT}": KT, "{KBYTES}": KT * (D + 8) * 2, "{VTBYTES}": D * (KT + 8) * 2,
+                   "{DP8}": D + 8, "{D}": D, "{NF}": NF, "{D - DPT}": D - DPT, "{D - 1}": D - 1, "{QH * D}": QH * D, "{SCALE}": repr(D ** -0.5), "{VTC}": KT + 8, "{P}": P, "{KVH}": KVH, "{LANES}": LANES, "{G}": G, "{TPK}": TPK, "{DPT}": DPT,
                    '{CFG["layers"]}': CFG["layers"], '{CFG["window"]}': CFG["window"], '{CFG["window"] - 1}': CFG["window"] - 1,
                    "{G - 1}": G - 1, "{QH}": QH, "{QH - 1}": QH - 1, "{QH * 128}": QH * 128, "{KVH - 1}": KVH - 1, "{LANES - 1}": LANES - 1, "{128 - DPT}": 128 - DPT,
                    '{"%sinks" if CFG["sinks"] else "%gate"}': "%sinks" if CFG["sinks"] else "%gate"}.items():

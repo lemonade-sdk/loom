@@ -78,6 +78,11 @@ for g in json.load(open(a.golden)):
     text = pkg.raw_from_chat(ch["message"], ch["finish_reason"] == "stop")
     got = pkg.ids(text)
     n, gap = match(got, g)
+    # llama.cpp can emit a non-canonical split (e.g. '[' 'A' where the HF tokenizer gives '[A');
+    # identical text is a match, whatever the token boundaries.
+    gold_text = pkg.tok.decode(g["ids"])
+    if n < min(len(got), len(g["ids"])) and (text.startswith(gold_text) or gold_text.startswith(text)):
+        n, gap = min(len(got), len(g["ids"])), None
     if g["prompt"] in alt:  # llama.cpp disagreed with itself? take the recording Loom follows further
         n2, gap2 = match(got, alt[g["prompt"]])
         if n2 > n:
